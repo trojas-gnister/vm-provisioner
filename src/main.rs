@@ -3,13 +3,53 @@ mod provisioner;
 mod window_proxy;
 
 use std::path::Path;
+use std::collections::HashMap;
 use clap::{Parser, Subcommand};
 use dialoguer::{Select, Confirm};
 use tokio;
+use serde::{Serialize, Deserialize};
 
 use config::AppVMConfig;
 use provisioner::AppVMProvisioner;
 use window_proxy::VMIntegrationHost;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VMPasswords {
+    vms: HashMap<String, String>,
+}
+
+impl VMPasswords {
+    fn new() -> Self {
+        Self {
+            vms: HashMap::new(),
+        }
+    }
+    
+    fn load_or_create(config_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let password_file = format!("{}/vm-passwords.toml", config_dir);
+        
+        if Path::new(&password_file).exists() {
+            let content = std::fs::read_to_string(&password_file)?;
+            Ok(toml::from_str(&content).unwrap_or_else(|_| Self::new()))
+        } else {
+            Ok(Self::new())
+        }
+    }
+    
+    fn save(&self, config_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure directory exists
+        std::fs::create_dir_all(config_dir)?;
+        
+        let password_file = format!("{}/vm-passwords.toml", config_dir);
+        std::fs::write(&password_file, toml::to_string_pretty(self)?)?;
+        println!("💾 Passwords saved to: {}", password_file);
+        Ok(())
+    }
+    
+    fn add_vm(&mut self, vm_name: &str, password: &str) {
+        self.vms.insert(vm_name.to_string(), password.to_string());
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "vm-provisioner")]
@@ -54,6 +94,9 @@ enum Commands {
     
     /// List all VMs
     List,
+    
+    /// Show passwords for all VMs
+    Passwords,
     
     /// Destroy a VM
     Destroy {
@@ -119,6 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         Commands::List => {
             list_vms()?;
+        }
+        
+        Commands::Passwords => {
+            show_passwords()?;
         }
         
         Commands::Destroy { name, yes } => {
@@ -197,11 +244,21 @@ async fn create_vm(
     std::fs::write(&config_file, toml::to_string_pretty(&config)?)?;
     println!("💾 Configuration saved to: {}", config_file);
     
+    // Save password to centralized password file
+    let mut passwords = VMPasswords::load_or_create(&config_dir)?;
+    passwords.add_vm(&config.name, &config.user_password);
+    passwords.save(&config_dir)?;
+    
     // Create and provision VM
     let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.provision_vm().await?;
     
     println!("\n✅ VM created successfully!");
+    println!("   VM Name: {}", config.name);
+    println!("   Username: user");
+    println!("   Password: {}", config.user_password);
+    println!("   Config: {}", config_file);
+    println!("   Passwords: {}/.config/vm-provisioner/vm-passwords.toml", std::env::var("HOME")?);
     println!("   Start with: vm-provisioner start {}", config.name);
     
     Ok(())
@@ -252,6 +309,12 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
         println!("ℹ️  Seamless mode not available (requires VirtIO-GPU)");
         println!("   Connect using: virt-viewer {}", name);
     }
+    
+    // Display login credentials
+    println!("\n🔑 VM Login Credentials:");
+    println!("   Username: user");
+    println!("   Password: {}", config.user_password);
+    println!("   Console: sudo virsh console {}", name);
     
     Ok(())
 }
@@ -414,4 +477,36 @@ fn get_vm_status(name: &str) -> String {
         }
         _ => "not created".to_string()
     }
+}
+
+fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
+    let password_file = format!("{}/vm-passwords.toml", config_dir);
+    
+    if !Path::new(&password_file).exists() {
+        println!("❌ No password file found");
+        println!("   Create a VM first to generate passwords");
+        return Ok(());
+    }
+    
+    let passwords = VMPasswords::load_or_create(&config_dir)?;
+    
+    if passwords.vms.is_empty() {
+        println!("ℹ️  No VM passwords stored yet");
+        return Ok(());
+    }
+    
+    println!("🔑 VM Login Credentials:");
+    println!("   File: {}", password_file);
+    println!();
+    
+    for (vm_name, password) in &passwords.vms {
+        println!("   {} | user:{}", vm_name, password);
+    }
+    
+    println!("\n💡 Usage:");
+    println!("   sudo virsh console <vm-name>");
+    println!("   vm-provisioner start <vm-name>  # Shows password");
+    
+    Ok(())
 }

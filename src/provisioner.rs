@@ -352,13 +352,28 @@ reboot"#,
         let disk_arg = format!("path={},size={},format=qcow2,bus=virtio", 
                                disk_path, self.config.disk_size_gb);
         
-        // Configure graphics based on backend
+        // Configure graphics based on backend and architecture
+        let arch = std::env::consts::ARCH;
         let graphics_args = match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu => {
-                vec!["--graphics", "none", "--video", "virtio", "--channel", "spicevmc"]
+                if arch == "aarch64" {
+                    // ARM64: Use virtio video with SPICE graphics
+                    vec!["--graphics", "spice", "--video", "virtio", 
+                         "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
+                } else {
+                    // x86_64: Use QXL for better performance
+                    vec!["--graphics", "spice,listen=127.0.0.1", "--video", "qxl", 
+                         "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
+                }
             },
             GraphicsBackend::QxlSpice => {
-                vec!["--graphics", "spice", "--video", "qxl", "--channel", "spicevmc"]
+                if arch == "aarch64" {
+                    vec!["--graphics", "spice", "--video", "virtio", 
+                         "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
+                } else {
+                    vec!["--graphics", "spice,listen=127.0.0.1", "--video", "qxl", 
+                         "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
+                }
             },
             GraphicsBackend::VncOnly => {
                 vec!["--graphics", "vnc,listen=127.0.0.1,port=5900"]
@@ -385,7 +400,13 @@ reboot"#,
         
         // Add sound if enabled
         if self.config.enable_audio {
-            virt_install_args.extend_from_slice(&["--sound", "default"]);
+            if arch == "aarch64" {
+                // ARM64: Use virtio sound model
+                virt_install_args.extend_from_slice(&["--sound", "model=virtio"]);
+            } else {
+                // x86_64: Use default sound
+                virt_install_args.extend_from_slice(&["--sound", "default"]);
+            }
         }
         
         // Add USB controller if needed
@@ -395,10 +416,14 @@ reboot"#,
         
         println!("⏳ Running automated installation (15-20 minutes)...");
         
-        Command::new("virt-install")
+        let status = Command::new("virt-install")
             .args(&virt_install_args)
             .status()?;
             
+        if !status.success() {
+            return Err(format!("VM installation failed with exit code: {:?}", status.code()).into());
+        }
+        
         println!("✅ Installation completed!");
         
         Ok(())
@@ -442,11 +467,41 @@ reboot"#,
         // Wait for VM to boot
         thread::sleep(Duration::from_secs(5));
         
-        // If using VirtIO-GPU, start the host-side window proxy
-        if matches!(self.config.graphics_backend, GraphicsBackend::VirtioGpu) {
-            println!("🪟 Starting window proxy...");
-            // This would launch the host-side Wayland proxy
-            // that creates native windows for the VM application
+        // Launch SPICE viewer for immediate functionality
+        match self.config.graphics_backend {
+            GraphicsBackend::VirtioGpu | GraphicsBackend::QxlSpice => {
+                println!("🖥️  Launching SPICE viewer...");
+                let vm_name = self.config.name.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(5)); // Wait for VM to start SPICE
+                    
+                    // Get the actual SPICE port from virsh
+                    if let Ok(output) = std::process::Command::new("virsh")
+                        .args(&["domdisplay", &vm_name])
+                        .output()
+                    {
+                        if let Ok(display) = String::from_utf8(output.stdout) {
+                            let display = display.trim();
+                            if !display.is_empty() {
+                                let _ = std::process::Command::new("remote-viewer")
+                                    .arg(display)
+                                    .spawn();
+                                return;
+                            }
+                        }
+                    }
+                    
+                    // Fallback to default port
+                    let _ = std::process::Command::new("remote-viewer")
+                        .arg("spice://127.0.0.1:5900")
+                        .spawn();
+                });
+                println!("   SPICE viewer will launch automatically");
+                println!("   Or get connection info with: virsh domdisplay {}", self.config.name);
+            },
+            GraphicsBackend::VncOnly => {
+                println!("   Connect with: vncviewer localhost:5900");
+            },
         }
         
         println!("✅ VM started successfully!");

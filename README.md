@@ -1,16 +1,28 @@
-# Container VM Provisioner 
+# VM Provisioner - Qubes-like Application Isolation System
 
-A Rust-based tool that automatically provisions secure virtual machines running minimal Fedora Server with containerized applications. Provides enterprise-grade security through VM isolation, SELinux, and container sandboxing.
+A Rust-based application isolation system inspired by Qubes OS. Creates lightweight VMs for individual applications (browser, office, development) with seamless window integration where VM windows appear as native host windows.
 
 ## Features
 
-- 🔒 **Multi-layered Security**: KVM virtualization + SELinux + container sandboxing
-- 🚀 **Automated Provisioning**: Unattended VM creation using Fedora kickstart
-- 🐳 **Flexible Container Support**: Any container registry (Docker Hub, LinuxServer, etc.)
-- 🔍 **Container Validation**: Validates container images exist before VM creation
-- 🔥 **Automatic Firewall**: Dynamically configures firewall based on your ports
-- 🖥️ **VNC Monitoring**: Monitor installation progress via VNC
-- ⚙️ **Cross-Architecture**: Supports x86_64 and aarch64
+- 🔒 **Application Isolation**: Each application runs in its own VM for security
+- 🪟 **Seamless Windows**: VM application windows appear as native host windows *(in development)*
+- 📋 **Clipboard Sharing**: Secure clipboard sharing between host and VMs via SPICE
+- 🚀 **Direct Installation**: Applications install directly (no containers)
+- 🖥️ **SPICE Integration**: Full graphics, audio, and input support
+- ⚙️ **Minimal Overhead**: Uses Cage compositor for single-app focus
+- 🔧 **Cross-Architecture**: Supports x86_64 and aarch64
+
+## Current Status
+
+**✅ Working Now:**
+- VM provisioning with Fedora + application installation
+- SPICE viewer with clipboard sharing
+- LibreWolf browser template
+- Audio passthrough
+
+**🚧 In Development:**
+- Seamless window proxy (VM windows → native host windows)
+- VirtIO channels for improved performance
 
 ## Quick Start
 
@@ -19,7 +31,10 @@ A Rust-based tool that automatically provisions secure virtual machines running 
 Install required tools:
 ```bash
 # Fedora/RHEL
-sudo dnf install libvirt virt-install qemu-img genisoimage
+sudo dnf install libvirt qemu-kvm virt-install virt-viewer
+
+# Ubuntu/Debian  
+sudo apt install libvirt-daemon qemu-kvm virtinst virt-viewer
 
 # Start libvirt service
 sudo systemctl enable --now libvirtd
@@ -29,158 +44,252 @@ sudo systemctl enable --now libvirtd
 
 ```bash
 git clone <repository-url>
-cd container-vm-provisioner
+cd vm-provisioner
 cargo build --release
 ```
 
 ### Basic Usage
 
-1. **Configure your VM** (creates `vm.env`):
+1. **Create a LibreWolf VM**:
 ```bash
-./target/release/container-vm-provisioner configure
+# Interactive mode
+./target/release/vm-provisioner create
+
+# From template
+./target/release/vm-provisioner create --template librewolf
+
+# Non-interactive
+./target/release/vm-provisioner create --template librewolf -y
 ```
 
-2. **Provision the VM**:
+2. **Start the VM**:
 ```bash
-./target/release/container-vm-provisioner provision
+./target/release/vm-provisioner start librewolf-vm
+# SPICE viewer will launch automatically
+# Login credentials will be displayed
 ```
 
-3. **Monitor installation** via VNC:
+3. **Manage VMs**:
 ```bash
-vncviewer localhost:5900
+# List all VMs
+./target/release/vm-provisioner list
+
+# Show all VM passwords
+./target/release/vm-provisioner passwords
+
+# Connect to VM console
+./target/release/vm-provisioner console librewolf-vm
+# Use credentials: user / [generated-password]
+
+# Stop VM
+./target/release/vm-provisioner stop librewolf-vm
+
+# Destroy VM
+./target/release/vm-provisioner destroy librewolf-vm
 ```
 
-4. **Check VM status**:
-```bash
-./target/release/container-vm-provisioner status
-```
+## VM Templates
+
+### LibreWolf Browser
+- **Application**: LibreWolf (privacy-focused Firefox)
+- **Graphics**: Wayland with hardware acceleration  
+- **Features**: Clipboard sharing, audio passthrough
+- **Use case**: Isolated web browsing
+
+### Office (Planned)
+- **Application**: LibreOffice suite
+- **Features**: Document editing in isolation
+- **Use case**: Secure document handling
+
+### Development (Planned)
+- **Applications**: VS Code, Rust/Python toolchain
+- **Features**: Isolated development environment
+- **Use case**: Secure code development
 
 ## Configuration
 
-Edit `vm.env` to customize your setup:
+VM configurations and passwords are automatically stored:
 
+### Individual VM Config
+```toml
+# ~/.config/vm-provisioner/librewolf-vm.toml
+[vm]
+name = "librewolf-vm"
+memory_mb = 4096
+vcpus = 2
+disk_size_gb = 20
+graphics_backend = "VirtioGpu"
+enable_clipboard = true
+enable_audio = true
+user_password = "abc123generated"
+
+[app]
+type = "Browser"
+command = "/usr/bin/librewolf"
+profile_path = "/home/user/.librewolf"
+
+[packages]
+system = ["cage", "wayland", "pipewire", "wl-clipboard"]
+app = ["librewolf"]
+```
+
+### Centralized Password Storage
+```toml
+# ~/.config/vm-provisioner/vm-passwords.toml
+[vms]
+librewolf-vm = "abc123generated"
+work-browser = "def456different"
+banking-vm = "xyz789another"
+```
+
+## Architecture
+
+```
+┌─────────────────┐    ┌─────────────────┐
+│     Host OS     │    │   VM (Fedora)   │
+│                 │    │                 │
+│ ┌─────────────┐ │    │ ┌─────────────┐ │
+│ │ Window      │◄┼────┼─┤ Cage        │ │
+│ │ Proxy       │ │    │ │ Compositor  │ │
+│ │             │ │    │ │             │ │
+│ │ ┌─────────┐ │ │    │ │ ┌─────────┐ │ │
+│ │ │ Native  │ │ │    │ │ │LibreWolf│ │ │
+│ │ │ Window  │ │ │    │ │ │         │ │ │
+│ │ └─────────┘ │ │    │ │ └─────────┘ │ │
+│ └─────────────┘ │    │ └─────────────┘ │
+└─────────────────┘    └─────────────────┘
+         ▲                       │
+         │      SPICE Protocol   │
+         └───────────────────────┘
+```
+
+## Current Implementation: SPICE Viewer
+
+**How it works now:**
+1. VM runs LibreWolf in Cage compositor (single-app mode)
+2. SPICE server streams VM display to host
+3. `remote-viewer` shows VM in separate window
+4. Clipboard automatically syncs between host and VM
+5. Audio passes through to host speakers
+
+**Commands:**
 ```bash
-# VM Hardware
-VM_NAME=container-vm
-VM_MEMORY_MB=4096
-VM_VCPUS=2
-VM_DISK_SIZE_GB=20
+# Start VM and launch SPICE viewer
+vm-provisioner start librewolf-vm
 
-# Container Configuration
-CONTAINER_REGISTRY=docker.io/linuxserver
-CONTAINERS=librewolf:latest,qbittorrent:latest
-CONTAINER_PORTS=3000:3000,3001:3001,8080:8080
-FIREWALL_PORTS=22,3000,3001,8080,5900
-
-# Server packages
-DNF_PACKAGES=podman,podman-compose,qemu-guest-agent,git,curl,wget,htop,vim
+# Manual connection
+remote-viewer spice://127.0.0.1:5900
 ```
 
-## Container Validation
+## Future: Seamless Window Integration
 
-The tool validates containers before VM creation:
+**Development roadmap:**
+1. **Window Proxy** (`src/window_proxy.rs`): Intercept SPICE graphics and create native Wayland windows
+2. **Guest Agent** (`src/guest_agent.rs`): Detect application windows within VM
+3. **SPICE Bridge**: Parse SPICE display commands to extract window regions
 
-- **LinuxServer containers**: Validates against LinuxServer.io API
-- **Docker Hub**: Validates against Docker Hub API  
-- **Other registries**: Gracefully skips validation to avoid blocking
-
-Example validation output:
-```
-🔍 Validating container images...
-  ✓ docker.io/linuxserver/librewolf:latest
-  ✓ docker.io/linuxserver/qbittorrent:latest
-✅ All containers validated successfully
-```
-
-## Accessing Containers
-
-### Via SSH Port Forwarding (Recommended)
-```bash
-# Forward container ports through SSH
-ssh -L 3000:localhost:3000 -L 3001:localhost:3001 user@VM_IP
-
-# Access in browser
-firefox http://localhost:3000   # HTTP
-firefox https://localhost:3001  # HTTPS (accept self-signed cert)
-```
-
-### Direct Access (if firewall configured)
-```bash
-# Access directly (requires firewall ports open)
-firefox https://VM_IP:3001
-```
-
-## Commands
-
-- `configure` - Interactive configuration setup
-- `provision` - Create and provision new VM
-- `start` - Start existing VM
-- `stop` - Stop running VM  
-- `status` - Show VM status and connection info
-- `destroy` - Remove VM and cleanup
-
-### Command Options
-
-- `--env <path>` - Use specific .env file (default: ./vm.env)
-- `--interactive` - Force interactive configuration
-- `--yes, -y` - Skip confirmation prompts
-
-## Examples
-
-### LibreWolf Browser VM
-```bash
-# vm.env
-CONTAINERS=librewolf:latest
-CONTAINER_PORTS=3000:3000,3001:3001
-FIREWALL_PORTS=22,3000,3001,5900
-```
-
-### Media Server VM  
-```bash
-# vm.env
-CONTAINERS=plex:latest,qbittorrent:latest
-CONTAINER_PORTS=32400:32400,8080:8080
-FIREWALL_PORTS=22,32400,8080,5900
-```
-
-### Multi-Registry Setup
-```bash
-# Mix different registries
-CONTAINER_REGISTRY=docker.io
-CONTAINERS=nginx:latest,portainer/portainer-ce:latest
-```
+**Result**: LibreWolf windows appear as native host windows, indistinguishable from host applications.
 
 ## Security
 
-- **VM Isolation**: Hardware virtualization prevents container breakout
-- **SELinux**: Mandatory access control enabled by default
-- **Container Sandboxing**: Podman provides additional isolation
-- **Minimal Attack Surface**: Server-only install, no desktop environment
-- **Network Isolation**: VNC bound to localhost only
+- **VM Isolation**: Hardware virtualization prevents application breakout
+- **SELinux**: Mandatory access control enabled in guest
+- **Minimal Attack Surface**: Guest OS has only necessary packages
+- **Network Isolation**: VMs use NAT by default
+- **Clipboard Security**: Controlled sharing via SPICE protocol
+
+## Commands
+
+- `create` - Create new application VM
+- `start` - Start VM and launch viewer  
+- `stop` - Stop running VM
+- `list` - Show all VMs and their status
+- `passwords` - Show login credentials for all VMs
+- `destroy` - Remove VM and cleanup
+- `console` - Connect to VM console
+
+### Command Options
+
+- `--template <name>` - Use predefined template (librewolf, office, dev)
+- `--config <path>` - Use custom configuration file
+- `--yes, -y` - Skip confirmation prompts
+- `--memory <mb>` - Override memory allocation
+- `--vcpus <n>` - Override CPU allocation
+
+## Examples
+
+### Create Browser VM with Custom Resources
+```bash
+vm-provisioner create --template librewolf --memory 8192 --vcpus 4 -y
+# Displays: Username: user, Password: [generated]
+```
+
+### Multiple Isolated Browsers
+```bash
+# Personal browsing
+vm-provisioner create --template librewolf --name personal-browser
+
+# Work browsing  
+vm-provisioner create --template librewolf --name work-browser
+
+# Banking (separate VM for financial sites)
+vm-provisioner create --template librewolf --name banking-browser
+
+# View all passwords
+vm-provisioner passwords
+```
+
+### Password Management
+```bash
+# Show all VM credentials
+vm-provisioner passwords
+
+# Manual password lookup
+cat ~/.config/vm-provisioner/vm-passwords.toml
+
+# Start VM (displays password)
+vm-provisioner start librewolf-vm
+```
 
 ## Troubleshooting
 
-### Container Not Loading
-- Check firewall: `sudo firewall-cmd --list-ports`
-- Verify container logs: `podman logs container-name`
-- Try HTTPS instead of HTTP (port 3001 vs 3000)
-
-### VM Won't Start
+### VM Creation Fails
 - Check libvirt status: `sudo systemctl status libvirtd`
-- Verify VM definition: `virsh list --all`
+- Verify KVM support: `lsmod | grep kvm`
+- Check disk space: `df -h /var/lib/libvirt/images/`
 
-### Installation Monitoring
-- Connect via VNC: `vncviewer localhost:5900`
-- Console access: `virsh console VM_NAME`
+### SPICE Connection Issues
+- Ensure VM is running: `virsh list`
+- Check SPICE port: `virsh domdisplay VM_NAME`
+- Install virt-viewer: `sudo dnf install virt-viewer`
 
-## Contributing
+### Clipboard Not Working
+- Install wl-clipboard on host: `dnf install wl-clipboard`
+- Verify SPICE agent in VM: `systemctl status spice-vdagentd`
 
-1. Fork the repository
-2. Create feature branch
-3. Make changes following Rust best practices
-4. Test with `cargo test` and `cargo clippy`
-5. Submit pull request
+### Performance Issues
+- Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`
+- Increase VM memory: Use `--memory` option
+- Enable hardware acceleration: Coming in future updates
 
-## License
+## Development
 
-[Add your license here]
+### Building from Source
+```bash
+git clone <repository-url>
+cd vm-provisioner
+cargo build --release
+cargo test
+```
+
+### Adding New Templates
+1. Create template function in `src/config.rs`
+2. Add to template matching in `src/main.rs`
+3. Update documentation and tests
+
+### Contributing to Window Proxy
+See `CLAUDE.md` for detailed development tasks and architecture decisions.
+
+---
+
+**Note**: This project is under active development. The seamless window integration is not yet complete - VMs currently display via SPICE viewer. See `CLAUDE.md` for detailed development roadmap.
