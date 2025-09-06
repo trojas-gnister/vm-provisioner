@@ -349,6 +349,8 @@ reboot"#,
         
         let memory_str = self.config.memory_mb.to_string();
         let vcpus_str = self.config.vcpus.to_string();
+        let disk_arg = format!("path={},size={},format=qcow2,bus=virtio", 
+                               disk_path, self.config.disk_size_gb);
         
         // Configure graphics based on backend
         let graphics_args = match self.config.graphics_backend {
@@ -367,8 +369,7 @@ reboot"#,
             "--name", &self.config.name,
             "--memory", &memory_str,
             "--vcpus", &vcpus_str,
-            "--disk", &format!("path={},size={},format=qcow2,bus=virtio", 
-                               disk_path, self.config.disk_size_gb),
+            "--disk", &disk_arg,
             "--location", install_location,
             "--initrd-inject", kickstart_path,
             "--extra-args", "inst.ks=file:/kickstart.cfg console=tty0 console=ttyS0,115200n8",
