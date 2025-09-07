@@ -103,15 +103,16 @@ impl AppVMProvisioner {
     fn create_vm_disk(&self) -> Result<String, Box<dyn std::error::Error>> {
         let disk_path = format!("{}/{}.qcow2", self.config.vm_dir, self.config.name);
         
-        if Path::new(&disk_path).exists() {
-            fs::remove_file(&disk_path)?;
-        }
+        // Remove existing disk if it exists (with sudo)
+        Command::new("sudo")
+            .args(&["rm", "-f", &disk_path])
+            .status()?;
         
         println!("💾 Creating VM disk ({} GB)...", self.config.disk_size_gb);
         
-        Command::new("qemu-img")
+        Command::new("sudo")
             .args(&[
-                "create", "-f", "qcow2",
+                "qemu-img", "create", "-f", "qcow2",
                 &disk_path,
                 &format!("{}G", self.config.disk_size_gb)
             ])
@@ -194,7 +195,7 @@ cat > /etc/systemd/system/guest-agent.service << 'EOF'
 [Unit]
 Description=VM Guest Agent for Window Management
 After=graphical.target
-Wants=display-manager.service
+Wants=autologin@tty1.service
 
 [Service]
 Type=simple
@@ -213,12 +214,11 @@ EOF
 
 # Enable the services
 systemctl enable guest-agent.service
-systemctl enable gdm
 
 {}
 
-# Set graphical target as default
-systemctl set-default graphical.target"#,
+# Set multi-user target as default (since we're using auto-login)
+systemctl set-default multi-user.target"#,
             self.get_autologin_config(),
         );
         
@@ -477,7 +477,8 @@ reboot"#,
         
         println!("⏳ Running automated installation (15-20 minutes)...");
         
-        let status = Command::new("virt-install")
+        let status = Command::new("sudo")
+            .arg("virt-install")
             .args(&virt_install_args)
             .status()?;
             
@@ -607,12 +608,137 @@ reboot"#,
     fn get_autologin_config(&self) -> String {
         if self.config.enable_auto_login {
             r#"
-# Configure GDM for auto-login
-cat > /etc/gdm/custom.conf << 'EOF'
-[daemon]
-AutomaticLoginEnable=true
-AutomaticLogin=user
-EOF"#.to_string()
+# Configure auto-login with i3 via systemd
+# Create auto-login service that starts X11 with i3
+cat > /etc/systemd/system/autologin@.service << 'EOF'
+[Unit]
+Description=Auto Login for %i
+After=systemd-user-sessions.service plymouth-quit-wait.service
+After=plymouth-quit.service gdm.service
+Before=getty@tty1.service
+
+[Service]
+ExecStart=-/sbin/agetty -o '-p -f user' --noclear --autologin user %i $TERM
+Type=idle
+Restart=always
+RestartSec=0
+UtmpIdentifier=%I
+TTYPath=/dev/%i
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+
+[Install]
+WantedBy=getty.target
+EOF
+
+# Enable auto-login on tty1
+systemctl enable autologin@tty1.service
+
+# Create .xinitrc for user to start i3
+cat > /home/user/.xinitrc << 'EOF'
+#!/bin/bash
+# Start SPICE agent for clipboard/resolution
+/usr/bin/spice-vdagent &
+
+# Start i3 window manager
+exec i3
+EOF
+chmod +x /home/user/.xinitrc
+chown user:user /home/user/.xinitrc
+
+# Create user systemd service to auto-start X11
+mkdir -p /home/user/.config/systemd/user
+cat > /home/user/.config/systemd/user/startx.service << 'EOF'
+[Unit]
+Description=Start X11 session
+After=graphical-session-pre.target
+Wants=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/startx
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable the startx service for user
+chown -R user:user /home/user/.config
+systemctl --user enable startx.service
+
+# Create default i3 config
+mkdir -p /home/user/.config/i3
+cat > /home/user/.config/i3/config << 'EOF'
+# i3 config file
+set $mod Mod4
+
+# Font for window titles
+font pango:DejaVu Sans Mono 8
+
+# Use Mouse+$mod to drag floating windows
+floating_modifier $mod
+
+# Start a terminal
+bindsym $mod+Return exec kitty
+
+# Kill focused window
+bindsym $mod+Shift+q kill
+
+# Start dmenu (app launcher)
+bindsym $mod+d exec dmenu_run
+
+# Change focus
+bindsym $mod+j focus left
+bindsym $mod+k focus down
+bindsym $mod+l focus up
+bindsym $mod+semicolon focus right
+bindsym $mod+Left focus left
+bindsym $mod+Down focus down
+bindsym $mod+Up focus up
+bindsym $mod+Right focus right
+
+# Move focused window
+bindsym $mod+Shift+j move left
+bindsym $mod+Shift+k move down
+bindsym $mod+Shift+l move up
+bindsym $mod+Shift+semicolon move right
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Down move down
+bindsym $mod+Shift+Up move up
+bindsym $mod+Shift+Right move right
+
+# Workspaces
+bindsym $mod+1 workspace 1
+bindsym $mod+2 workspace 2
+bindsym $mod+3 workspace 3
+bindsym $mod+4 workspace 4
+bindsym $mod+5 workspace 5
+
+# Move container to workspace
+bindsym $mod+Shift+1 move container to workspace 1
+bindsym $mod+Shift+2 move container to workspace 2
+bindsym $mod+Shift+3 move container to workspace 3
+bindsym $mod+Shift+4 move container to workspace 4
+bindsym $mod+Shift+5 move container to workspace 5
+
+# Restart i3
+bindsym $mod+Shift+r restart
+
+# Exit i3
+bindsym $mod+Shift+e exec "i3-nagbar -t warning -m 'Exit i3?' -b 'Yes' 'i3-msg exit'"
+
+# Status bar
+bar {
+    status_command i3status
+}
+EOF
+chown -R user:user /home/user/.config"#.to_string()
         } else {
             "".to_string()
         }

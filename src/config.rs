@@ -66,12 +66,18 @@ impl AppVMConfig {
         // Default system packages including kitty terminal
         let mut default_system_packages = vec![
             "@base-x".to_string(),
-            "gdm".to_string(),
+            "i3".to_string(),
+            "i3status".to_string(),
+            "i3lock".to_string(),
+            "dmenu".to_string(),
             "xorg-x11-server-Xorg".to_string(),
+            "xorg-x11-xinit".to_string(),
+            "xorg-x11-server-utils".to_string(), // includes xrandr
             "wmctrl".to_string(),
             "xwininfo".to_string(),
             "pipewire".to_string(),
             "wl-clipboard".to_string(),
+            "spice-vdagent".to_string(),  // SPICE agent for clipboard/resolution
             "kitty".to_string(),  // Default terminal emulator
         ];
         

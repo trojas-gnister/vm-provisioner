@@ -11,7 +11,7 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - 🖥️ **kitty Terminal**: Always available in every VM for CLI tasks
 - 🪟 **Window Proxy System**: TCP-based communication with comprehensive window event handling
 - 📋 **Clipboard Sharing**: Secure clipboard sharing between host and VMs
-- 🖥️ **X11 Integration**: Full graphics, audio, and input support with X11/GDM
+- 🖥️ **i3 Window Manager**: Pure X11 environment with lightweight i3 for optimal compatibility
 - 💾 **Password Management**: Centralized storage of VM credentials
 - 🔧 **Cross-Architecture**: Supports x86_64 and aarch64
 
@@ -21,7 +21,7 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - VM provisioning with Fedora + dynamic package installation
 - System package installation (dnf-based) and Flatpak package support
 - Auto-launch system with systemd services for specified applications
-- Auto-login with GDM configuration (passwordless access)
+- Auto-login with i3 window manager (passwordless X11 access)
 - kitty terminal emulator included by default in all VMs
 - Advanced window proxy architecture with TCP communication (port 9999)
 - X11 window detection using xwininfo/wmctrl
@@ -211,14 +211,15 @@ dev-vm = "vm-456def789ghi"
 ## Current Implementation: Window Proxy System
 
 **How it works:**
-1. VM runs applications in X11 desktop environment (GDM) with auto-login
-2. kitty terminal and specified packages (system + Flatpak) are auto-installed
-3. Auto-launch systemd services start specified applications on boot
-4. Guest agent monitors X11 windows using xwininfo/wmctrl
-5. Window events (8 types: create/destroy/resize/move/focus/title) sent to host via TCP
-6. Host window proxy receives events with length-prefixed binary protocol
-7. Wayland client framework processes events and creates native windows
-8. Clipboard synchronized bidirectionally with wl-clipboard integration
+1. VM runs applications in pure X11 environment with i3 window manager and auto-login
+2. SPICE agent provides automatic resolution adjustment and clipboard sharing
+3. kitty terminal and specified packages (system + Flatpak) are auto-installed
+4. Auto-launch systemd services start specified applications on boot
+5. Guest agent monitors X11 windows using xwininfo/wmctrl
+6. Window events (8 types: create/destroy/resize/move/focus/title) sent to host via TCP
+7. Host window proxy receives events with length-prefixed binary protocol
+8. Wayland client framework processes events and creates native windows
+9. Clipboard synchronized bidirectionally with SPICE and wl-clipboard integration
 
 **Window Detection Flow:**
 ```
@@ -239,12 +240,48 @@ Wayland Client: Processes events and creates native windows
 ```bash
 # Start VM with window proxy
 vm-provisioner start firefox-vm
-# Window proxy automatically starts, guest agent runs in VM
-# Applications auto-launch on boot with auto-login
+# SPICE viewer opens with i3 window manager
+# Auto-login enabled - no password needed
+# Applications auto-launch on boot
+# Use Mod+Enter for terminal, Mod+d for app launcher
 
 # Manual guest agent (inside VM) - connects to host TCP:9999
 /usr/local/bin/guest-agent
 ```
+
+## i3 Window Manager Usage
+
+VMs use the lightweight i3 window manager for optimal X11 compatibility and performance:
+
+### Basic i3 Shortcuts
+- `Mod+Enter` - Open kitty terminal
+- `Mod+d` - Open dmenu (application launcher)  
+- `Mod+Shift+q` - Close focused window
+- `Mod+1,2,3,4,5` - Switch to workspace 1-5
+- `Mod+Shift+1,2,3,4,5` - Move window to workspace 1-5
+- `Mod+Arrow Keys` - Change window focus
+- `Mod+Shift+Arrow Keys` - Move focused window
+- `Mod+Shift+r` - Restart i3
+- `Mod+Shift+e` - Exit i3
+
+**Note**: `Mod` key is typically the Windows/Super key
+
+### Launching Applications
+```bash
+# Via dmenu (Mod+d)
+# Type application name and press Enter
+
+# Via terminal (Mod+Enter, then type):
+firefox  # If installed as system package
+flatpak run org.mozilla.firefox  # If installed as Flatpak
+qbittorrent  # System package example
+```
+
+### Window Management
+- i3 automatically tiles windows
+- Drag windows while holding `Mod` key to make them floating
+- Windows are organized in workspaces (1-5 by default)
+- Status bar shows current workspace and system information
 
 ## Security
 
