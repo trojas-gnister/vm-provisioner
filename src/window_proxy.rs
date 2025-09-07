@@ -13,56 +13,49 @@ use wayland_protocols::xdg::shell::client::{
 
 use serde::{Serialize, Deserialize};
 
-/// Messages exchanged between VM and host
+/// Messages sent from guest to host about window state
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WindowMessage {
-    // From VM to Host
-    CreateWindow { 
+    // Window lifecycle
+    WindowCreated { 
         id: u32, 
         title: String,
         width: u32,
         height: u32,
+        x: i32,
+        y: i32,
+        app_name: String,
     },
-    DestroyWindow { 
+    WindowDestroyed { 
         id: u32 
     },
-    UpdateTitle { 
+    WindowMoved { 
         id: u32, 
-        title: String 
+        x: i32, 
+        y: i32 
     },
-    ResizeWindow { 
-        id: u32, 
-        width: u32, 
-        height: u32 
-    },
-    UpdateBuffer { 
-        id: u32, 
-        buffer_data: Vec<u8> 
-    },
-    
-    // From Host to VM
     WindowResized { 
         id: u32, 
         width: u32, 
         height: u32 
     },
-    MouseMove { 
+    WindowTitleChanged { 
         id: u32, 
-        x: f64, 
-        y: f64 
+        title: String 
     },
-    MouseButton { 
+    WindowFocusChanged { 
         id: u32, 
-        button: u32, 
-        pressed: bool 
+        focused: bool 
     },
-    KeyEvent { 
-        id: u32, 
-        key: u32, 
-        pressed: bool 
+    
+    // Application lifecycle
+    ApplicationStarted { 
+        app_name: String,
+        pid: u32,
     },
-    WindowClosed { 
-        id: u32 
+    ApplicationStopped { 
+        app_name: String,
+        pid: u32,
     },
 }
 
@@ -179,47 +172,68 @@ impl WindowProxy {
         xdg_wm_base: &Option<xdg_wm_base::XdgWmBase>,
     ) {
         match msg {
-            WindowMessage::CreateWindow { id, title, width, height } => {
-                println!("Creating window {} '{}' ({}x{})", id, title, width, height);
+            WindowMessage::WindowCreated { id, title, width, height, x, y, app_name } => {
+                println!("🪟 Creating native window for VM window {} '{}' ({}x{}+{}+{}) [{}]", 
+                         id, title, width, height, x, y, app_name);
                 
-                // Create Wayland surface and XDG toplevel
-                // This is simplified - actual implementation would properly create surfaces
+                // TODO: Create actual Wayland surface and XDG toplevel
+                // For now, just print the window info
+                let proxied_window = ProxiedWindow {
+                    vm_window_id: id,
+                    surface: unsafe { std::mem::zeroed() }, // Placeholder
+                    xdg_surface: unsafe { std::mem::zeroed() }, // Placeholder  
+                    xdg_toplevel: unsafe { std::mem::zeroed() }, // Placeholder
+                    width,
+                    height,
+                    title: title.clone(),
+                };
                 
-                // Store in windows map
-                // windows.lock().unwrap().insert(id, proxied_window);
+                windows.lock().unwrap().insert(id, proxied_window);
+                
+                // TODO: Actually create the native window here
+                println!("   → Native window created for {}", title);
             }
             
-            WindowMessage::UpdateBuffer { id, buffer_data } => {
-                // Update the window's buffer with new frame data from VM
-                if let Some(window) = windows.lock().unwrap().get_mut(&id) {
-                    // Create SHM buffer and attach to surface
-                    // Copy buffer_data to shared memory
-                    // window.surface.attach(buffer)
-                    // window.surface.commit()
-                }
-            }
-            
-            WindowMessage::ResizeWindow { id, width, height } => {
-                if let Some(window) = windows.lock().unwrap().get_mut(&id) {
-                    window.width = width;
-                    window.height = height;
-                    // Notify XDG surface of size change
-                }
-            }
-            
-            WindowMessage::UpdateTitle { id, title } => {
-                if let Some(window) = windows.lock().unwrap().get_mut(&id) {
-                    window.title = title.clone();
-                    window.xdg_toplevel.set_title(title);
-                }
-            }
-            
-            WindowMessage::DestroyWindow { id } => {
-                println!("Destroying window {}", id);
+            WindowMessage::WindowDestroyed { id } => {
+                println!("🗑️  Destroying native window for VM window {}", id);
                 windows.lock().unwrap().remove(&id);
             }
             
-            _ => {} // Host->VM messages, not handled here
+            WindowMessage::WindowResized { id, width, height } => {
+                if let Some(window) = windows.lock().unwrap().get_mut(&id) {
+                    println!("📏 Resizing window {} to {}x{}", id, width, height);
+                    window.width = width;
+                    window.height = height;
+                    // TODO: Resize the actual Wayland surface
+                }
+            }
+            
+            WindowMessage::WindowTitleChanged { id, title } => {
+                if let Some(window) = windows.lock().unwrap().get_mut(&id) {
+                    println!("📝 Window {} title changed to '{}'", id, title);
+                    window.title = title.clone();
+                    // TODO: Update the actual window title
+                    // window.xdg_toplevel.set_title(title);
+                }
+            }
+            
+            WindowMessage::WindowMoved { id, x, y } => {
+                println!("📍 Window {} moved to position ({}, {})", id, x, y);
+                // TODO: Update window position if supported
+            }
+            
+            WindowMessage::WindowFocusChanged { id, focused } => {
+                println!("🎯 Window {} focus changed: {}", id, focused);
+                // TODO: Update window focus state
+            }
+            
+            WindowMessage::ApplicationStarted { app_name, pid } => {
+                println!("🚀 Application started: {} (PID: {})", app_name, pid);
+            }
+            
+            WindowMessage::ApplicationStopped { app_name, pid } => {
+                println!("⏹️  Application stopped: {} (PID: {})", app_name, pid);
+            }
         }
     }
     
@@ -362,31 +376,105 @@ impl VMIntegrationHost {
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Starting VM Integration for: {}", self.vm_name);
         
-        // Socket paths for VM communication
-        let window_socket = format!("/tmp/{}-window.sock", self.vm_name);
-        let clipboard_socket = format!("/tmp/{}-clipboard.sock", self.vm_name);
+        // TCP port for VM communication
+        let port = "0.0.0.0:9999";
         
-        // Start window proxy in separate thread
-        let window_socket_clone = window_socket.clone();
-        std::thread::spawn(move || {
-            let mut proxy = WindowProxy::new(&window_socket_clone).unwrap();
-            proxy.run().unwrap();
-        });
+        // Create TCP server
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(port)?;
+        println!("   Listening on TCP port: {}", port);
         
-        // Start clipboard proxy if enabled
-        let clipboard_socket_clone = clipboard_socket.clone();
+        // Start window proxy server
+        let vm_name = self.vm_name.clone();
         std::thread::spawn(move || {
-            let mut proxy = ClipboardProxy::new(&clipboard_socket_clone).unwrap();
-            proxy.run().unwrap();
+            Self::run_socket_server(listener, vm_name);
         });
         
         println!("✅ VM Integration running");
-        println!("   Window socket: {}", window_socket);
-        println!("   Clipboard socket: {}", clipboard_socket);
+        println!("   Waiting for guest agent connection...");
         
         // Keep main thread alive
         loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
+    }
+    
+    fn run_socket_server(listener: std::net::TcpListener, vm_name: String) {
+        println!("🔌 TCP server started for VM: {} on port 9999", vm_name);
+        
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    println!("📡 Guest agent connected from: {:?}!", stream.peer_addr());
+                    
+                    // Spawn a thread to handle this connection
+                    let vm_name_clone = vm_name.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = Self::handle_guest_connection(stream, vm_name_clone) {
+                            eprintln!("Connection error: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Connection failed: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn handle_guest_connection(
+        mut stream: std::net::TcpStream, 
+        vm_name: String
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Read;
+        
+        println!("🔄 Handling connection for VM: {}", vm_name);
+        let mut buffer = vec![0u8; 4096];
+        
+        loop {
+            // Read message length first
+            let mut len_buf = [0u8; 4];
+            match stream.read_exact(&mut len_buf) {
+                Ok(()) => {
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    if len > buffer.len() {
+                        buffer.resize(len, 0);
+                    }
+                    
+                    // Read the actual message
+                    stream.read_exact(&mut buffer[..len])?;
+                    
+                    // Deserialize and handle message
+                    if let Ok(msg) = bincode::deserialize::<WindowMessage>(&buffer[..len]) {
+                        println!("📨 Received message: {:?}", msg);
+                        
+                        // Handle the message (for now just print)
+                        match msg {
+                            WindowMessage::WindowCreated { id, title, width, height, x, y, app_name } => {
+                                println!("🪟 VM window created: {} '{}' ({}x{}+{}+{}) [{}]", 
+                                         id, title, width, height, x, y, app_name);
+                                // TODO: Create native Wayland window
+                            }
+                            WindowMessage::WindowDestroyed { id } => {
+                                println!("🗑️  VM window destroyed: {}", id);
+                                // TODO: Destroy native window
+                            }
+                            WindowMessage::ApplicationStarted { app_name, pid } => {
+                                println!("🚀 Application started in VM: {} (PID: {})", app_name, pid);
+                            }
+                            _ => {
+                                println!("📦 Other message: {:?}", msg);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("🔌 Guest agent disconnected: {}", e);
+                    break;
+                }
+            }
+        }
+        
+        Ok(())
     }
 }

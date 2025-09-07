@@ -5,23 +5,36 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 ## Features
 
 - 🔒 **Application Isolation**: Each application runs in its own VM for security
-- 🪟 **Seamless Windows**: VM application windows appear as native host windows *(in development)*
-- 📋 **Clipboard Sharing**: Secure clipboard sharing between host and VMs via SPICE
-- 🚀 **Direct Installation**: Applications install directly (no containers)
-- 🖥️ **SPICE Integration**: Full graphics, audio, and input support
-- ⚙️ **Minimal Overhead**: Uses Cage compositor for single-app focus
+- 📦 **Dynamic Package Installation**: Install any system or Flatpak packages on-demand
+- 🚀 **Auto-Launch Applications**: Specified applications start automatically when VM boots
+- 🔓 **Auto-Login**: Passwordless login with direct desktop access
+- 🖥️ **kitty Terminal**: Always available in every VM for CLI tasks
+- 🪟 **Window Proxy System**: TCP-based communication with comprehensive window event handling
+- 📋 **Clipboard Sharing**: Secure clipboard sharing between host and VMs
+- 🖥️ **X11 Integration**: Full graphics, audio, and input support with X11/GDM
+- 💾 **Password Management**: Centralized storage of VM credentials
 - 🔧 **Cross-Architecture**: Supports x86_64 and aarch64
 
 ## Current Status
 
-**✅ Working Now:**
-- VM provisioning with Fedora + application installation
-- SPICE viewer with clipboard sharing
-- LibreWolf browser template
-- Audio passthrough
+**✅ Implemented:**
+- VM provisioning with Fedora + dynamic package installation
+- System package installation (dnf-based) and Flatpak package support
+- Auto-launch system with systemd services for specified applications
+- Auto-login with GDM configuration (passwordless access)
+- kitty terminal emulator included by default in all VMs
+- Advanced window proxy architecture with TCP communication (port 9999)
+- X11 window detection using xwininfo/wmctrl
+- Length-prefixed binary protocol for window events
+- Comprehensive window event handling (8 message types)
+- Wayland client framework with compositor integration
+- Clipboard proxy with bidirectional sharing
+- Centralized password storage and management
 
-**🚧 In Development:**
-- Seamless window proxy (VM windows → native host windows)
+**🚧 In Progress:**
+- Wayland surface instantiation (framework complete)
+- Buffer sharing and graphics acceleration
+- Input event forwarding from host to VM
 - VirtIO channels for improved performance
 
 ## Quick Start
@@ -50,23 +63,27 @@ cargo build --release
 
 ### Basic Usage
 
-1. **Create a LibreWolf VM**:
+1. **Create VMs with Dynamic Packages**:
 ```bash
-# Interactive mode
-./target/release/vm-provisioner create
+# Firefox browser VM
+./target/release/vm-provisioner create --flatpak org.mozilla.firefox
 
-# From template
-./target/release/vm-provisioner create --template librewolf
+# LibreOffice + development tools
+./target/release/vm-provisioner create --system libreoffice git --name office-vm
 
-# Non-interactive
-./target/release/vm-provisioner create --template librewolf -y
+# Multiple applications with custom resources
+./target/release/vm-provisioner create --flatpak com.spotify.Client --flatpak com.slack.Slack --memory 8192 --vcpus 4
+
+# Custom VM name and packages
+./target/release/vm-provisioner create --flatpak org.mozilla.firefox --system htop --name my-browser-vm
 ```
 
 2. **Start the VM**:
 ```bash
-./target/release/vm-provisioner start librewolf-vm
+./target/release/vm-provisioner start firefox-vm
 # SPICE viewer will launch automatically
-# Login credentials will be displayed
+# Auto-login enabled - no password required
+# Specified applications will launch automatically
 ```
 
 3. **Manage VMs**:
@@ -74,37 +91,60 @@ cargo build --release
 # List all VMs
 ./target/release/vm-provisioner list
 
-# Show all VM passwords
+# Show all VM passwords (for console access if needed)
 ./target/release/vm-provisioner passwords
 
 # Connect to VM console
-./target/release/vm-provisioner console librewolf-vm
+./target/release/vm-provisioner console firefox-vm
 # Use credentials: user / [generated-password]
+# Note: SPICE viewer has auto-login, console needs password
 
 # Stop VM
-./target/release/vm-provisioner stop librewolf-vm
+./target/release/vm-provisioner stop firefox-vm
 
 # Destroy VM
-./target/release/vm-provisioner destroy librewolf-vm
+./target/release/vm-provisioner destroy firefox-vm
 ```
 
-## VM Templates
+## Package Examples
 
-### LibreWolf Browser
-- **Application**: LibreWolf (privacy-focused Firefox)
-- **Graphics**: Wayland with hardware acceleration  
-- **Features**: Clipboard sharing, audio passthrough
-- **Use case**: Isolated web browsing
+### System Packages (via dnf)
+```bash
+# Productivity
+--system libreoffice gimp inkscape
 
-### Office (Planned)
-- **Application**: LibreOffice suite
-- **Features**: Document editing in isolation
-- **Use case**: Secure document handling
+# Development  
+--system git gcc rust cargo python3 nodejs npm
 
-### Development (Planned)
-- **Applications**: VS Code, Rust/Python toolchain
-- **Features**: Isolated development environment
-- **Use case**: Secure code development
+# Media
+--system vlc mpv audacity
+
+# System tools
+--system htop neofetch tree wget curl
+```
+
+### Flatpak Packages
+```bash
+# Browsers
+--flatpak org.mozilla.firefox
+--flatpak io.gitlab.librewolf-community
+--flatpak com.google.Chrome
+
+# Communication
+--flatpak com.slack.Slack
+--flatpak com.discordapp.Discord
+--flatpak org.telegram.desktop
+
+# Media & Entertainment
+--flatpak com.spotify.Client
+--flatpak org.videolan.VLC
+--flatpak org.kde.kdenlive
+
+# Development
+--flatpak com.visualstudio.code
+--flatpak org.kde.kdevelop
+--flatpak com.jetbrains.IntelliJ-IDEA-Community
+```
 
 ## Configuration
 
@@ -112,34 +152,38 @@ VM configurations and passwords are automatically stored:
 
 ### Individual VM Config
 ```toml
-# ~/.config/vm-provisioner/librewolf-vm.toml
-[vm]
-name = "librewolf-vm"
+# ~/.config/vm-provisioner/firefox-vm.toml
+name = "firefox-vm"
 memory_mb = 4096
 vcpus = 2
 disk_size_gb = 20
+vm_dir = "/var/lib/libvirt/images"
+
+# Package installation
+system_packages = ["@base-x", "gdm", "xorg-x11-server-Xorg", "wmctrl", "xwininfo", "pipewire", "wl-clipboard", "kitty"]
+flatpak_packages = ["org.mozilla.firefox"]
+auto_launch_apps = ["flatpak run org.mozilla.firefox"]
+
+# Graphics and features
 graphics_backend = "VirtioGpu"
 enable_clipboard = true
 enable_audio = true
-user_password = "abc123generated"
+enable_usb_passthrough = false
+enable_auto_login = true
 
-[app]
-type = "Browser"
-command = "/usr/bin/librewolf"
-profile_path = "/home/user/.librewolf"
-
-[packages]
-system = ["cage", "wayland", "pipewire", "wl-clipboard"]
-app = ["librewolf"]
+# Security
+network_mode = "Nat"
+firewall_rules = ["OUTPUT -p udp --dport 53 -j ACCEPT", "OUTPUT -p tcp --dport 443 -j ACCEPT"]
+user_password = "vm-abc123def456"
 ```
 
 ### Centralized Password Storage
 ```toml
 # ~/.config/vm-provisioner/vm-passwords.toml
 [vms]
-librewolf-vm = "abc123generated"
-work-browser = "def456different"
-banking-vm = "xyz789another"
+firefox-vm = "vm-abc123def456"
+office-vm = "vm-789xyz012abc"
+dev-vm = "vm-456def789ghi"
 ```
 
 ## Architecture
@@ -149,46 +193,58 @@ banking-vm = "xyz789another"
 │     Host OS     │    │   VM (Fedora)   │
 │                 │    │                 │
 │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ Window      │◄┼────┼─┤ Cage        │ │
-│ │ Proxy       │ │    │ │ Compositor  │ │
-│ │             │ │    │ │             │ │
+│ │ Window      │◄┼────┼─┤ Guest       │ │
+│ │ Proxy       │ │    │ │ Agent       │ │
+│ │ TCP:9999    │ │    │ │             │ │
 │ │ ┌─────────┐ │ │    │ │ ┌─────────┐ │ │
-│ │ │ Native  │ │ │    │ │ │LibreWolf│ │ │
-│ │ │ Window  │ │ │    │ │ │         │ │ │
+│ │ │ Wayland │ │ │    │ │ │LibreWolf│ │ │
+│ │ │ Client  │ │ │    │ │ │ + X11   │ │ │
+│ │ │Framework│ │ │    │ │ │         │ │ │
 │ │ └─────────┘ │ │    │ │ └─────────┘ │ │
 │ └─────────────┘ │    │ └─────────────┘ │
 └─────────────────┘    └─────────────────┘
          ▲                       │
-         │      SPICE Protocol   │
+         │ TCP Binary Protocol   │
          └───────────────────────┘
 ```
 
-## Current Implementation: SPICE Viewer
+## Current Implementation: Window Proxy System
 
-**How it works now:**
-1. VM runs LibreWolf in Cage compositor (single-app mode)
-2. SPICE server streams VM display to host
-3. `remote-viewer` shows VM in separate window
-4. Clipboard automatically syncs between host and VM
-5. Audio passes through to host speakers
+**How it works:**
+1. VM runs applications in X11 desktop environment (GDM) with auto-login
+2. kitty terminal and specified packages (system + Flatpak) are auto-installed
+3. Auto-launch systemd services start specified applications on boot
+4. Guest agent monitors X11 windows using xwininfo/wmctrl
+5. Window events (8 types: create/destroy/resize/move/focus/title) sent to host via TCP
+6. Host window proxy receives events with length-prefixed binary protocol
+7. Wayland client framework processes events and creates native windows
+8. Clipboard synchronized bidirectionally with wl-clipboard integration
+
+**Window Detection Flow:**
+```
+VM Boot: Auto-login + auto-launch applications → X11 windows created
+    ↓
+Guest Agent: xwininfo detects new windows
+    ↓  
+Guest Agent: Serializes WindowMessage::WindowCreated for each
+    ↓
+TCP:9999: Sends length-prefixed binary data to host
+    ↓
+Host Proxy: Receives and deserializes messages  
+    ↓
+Wayland Client: Processes events and creates native windows
+```
 
 **Commands:**
 ```bash
-# Start VM and launch SPICE viewer
-vm-provisioner start librewolf-vm
+# Start VM with window proxy
+vm-provisioner start firefox-vm
+# Window proxy automatically starts, guest agent runs in VM
+# Applications auto-launch on boot with auto-login
 
-# Manual connection
-remote-viewer spice://127.0.0.1:5900
+# Manual guest agent (inside VM) - connects to host TCP:9999
+/usr/local/bin/guest-agent
 ```
-
-## Future: Seamless Window Integration
-
-**Development roadmap:**
-1. **Window Proxy** (`src/window_proxy.rs`): Intercept SPICE graphics and create native Wayland windows
-2. **Guest Agent** (`src/guest_agent.rs`): Detect application windows within VM
-3. **SPICE Bridge**: Parse SPICE display commands to extract window regions
-
-**Result**: LibreWolf windows appear as native host windows, indistinguishable from host applications.
 
 ## Security
 
@@ -200,7 +256,7 @@ remote-viewer spice://127.0.0.1:5900
 
 ## Commands
 
-- `create` - Create new application VM
+- `create` - Create new VM with dynamic packages
 - `start` - Start VM and launch viewer  
 - `stop` - Stop running VM
 - `list` - Show all VMs and their status
@@ -210,45 +266,58 @@ remote-viewer spice://127.0.0.1:5900
 
 ### Command Options
 
-- `--template <name>` - Use predefined template (librewolf, office, dev)
+**VM Creation:**
+- `--name <name>` - Custom VM name (auto-generated if not provided)
+- `--system <pkg>` - System packages to install (can be used multiple times)
+- `--flatpak <pkg>` - Flatpak packages to install (can be used multiple times)
+- `--memory <mb>` - Memory allocation in MB (default: 4096)
+- `--vcpus <n>` - Number of virtual CPUs (default: 2)
+- `--disk <gb>` - Disk size in GB (default: 20)
 - `--config <path>` - Use custom configuration file
 - `--yes, -y` - Skip confirmation prompts
-- `--memory <mb>` - Override memory allocation
-- `--vcpus <n>` - Override CPU allocation
 
 ## Examples
 
-### Create Browser VM with Custom Resources
+### Browser VMs for Different Use Cases
 ```bash
-vm-provisioner create --template librewolf --memory 8192 --vcpus 4 -y
-# Displays: Username: user, Password: [generated]
+# Personal Firefox with high resources
+vm-provisioner create --flatpak org.mozilla.firefox --memory 8192 --vcpus 4 --name personal-browser
+
+# Work browser with Slack
+vm-provisioner create --flatpak io.gitlab.librewolf-community --flatpak com.slack.Slack --name work-browser
+
+# Banking browser (isolated)
+vm-provisioner create --flatpak org.mozilla.firefox --name banking-browser
 ```
 
-### Multiple Isolated Browsers
+### Development Environment
 ```bash
-# Personal browsing
-vm-provisioner create --template librewolf --name personal-browser
+# Full development setup
+vm-provisioner create --flatpak com.visualstudio.code --system git gcc rust cargo python3 nodejs npm --name dev-env --memory 8192 --disk 40
 
-# Work browsing  
-vm-provisioner create --template librewolf --name work-browser
-
-# Banking (separate VM for financial sites)
-vm-provisioner create --template librewolf --name banking-browser
-
-# View all passwords
-vm-provisioner passwords
+# Quick Python development
+vm-provisioner create --system python3 python3-pip git --flatpak com.visualstudio.code --name python-dev
 ```
 
-### Password Management
+### Media & Productivity
 ```bash
-# Show all VM credentials
-vm-provisioner passwords
+# Media editing suite
+vm-provisioner create --flatpak org.kde.kdenlive --flatpak org.gimp.GIMP --system audacity --memory 8192 --name media-vm
 
-# Manual password lookup
-cat ~/.config/vm-provisioner/vm-passwords.toml
+# Office suite with extras
+vm-provisioner create --system libreoffice --flatpak com.slack.Slack --flatpak org.telegram.desktop --name office-vm
+```
 
-# Start VM (displays password)
-vm-provisioner start librewolf-vm
+### Auto-Generated VM Names
+```bash
+# VM will be named "org-mozilla-firefox-vm" 
+vm-provisioner create --flatpak org.mozilla.firefox
+
+# VM will be named "git-vm"
+vm-provisioner create --system git
+
+# VM will be named "app-vm-[timestamp]"
+vm-provisioner create
 ```
 
 ## Troubleshooting

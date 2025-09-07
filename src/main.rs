@@ -1,11 +1,12 @@
 mod config;
 mod provisioner;
 mod window_proxy;
+mod guest_agent;
 
 use std::path::Path;
 use std::collections::HashMap;
 use clap::{Parser, Subcommand};
-use dialoguer::{Select, Confirm};
+use dialoguer::Confirm;
 use tokio;
 use serde::{Serialize, Deserialize};
 
@@ -63,9 +64,17 @@ struct Cli {
 enum Commands {
     /// Create a new application VM
     Create {
-        /// Use a specific template
+        /// VM name
         #[arg(short, long)]
-        template: Option<String>,
+        name: Option<String>,
+        
+        /// System packages to install (can be used multiple times)
+        #[arg(long, action = clap::ArgAction::Append)]
+        system: Vec<String>,
+        
+        /// Flatpak packages to install (can be used multiple times)
+        #[arg(long, action = clap::ArgAction::Append)]
+        flatpak: Vec<String>,
         
         /// Skip interactive configuration
         #[arg(short = 'y', long)]
@@ -74,6 +83,18 @@ enum Commands {
         /// Configuration file path
         #[arg(short, long)]
         config: Option<String>,
+        
+        /// Memory in MB (default: 4096)
+        #[arg(long, default_value = "4096")]
+        memory: u64,
+        
+        /// Number of CPUs (default: 2)
+        #[arg(long, default_value = "2")]
+        vcpus: u32,
+        
+        /// Disk size in GB (default: 20)
+        #[arg(long, default_value = "20")]
+        disk: u64,
     },
     
     /// Start an existing VM
@@ -114,33 +135,6 @@ enum Commands {
         name: String,
     },
     
-    /// Manage templates
-    Template {
-        #[command(subcommand)]
-        action: TemplateAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum TemplateAction {
-    /// List available templates
-    List,
-    
-    /// Create custom template
-    Create {
-        /// Template name
-        name: String,
-    },
-    
-    /// Export template
-    Export {
-        /// Template name
-        name: String,
-        
-        /// Output file
-        #[arg(short, long)]
-        output: String,
-    },
 }
 
 #[tokio::main]
@@ -148,8 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Create { template, yes, config } => {
-            create_vm(template, yes, config).await?;
+        Commands::Create { name, system, flatpak, yes, config, memory, vcpus, disk } => {
+            create_vm(name, system, flatpak, yes, config, memory, vcpus, disk).await?;
         }
         
         Commands::Start { name, seamless } => {
@@ -176,47 +170,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connect_console(name)?;
         }
         
-        Commands::Template { action } => {
-            handle_template(action).await?;
-        }
     }
     
     Ok(())
 }
 
 async fn create_vm(
-    template: Option<String>, 
-    skip_confirm: bool, 
-    config_path: Option<String>
+    name: Option<String>,
+    system_packages: Vec<String>,
+    flatpak_packages: Vec<String>,
+    skip_confirm: bool,
+    config_path: Option<String>,
+    memory: u64,
+    vcpus: u32,
+    disk: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 VM Provisioner - Application VM Creator");
-    println!("==========================================");
+    println!("🚀 VM Provisioner - Dynamic Package Installer");
+    println!("==============================================");
     
     let config = if let Some(path) = config_path {
         // Load from file
         let content = std::fs::read_to_string(path)?;
         toml::from_str::<AppVMConfig>(&content)?
-    } else if let Some(template_name) = template {
-        // Use predefined template
-        match template_name.as_str() {
-            "librewolf" | "browser" => AppVMConfig::librewolf_template(),
-            "office" => AppVMConfig::office_template(),
-            "dev" | "development" => AppVMConfig::development_template(),
-            _ => {
-                eprintln!("Unknown template: {}", template_name);
-                eprintln!("Available templates: librewolf, office, dev");
-                std::process::exit(1);
-            }
-        }
     } else {
-        // Interactive mode
-        AppVMConfig::interactive_config().await?
+        // Generate VM name if not provided
+        let vm_name = if let Some(name) = name {
+            name
+        } else if !flatpak_packages.is_empty() {
+            format!("{}-vm", flatpak_packages[0].replace(".", "-"))
+        } else if !system_packages.is_empty() {
+            format!("{}-vm", system_packages[0])
+        } else {
+            format!("app-vm-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+        };
+        
+        // Create config with dynamic packages
+        AppVMConfig::new(vm_name, memory, vcpus, disk, system_packages, flatpak_packages)
     };
     
     // Display configuration
     println!("\n📋 VM Configuration:");
     println!("   Name: {}", config.name);
-    println!("   Type: {:?}", config.app_type);
+    println!("   System Packages: {:?}", config.system_packages);
+    println!("   Flatpak Packages: {:?}", config.flatpak_packages);
     println!("   Memory: {} MB", config.memory_mb);
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
@@ -285,29 +281,23 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
     let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.start_vm()?;
     
-    // Start window integration if seamless mode
-    if seamless && matches!(config.graphics_backend, 
-                           config::GraphicsBackend::VirtioGpu) {
-        println!("🪟 Starting seamless window integration...");
-        
-        // Launch window proxy in background
-        let vm_name_clone = name.clone();
-        std::thread::spawn(move || {
-            let mut integration = VMIntegrationHost::new(vm_name_clone);
-            if let Err(e) = integration.start() {
-                eprintln!("Window integration error: {}", e);
-            }
-        });
-        
-        println!("✅ Seamless mode active");
-        println!("   Application windows will appear as native windows");
-        
-        if config.enable_clipboard {
-            println!("   Clipboard sharing enabled");
+    // Start window proxy for seamless integration (always enabled now)
+    println!("🪟 Starting window proxy...");
+    
+    // Launch window proxy in background  
+    let vm_name_clone = name.clone();
+    std::thread::spawn(move || {
+        let mut integration = VMIntegrationHost::new(vm_name_clone);
+        if let Err(e) = integration.start() {
+            eprintln!("Window integration error: {}", e);
         }
-    } else if seamless {
-        println!("ℹ️  Seamless mode not available (requires VirtIO-GPU)");
-        println!("   Connect using: virt-viewer {}", name);
+    });
+    
+    println!("✅ Window proxy started");
+    println!("   Waiting for guest agent connection...");
+    
+    if config.enable_clipboard {
+        println!("   Clipboard sharing enabled");
     }
     
     // Display login credentials
@@ -366,7 +356,8 @@ fn list_vms() -> Result<(), Box<dyn std::error::Error>> {
                 let status = get_vm_status(&config.name);
                 
                 println!("  {} [{}]", config.name, status);
-                println!("    Type: {:?}", config.app_type);
+                println!("    System Packages: {:?}", config.system_packages);
+                println!("    Flatpak Packages: {:?}", config.flatpak_packages);
                 println!("    Memory: {} MB", config.memory_mb);
                 println!("    Graphics: {:?}", config.graphics_backend);
             }
@@ -423,49 +414,6 @@ fn connect_console(name: String) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_template(action: TemplateAction) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        TemplateAction::List => {
-            println!("📋 Available Templates:");
-            println!("======================");
-            println!("  librewolf  - LibreWolf browser in isolated VM");
-            println!("  office     - LibreOffice suite");
-            println!("  dev        - Development environment");
-            println!("");
-            println!("Use: vm-provisioner create --template <name>");
-        }
-        
-        TemplateAction::Create { name } => {
-            println!("Creating custom template: {}", name);
-            let config = AppVMConfig::interactive_config().await?;
-            
-            // Save as template
-            let template_dir = format!("{}/.config/vm-provisioner/templates", 
-                                      std::env::var("HOME")?);
-            std::fs::create_dir_all(&template_dir)?;
-            
-            let template_file = format!("{}/{}.toml", template_dir, name);
-            std::fs::write(&template_file, toml::to_string_pretty(&config)?)?;
-            
-            println!("✅ Template saved: {}", template_file);
-        }
-        
-        TemplateAction::Export { name, output } => {
-            let template_file = format!("{}/.config/vm-provisioner/templates/{}.toml", 
-                                       std::env::var("HOME")?, name);
-            
-            if !Path::new(&template_file).exists() {
-                eprintln!("❌ Template not found: {}", name);
-                std::process::exit(1);
-            }
-            
-            std::fs::copy(&template_file, &output)?;
-            println!("✅ Template exported to: {}", output);
-        }
-    }
-    
-    Ok(())
-}
 
 fn get_vm_status(name: &str) -> String {
     match std::process::Command::new("virsh")

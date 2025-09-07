@@ -4,7 +4,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{AppVMConfig, AppType, GraphicsBackend, NetworkMode};
+use crate::config::{AppVMConfig, GraphicsBackend};
 
 pub struct AppVMProvisioner {
     config: AppVMConfig,
@@ -17,7 +17,8 @@ impl AppVMProvisioner {
     
     pub async fn provision_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Starting Application VM provisioning...");
-        println!("   Application: {}", self.config.app_command);
+        println!("   System packages: {:?}", self.config.system_packages);
+        println!("   Flatpak packages: {:?}", self.config.flatpak_packages);
         
         // Check prerequisites
         self.check_prerequisites()?;
@@ -39,7 +40,8 @@ impl AppVMProvisioner {
         
         println!("✅ Application VM provisioned successfully!");
         println!("   VM Name: {}", self.config.name);
-        println!("   Application: {}", self.config.app_command);
+        println!("   System packages: {:?}", self.config.system_packages);
+        println!("   Flatpak packages: {:?}", self.config.flatpak_packages);
         println!("   Graphics: {:?}", self.config.graphics_backend);
         println!("   Clipboard: {}", if self.config.enable_clipboard { "Enabled" } else { "Disabled" });
         
@@ -126,53 +128,50 @@ impl AppVMProvisioner {
         
         println!("🏗️  Generating kickstart configuration...");
         
-        // Build package list
-        let mut all_packages = self.config.system_packages.clone();
-        all_packages.extend(self.config.app_packages.clone());
-        let packages = all_packages.join("\n");
+        // Build package list from system packages only
+        let packages = self.config.system_packages.join("\n");
         
-        // Build repository configuration for LibreWolf if needed
-        let repo_config = if self.config.app_packages.contains(&"librewolf".to_string()) {
-            r#"
-# Add LibreWolf repository
-cat > /etc/yum.repos.d/librewolf.repo << 'EOF'
-[librewolf]
-name=LibreWolf
-baseurl=https://rpm.librewolf.net/x86_64
-enabled=1
-gpgcheck=1
-gpgkey=https://rpm.librewolf.net/pubkey.gpg
-EOF
-dnf install -y librewolf"#
+        // Build Flatpak configuration if flatpak packages specified
+        let flatpak_config = if !self.config.flatpak_packages.is_empty() {
+            let mut config = String::from(r#"
+# Install and configure Flatpak
+dnf install -y flatpak
+
+# Add Flathub repository
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+# Install Flatpak packages
+"#);
+            for package in &self.config.flatpak_packages {
+                config.push_str(&format!("flatpak install -y flathub {}\n", package));
+            }
+            
+            config.push_str("\n# Verify installations\nflatpak list\n");
+            config
         } else {
-            ""
+            "".to_string()
         };
         
-        // Build environment variables
-        let env_vars = self.config.app_env_vars
-            .iter()
-            .map(|(k, v)| format!("export {}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("\n");
-        
-        // Build Cage compositor configuration
-        let cage_config = format!(r#"
-# Create Cage service for auto-starting application
-cat > /etc/systemd/system/cage-app.service << 'EOF'
+        // Build auto-launch configuration
+        let auto_launch_config = if !self.config.auto_launch_apps.is_empty() {
+            let mut config = String::from("\n# Auto-launch applications\n");
+            for (i, app_cmd) in self.config.auto_launch_apps.iter().enumerate() {
+                config.push_str(&format!(r#"
+# Auto-launch service {}
+cat > /etc/systemd/system/auto-launch-{}.service << 'EOF'
 [Unit]
-Description=Cage Wayland Compositor with Application
-After=multi-user.target
+Description=Auto Launch Application {}
+After=graphical-session.target
+Wants=display-manager.service
 
 [Service]
 Type=simple
 User=user
-PAMName=login
-TTYPath=/dev/tty7
+Environment="DISPLAY=:0"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
-Environment="WAYLAND_DISPLAY=wayland-0"
-{}
-ExecStartPre=/bin/bash -c 'mkdir -p /run/user/1000 && chown user:user /run/user/1000'
-ExecStart=/usr/bin/cage -- {}
+Environment="XDG_SESSION_TYPE=x11"
+ExecStartPre=/bin/bash -c 'while ! pgrep -x Xorg; do sleep 1; done'
+ExecStart={}
 Restart=on-failure
 RestartSec=5
 
@@ -180,13 +179,47 @@ RestartSec=5
 WantedBy=graphical.target
 EOF
 
-# Enable the service
-systemctl enable cage-app.service
+systemctl enable auto-launch-{}.service
+"#, i + 1, i + 1, i + 1, app_cmd, i + 1));
+            }
+            config
+        } else {
+            "".to_string()
+        };
+        
+        // Build guest agent service configuration
+        let app_config = format!(r#"
+# Create guest agent service
+cat > /etc/systemd/system/guest-agent.service << 'EOF'
+[Unit]
+Description=VM Guest Agent for Window Management
+After=graphical.target
+Wants=display-manager.service
+
+[Service]
+Type=simple
+User=user
+Environment="DISPLAY=:0"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="XDG_SESSION_TYPE=x11"
+ExecStartPre=/bin/bash -c 'while ! pgrep -x Xorg; do sleep 1; done'
+ExecStart=/usr/local/bin/guest-agent
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target
+EOF
+
+# Enable the services
+systemctl enable guest-agent.service
+systemctl enable gdm
+
+{}
 
 # Set graphical target as default
 systemctl set-default graphical.target"#,
-            env_vars,
-            self.config.app_command
+            self.get_autologin_config(),
         );
         
         // Build clipboard daemon configuration if enabled
@@ -273,20 +306,20 @@ firewall --enabled
 # Post-installation script
 %post --log=/var/log/kickstart-post.log
 
-# Add extra repositories if needed
+# Install flatpak packages if specified
+{}
+
+# Configure auto-launch applications
 {}
 
 # Configure sudo for user
 echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/user
 
-# Configure Wayland environment
+# Configure X11 environment
 mkdir -p /home/user/.config
 cat > /home/user/.config/environment << 'EOF'
-MOZ_ENABLE_WAYLAND=1
-WAYLAND_DISPLAY=wayland-0
-XDG_SESSION_TYPE=wayland
-QT_QPA_PLATFORM=wayland
-GDK_BACKEND=wayland
+DISPLAY=:0
+XDG_SESSION_TYPE=x11
 EOF
 
 {}
@@ -298,14 +331,41 @@ EOF
 # Configure firewall rules
 {}
 
-# Create window manager agent placeholder
-cat > /usr/local/bin/vm-window-agent << 'EOF'
-#!/bin/bash
-# VM Window Agent - communicates with host for window management
-# This will be replaced with the actual Rust agent
-echo "VM Window Agent started"
+# Install build tools and compile guest agent
+dnf install -y rust cargo git
+
+# Create guest agent source
+mkdir -p /tmp/guest-agent-build
+cat > /tmp/guest-agent-build/Cargo.toml << 'EOF'
+[package]
+name = "guest-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = {{ version = "1.0", features = ["derive"] }}
+bincode = "1.3"
+regex = "1.10"
 EOF
-chmod +x /usr/local/bin/vm-window-agent
+
+# Copy guest agent source (this would be injected from the host)
+# For now, create a minimal version
+cat > /tmp/guest-agent-build/src/main.rs << 'EOF'
+fn main() {{
+    println!("Guest agent placeholder - will be replaced with full implementation");
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}}
+EOF
+
+mkdir -p /tmp/guest-agent-build/src
+cd /tmp/guest-agent-build
+cargo build --release
+cp target/release/guest-agent /usr/local/bin/guest-agent
+chmod +x /usr/local/bin/guest-agent
+
+# Cleanup build files
+cd /
+rm -rf /tmp/guest-agent-build
 
 # Disable unnecessary services
 systemctl disable bluetooth
@@ -321,11 +381,12 @@ dnf clean all
 
 # Reboot after installation
 reboot"#,
-            self.config.app_command,
+            self.config.name,
             self.config.user_password,
             packages,
-            repo_config,
-            cage_config,
+            flatpak_config,
+            auto_launch_config,
+            app_config,
             clipboard_config,
             audio_config,
             firewall_rules,
@@ -343,7 +404,7 @@ reboot"#,
         let arch = std::env::consts::ARCH;
         let install_location = match arch {
             "x86_64" => "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Server/x86_64/os/",
-            "aarch64" => "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Server/aarch64/os/",
+            "aarch64" => "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Everything/aarch64/os/",
             _ => return Err(format!("Unsupported architecture: {}", arch).into()),
         };
         
@@ -541,5 +602,19 @@ reboot"#,
         println!("✅ VM destroyed");
         
         Ok(())
+    }
+    
+    fn get_autologin_config(&self) -> String {
+        if self.config.enable_auto_login {
+            r#"
+# Configure GDM for auto-login
+cat > /etc/gdm/custom.conf << 'EOF'
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=user
+EOF"#.to_string()
+        } else {
+            "".to_string()
+        }
     }
 }
