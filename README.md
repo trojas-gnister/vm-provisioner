@@ -36,6 +36,8 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - Seamless window integration (framework complete, needs surface instantiation)
 - VirtIO channels for improved performance
 - GPU passthrough for hardware acceleration
+- Reduce RAM requirement for VM installation (2GB of RAM currently unsupported. 4GB of RAM is the current minimum)
+- Enhance managing state of VM through CLI (Currently destroy command has inconsistencies)
 
 ## Quick Start
 
