@@ -64,21 +64,24 @@ impl AppVMConfig {
         flatpak_packages: Vec<String>,
     ) -> Self {
         // Default system packages including kitty terminal
+        // Build dependencies are now installed in post-install script
         let mut default_system_packages = vec![
-            "@base-x".to_string(),
             "i3".to_string(),
             "i3status".to_string(),
             "i3lock".to_string(),
             "dmenu".to_string(),
+            "rofi".to_string(),                  // Better application launcher with Flatpak support
             "xorg-x11-server-Xorg".to_string(),
             "xorg-x11-xinit".to_string(),
-            "xorg-x11-server-utils".to_string(), // includes xrandr
-            "wmctrl".to_string(),
-            "xwininfo".to_string(),
-            "pipewire".to_string(),
-            "wl-clipboard".to_string(),
-            "spice-vdagent".to_string(),  // SPICE agent for clipboard/resolution
-            "kitty".to_string(),  // Default terminal emulator
+            "xset".to_string(),                  // X11 settings utility (CRITICAL for startup)
+            "xrandr".to_string(),                // X11 resolution control
+            "wmctrl".to_string(),                // Window management for guest agent
+            "xwininfo".to_string(),              // Window information for guest agent
+            "pipewire".to_string(),              // Audio system
+            "wl-clipboard".to_string(),          // Clipboard utilities
+            "spice-vdagent".to_string(),         // SPICE agent for clipboard/resolution
+            "kitty".to_string(),                 // Default terminal emulator
+            "git".to_string(),                   // Version control (needed for spice-autorandr)
         ];
         
         // Add user-specified system packages

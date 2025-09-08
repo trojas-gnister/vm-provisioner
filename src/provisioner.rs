@@ -129,8 +129,38 @@ impl AppVMProvisioner {
         
         println!("🏗️  Generating kickstart configuration...");
         
-        // Build package list from system packages only
-        let packages = self.config.system_packages.join("\n");
+        // Build package list from system packages, separating build deps from runtime deps
+        let mut base_packages = vec![
+            "@core".to_string(),
+            "@base-x".to_string(),
+            "i3".to_string(),
+            "i3status".to_string(),
+            "i3lock".to_string(),
+            "dmenu".to_string(),
+            "rofi".to_string(),
+            "xorg-x11-server-Xorg".to_string(),
+            "xorg-x11-xinit".to_string(),
+            "xset".to_string(),  // This is critical for X11 readiness check
+            "xrandr".to_string(),
+            "wmctrl".to_string(),
+            "xwininfo".to_string(),
+            "pipewire".to_string(),
+            "wl-clipboard".to_string(),
+            "spice-vdagent".to_string(),
+            "kitty".to_string(),
+            "git".to_string(), // Needed for cloning spice-autorandr
+        ];
+        
+        // Add user-specified system packages (filter out build deps)
+        for pkg in &self.config.system_packages {
+            if !pkg.contains("-devel") && !pkg.contains("autoconf") && 
+               !pkg.contains("automake") && !pkg.contains("libtool") &&
+               !pkg.contains("pkgconfig") && !pkg.contains("gcc") && !pkg.contains("make") {
+                base_packages.push(pkg.clone());
+            }
+        }
+        
+        let packages = base_packages.join("\n");
         
         // Build Flatpak configuration if flatpak packages specified
         let flatpak_config = if !self.config.flatpak_packages.is_empty() {
@@ -303,8 +333,35 @@ firewall --enabled
 {}
 %end
 
-# Post-installation script
+# Post-installation script  
 %post --log=/var/log/kickstart-post.log
+
+# Enable comprehensive logging for debugging
+set -x
+exec > >(tee -a /var/log/kickstart-post-detailed.log) 2>&1
+echo "=== Post-installation script started at $(date) ==="
+
+# Check what packages were actually installed in the base install
+echo "=== Checking installed packages ==="
+rpm -qa | grep -E "(i3|xset|xrandr|kitty|git|rofi)" | sort
+
+# Verify critical packages and install if missing
+echo "=== Verifying critical packages ==="
+MISSING_PACKAGES=()
+for pkg in i3 xset xrandr kitty git rofi wmctrl xwininfo spice-vdagent; do
+    if ! rpm -q $pkg &>/dev/null; then
+        echo "Missing package: $pkg"
+        MISSING_PACKAGES+=($pkg)
+    else
+        echo "Package installed: $pkg"
+    fi
+done
+
+# Install any missing critical packages
+if [ ${{#MISSING_PACKAGES[@]}} -gt 0 ]; then
+    echo "=== Installing missing packages ==="
+    dnf install -y "${{MISSING_PACKAGES[@]}}"
+fi
 
 # Install flatpak packages if specified
 {}
@@ -371,8 +428,66 @@ rm -rf /tmp/guest-agent-build
 systemctl disable bluetooth
 systemctl disable cups
 
-# Set hostname
+# Set hostname  
 echo "{}" > /etc/hostname
+
+# Final verification and status report
+echo "=== FINAL VERIFICATION ==="
+echo "Date: $(date)"
+echo ""
+
+echo "Critical packages status:"
+for pkg in i3 xset xrandr kitty git rofi wmctrl xwininfo spice-vdagent; do
+    if rpm -q $pkg &>/dev/null; then
+        echo "✓ $pkg: INSTALLED"
+    else
+        echo "✗ $pkg: MISSING"
+    fi
+done
+
+echo ""
+echo "spice-autorandr status:"
+if [ -f /usr/local/bin/spice-autorandr ]; then
+    echo "✓ spice-autorandr: INSTALLED"
+    ls -la /usr/local/bin/spice-autorandr
+else
+    echo "✗ spice-autorandr: MISSING"
+fi
+
+echo ""
+echo "Auto-login service status:"
+if [ -f /etc/systemd/system/autologin@.service ]; then
+    echo "✓ autologin@.service: CONFIGURED"
+else
+    echo "✗ autologin@.service: MISSING"
+fi
+
+echo ""
+echo "User configuration status:"
+echo "User home directory contents:"
+ls -la /home/user/
+echo ""
+echo "User .xinitrc exists:"
+if [ -f /home/user/.xinitrc ]; then
+    echo "✓ .xinitrc: EXISTS"
+    echo "Owner: $(stat -c '%U:%G' /home/user/.xinitrc)"
+else
+    echo "✗ .xinitrc: MISSING"
+fi
+
+echo ""
+echo "i3 config exists:"
+if [ -f /home/user/.config/i3/config ]; then
+    echo "✓ i3 config: EXISTS"
+    echo "Auto-start apps in config:"
+    grep -c "exec --no-startup-id" /home/user/.config/i3/config || echo "0"
+else
+    echo "✗ i3 config: MISSING"
+fi
+
+echo ""
+echo "=== POST-INSTALL SCRIPT COMPLETED ==="
+echo "Check logs at /var/log/kickstart-post.log and /var/log/kickstart-post-detailed.log"
 
 # Final cleanup
 dnf clean all
@@ -418,7 +533,7 @@ reboot"#,
         let graphics_args = match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu => {
                 if arch == "aarch64" {
-                    // ARM64: Use virtio video with SPICE graphics
+                    // ARM64: Use virtio video with spice-autorandr for auto-resize
                     vec!["--graphics", "spice", "--video", "virtio", 
                          "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
                 } else {
@@ -584,30 +699,118 @@ reboot"#,
     pub fn destroy_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🗑️  Destroying VM: {}", self.config.name);
         
-        // Force stop if running
-        let _ = Command::new("virsh")
-            .args(&["destroy", &self.config.name])
-            .output();
+        // Check if VM exists first
+        let list_output = Command::new("virsh")
+            .args(&["list", "--all"])
+            .output()?;
         
-        // Undefine VM
-        Command::new("virsh")
-            .args(&["undefine", &self.config.name, "--nvram"])
-            .status()?;
-        
-        // Remove disk
-        let disk_path = format!("{}/{}.qcow2", self.config.vm_dir, self.config.name);
-        if Path::new(&disk_path).exists() {
-            fs::remove_file(&disk_path)?;
+        if !String::from_utf8_lossy(&list_output.stdout).contains(&self.config.name) {
+            println!("   VM {} not found in virsh list", self.config.name);
+            // Still try to clean up disk
+        } else {
+            // Force stop if running
+            println!("   Force stopping VM...");
+            let destroy_output = Command::new("virsh")
+                .args(&["destroy", &self.config.name])
+                .output();
+            
+            match destroy_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        println!("   VM stopped successfully");
+                    } else {
+                        println!("   VM stop failed or already stopped: {}", 
+                                String::from_utf8_lossy(&output.stderr));
+                    }
+                }
+                Err(e) => println!("   Error stopping VM: {}", e),
+            }
+            
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            
+            // Undefine VM (remove from libvirt)
+            println!("   Removing VM definition...");
+            let undefine_output = Command::new("virsh")
+                .args(&["undefine", &self.config.name, "--remove-all-storage", "--nvram"])
+                .output();
+            
+            match undefine_output {
+                Ok(output) => {
+                    if output.status.success() {
+                        println!("   VM definition removed with storage");
+                    } else {
+                        println!("   Undefine with storage failed: {}", 
+                                String::from_utf8_lossy(&output.stderr));
+                        println!("   Trying without storage flags...");
+                        
+                        // Try simpler undefine
+                        let simple_undefine = Command::new("virsh")
+                            .args(&["undefine", &self.config.name])
+                            .output()?;
+                        
+                        if simple_undefine.status.success() {
+                            println!("   VM definition removed (without storage)");
+                        } else {
+                            println!("   Simple undefine also failed: {}", 
+                                    String::from_utf8_lossy(&simple_undefine.stderr));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("   Error running undefine: {}", e);
+                }
+            }
         }
         
-        println!("✅ VM destroyed");
+        // Remove disk manually
+        let disk_path = format!("{}/{}.qcow2", self.config.vm_dir, self.config.name);
+        if Path::new(&disk_path).exists() {
+            println!("   Removing disk image: {}", disk_path);
+            match fs::remove_file(&disk_path) {
+                Ok(_) => println!("   ✅ Disk removed successfully"),
+                Err(e) => {
+                    println!("   Permission denied ({}), trying with sudo...", e);
+                    let sudo_result = Command::new("sudo")
+                        .args(&["rm", "-f", &disk_path])
+                        .output();
+                        
+                    match sudo_result {
+                        Ok(output) => {
+                            if output.status.success() {
+                                println!("   ✅ Disk removed with sudo");
+                            } else {
+                                println!("   ❌ Failed to remove disk even with sudo: {}", 
+                                        String::from_utf8_lossy(&output.stderr));
+                            }
+                        }
+                        Err(e) => println!("   ❌ Sudo command failed: {}", e),
+                    }
+                }
+            }
+        } else {
+            println!("   Disk image not found at: {}", disk_path);
+        }
+        
+        // Final verification
+        let final_check = Command::new("virsh")
+            .args(&["list", "--all"])
+            .output()?;
+        
+        if String::from_utf8_lossy(&final_check.stdout).contains(&self.config.name) {
+            println!("   ⚠️  Warning: VM still appears in virsh list");
+            println!("   You may need to manually run: virsh undefine {}", self.config.name);
+        } else {
+            println!("   ✅ VM successfully removed from libvirt");
+        }
+        
+        println!("✅ VM destruction completed");
         
         Ok(())
     }
     
     fn get_autologin_config(&self) -> String {
         if self.config.enable_auto_login {
-            r#"
+            let mut result = r#"
 # Configure auto-login with i3 via systemd
 # Create auto-login service that starts X11 with i3
 cat > /etc/systemd/system/autologin@.service << 'EOF'
@@ -638,39 +841,123 @@ EOF
 # Enable auto-login on tty1
 systemctl enable autologin@tty1.service
 
+# Enable spice-vdagentd socket for auto-resize (starts daemon on demand)
+systemctl enable spice-vdagentd.socket
+
 # Create .xinitrc for user to start i3
 cat > /home/user/.xinitrc << 'EOF'
 #!/bin/bash
-# Start SPICE agent for clipboard/resolution
-/usr/bin/spice-vdagent &
+
+# Comprehensive logging for debugging
+exec > /tmp/xinitrc.log 2>&1
+echo "=== .xinitrc started at $(date) ==="
+set -x
+
+# Set up X11 environment
+export DISPLAY=:0
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# Add Flatpak paths to XDG_DATA_DIRS for dmenu integration
+export XDG_DATA_DIRS="/usr/local/share:/usr/share:/var/lib/flatpak/exports/share:$HOME/.local/share/flatpak/exports/share:$XDG_DATA_DIRS"
+
+echo "Environment: DISPLAY=$DISPLAY, XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+echo "XDG_DATA_DIRS: $XDG_DATA_DIRS"
+
+# Wait for X11 to be ready with timeout
+echo "Waiting for X11 to be ready..."
+timeout=30
+count=0
+while ! DISPLAY=:0 xset q &>/dev/null; do
+    if [ $count -ge $timeout ]; then
+        echo "X11 timeout after ${timeout}s, proceeding anyway..."
+        break
+    fi
+    echo "X11 not ready, waiting... ($count/$timeout)"
+    sleep 1
+    count=$((count + 1))
+done
+echo "X11 check completed (timeout: $count/$timeout)"
+
+# Ensure X11 authority is properly set
+echo "Setting X11 authority..."
+xauth generate :0 . trusted
+echo "X11 authority set"
+
+# Start SPICE agent user session (system daemon should already be running)
+if command -v spice-vdagent >/dev/null 2>&1; then
+    echo "Starting spice-vdagent..."
+    DISPLAY=:0 XDG_RUNTIME_DIR="/run/user/$(id -u)" spice-vdagent &
+    sleep 1
+    echo "spice-vdagent started"
+else
+    echo "spice-vdagent not found!"
+fi
+
+# Check i3 before starting
+echo "Checking i3 installation..."
+which i3
+i3 --version
 
 # Start i3 window manager
+echo "About to exec i3..."
 exec i3
 EOF
 chmod +x /home/user/.xinitrc
 chown user:user /home/user/.xinitrc
 
-# Create user systemd service to auto-start X11
+# Auto-start X11 when user logs into tty1
+cat > /home/user/.bash_profile << 'EOF'
+# Debug autologin
+echo "bash_profile executed at $(date)" >> /tmp/autologin.log
+echo "Current tty: $(tty)" >> /tmp/autologin.log
+echo "DISPLAY: $DISPLAY" >> /tmp/autologin.log
+echo "XDG_VTNR: $XDG_VTNR" >> /tmp/autologin.log
+
+# Auto-start X11 on tty1 login
+if [[ -z $DISPLAY ]]; then
+    # Check if we're on tty1 (multiple ways to detect)
+    if [[ $(tty) == "/dev/tty1" ]] || [[ "$XDG_VTNR" -eq 1 ]] || [[ $(fgconsole 2>/dev/null) -eq 1 ]]; then
+        echo "Starting X11 on tty1..." | tee -a /tmp/autologin.log
+        exec startx -- vt1
+    else
+        echo "Not on tty1, not starting X11" >> /tmp/autologin.log
+    fi
+else
+    echo "DISPLAY already set, not starting X11" >> /tmp/autologin.log
+fi
+EOF
+chown user:user /home/user/.bash_profile
+
+# Create systemd user service as fallback for X11 startup
 mkdir -p /home/user/.config/systemd/user
 cat > /home/user/.config/systemd/user/startx.service << 'EOF'
 [Unit]
 Description=Start X11 session
 After=graphical-session-pre.target
-Wants=graphical-session-pre.target
 
 [Service]
-Type=simple
+Type=oneshot
 ExecStart=/usr/bin/startx
-Restart=on-failure
-RestartSec=5
+Environment=DISPLAY=:0
+Restart=no
 
 [Install]
 WantedBy=default.target
 EOF
 
-# Enable the startx service for user
+# Create user cache directory and fix permissions
+mkdir -p /home/user/.cache
+mkdir -p /home/user/.local/share
+mkdir -p /home/user/.local/bin
+
+# Fix ownership of all user directories
 chown -R user:user /home/user/.config
-systemctl --user enable startx.service
+chown -R user:user /home/user/.cache
+chown -R user:user /home/user/.local
+chown -R user:user /home/user/.*
+
+# Enable the user service (will be activated when user session starts)
+sudo -u user systemctl --user enable startx.service
 
 # Create default i3 config
 mkdir -p /home/user/.config/i3
@@ -690,8 +977,11 @@ bindsym $mod+Return exec kitty
 # Kill focused window
 bindsym $mod+Shift+q kill
 
-# Start dmenu (app launcher)
-bindsym $mod+d exec dmenu_run
+# Start rofi (app launcher) - better Flatpak support than dmenu
+bindsym $mod+d exec rofi -show drun -p "Applications"
+
+# Alternative: traditional dmenu 
+bindsym $mod+Shift+d exec dmenu_run -p "Run:" -fn "DejaVu Sans Mono-10"
 
 # Change focus
 bindsym $mod+j focus left
@@ -737,8 +1027,86 @@ bindsym $mod+Shift+e exec "i3-nagbar -t warning -m 'Exit i3?' -b 'Yes' 'i3-msg e
 bar {
     status_command i3status
 }
+
+# Auto-start applications
 EOF
-chown -R user:user /home/user/.config"#.to_string()
+
+# Add auto-start commands for installed applications"#.to_string();
+
+            // Add auto-start commands for each application
+            for app_command in &self.config.auto_launch_apps {
+                result.push_str(&format!("\necho \"exec --no-startup-id {}\" >> /home/user/.config/i3/config", app_command));
+            }
+
+            result.push_str(r#"
+
+# Final comprehensive ownership fix for all user directories
+chown -R user:user /home/user/.config
+chown -R user:user /home/user/.cache
+chown -R user:user /home/user/.local
+chown -R user:user /home/user/.xinitrc
+chown -R user:user /home/user/.bash_profile
+
+# Ensure proper permissions for user directories
+chmod 755 /home/user/.config
+chmod 755 /home/user/.cache
+chmod 755 /home/user/.local
+
+# Install build dependencies for spice-autorandr (must be done in post-install)
+echo "Installing build dependencies for spice-autorandr..."
+dnf install -y gcc make autoconf automake libtool libXrandr-devel libX11-devel systemd-devel pkgconfig xorg-x11-proto-devel xorg-x11-util-macros
+
+# Install and configure spice-autorandr for automatic resolution adjustment
+echo "Building spice-autorandr..."
+cd /tmp
+if git clone https://github.com/seife/spice-autorandr.git; then
+    cd spice-autorandr
+    if autoreconf -is; then
+        if ./configure; then
+            if make; then
+                cp spice-autorandr /usr/local/bin/
+                chmod +x /usr/local/bin/spice-autorandr
+                echo "spice-autorandr installed successfully"
+            else
+                echo "ERROR: spice-autorandr make failed"
+            fi
+        else
+            echo "ERROR: spice-autorandr configure failed"
+        fi
+    else
+        echo "ERROR: spice-autorandr autoreconf failed"
+    fi
+else
+    echo "ERROR: spice-autorandr git clone failed"
+fi
+
+# Create systemd service for spice-autorandr
+cat > /etc/systemd/system/spice-autorandr.service << 'EOF'
+[Unit]
+Description=SPICE Auto Resolution Adjustment
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spice-autorandr
+Restart=always
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+User=user
+Group=user
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable the spice-autorandr service
+systemctl enable spice-autorandr.service"#);
+
+            result
         } else {
             "".to_string()
         }

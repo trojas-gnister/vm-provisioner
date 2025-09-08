@@ -1,41 +1,41 @@
 # VM Provisioner - Qubes-like Application Isolation System
 
-A Rust-based application isolation system inspired by Qubes OS. Creates lightweight VMs for individual applications (browser, office, development) with seamless window integration where VM windows appear as native host windows.
+A Rust-based application isolation system inspired by Qubes OS. Creates lightweight VMs with dynamic package installation (system + Flatpak) featuring auto-login, auto-launch applications, i3 window manager, SPICE integration with auto-resize functionality, and comprehensive Flatpak support.
 
 ## Features
 
 - 🔒 **Application Isolation**: Each application runs in its own VM for security
-- 📦 **Dynamic Package Installation**: Install any system or Flatpak packages on-demand
+- 📦 **Dynamic Package Installation**: Install any system (dnf) or Flatpak packages on-demand
 - 🚀 **Auto-Launch Applications**: Specified applications start automatically when VM boots
-- 🔓 **Auto-Login**: Passwordless login with direct desktop access
-- 🖥️ **kitty Terminal**: Always available in every VM for CLI tasks
-- 🪟 **Window Proxy System**: TCP-based communication with comprehensive window event handling
-- 📋 **Clipboard Sharing**: Secure clipboard sharing between host and VMs
-- 🖥️ **i3 Window Manager**: Pure X11 environment with lightweight i3 for optimal compatibility
-- 💾 **Password Management**: Centralized storage of VM credentials
-- 🔧 **Cross-Architecture**: Supports x86_64 and aarch64
+- 🔓 **Auto-Login**: Passwordless login with i3 window manager and desktop access
+- 🖥️ **kitty Terminal**: Default terminal emulator included in every VM
+- 🪟 **SPICE Integration**: Auto-resize functionality with comprehensive window management
+- 📋 **Clipboard Sharing**: Bidirectional clipboard sharing between host and VMs via SPICE
+- 🖥️ **i3 Window Manager**: Lightweight tiling window manager with full X11 compatibility
+- 🚀 **Application Launcher**: rofi with complete Flatpak integration and discovery
+- 💾 **Password Management**: Centralized storage and individual VM credential management
+- 🔧 **Cross-Architecture**: Full support for x86_64 and aarch64 (ARM64)
+- 📏 **Auto-Resize**: Dynamic resolution adjustment using spice-autorandr (ARM64 compatible)
 
 ## Current Status
 
-**✅ Implemented:**
-- VM provisioning with Fedora + dynamic package installation
-- System package installation (dnf-based) and Flatpak package support
-- Auto-launch system with systemd services for specified applications
-- Auto-login with i3 window manager (passwordless X11 access)
-- kitty terminal emulator included by default in all VMs
-- Advanced window proxy architecture with TCP communication (port 9999)
-- X11 window detection using xwininfo/wmctrl
-- Length-prefixed binary protocol for window events
-- Comprehensive window event handling (8 message types)
-- Wayland client framework with compositor integration
-- Clipboard proxy with bidirectional sharing
-- Centralized password storage and management
+**✅ Fully Working System:**
+- **Complete VM isolation**: Each application runs in its own secure VM
+- **Dynamic package installation**: Install any system (dnf) or Flatpak packages on-demand
+- **Auto-login & auto-launch**: Passwordless login with applications starting automatically
+- **SPICE integration**: Full clipboard sharing and auto-resize functionality working on ARM64/x86_64
+- **Robust package management**: All critical packages (xset, i3, kitty, etc.) install correctly
+- **Cross-architecture support**: ARM64 and x86_64 compatibility verified and working
+- **Advanced CLI**: --system and --flatpak flags for dynamic VM creation
+- **Application launcher**: rofi with full Flatpak integration and discovery
+- **Comprehensive logging**: Detailed installation logs for troubleshooting
+- **VM lifecycle management**: create/start/stop/destroy/list/passwords all working
+- **Centralized password storage**: Secure credential management system
 
-**🚧 In Progress:**
-- Wayland surface instantiation (framework complete)
-- Buffer sharing and graphics acceleration
-- Input event forwarding from host to VM
+**🚧 Future Enhancements:**
+- Seamless window integration (framework complete, needs surface instantiation)
 - VirtIO channels for improved performance
+- GPU passthrough for hardware acceleration
 
 ## Quick Start
 
@@ -65,25 +65,28 @@ cargo build --release
 
 1. **Create VMs with Dynamic Packages**:
 ```bash
-# Firefox browser VM
-./target/release/vm-provisioner create --flatpak org.mozilla.firefox
+# LibreWolf browser VM (auto-named "io-gitlab-librewolf-community-vm")
+./target/release/vm-provisioner create --flatpak io.gitlab.librewolf-community
 
-# LibreOffice + development tools
-./target/release/vm-provisioner create --system libreoffice git --name office-vm
+# LibreWolf + qBittorrent with custom name
+./target/release/vm-provisioner create --flatpak io.gitlab.librewolf-community --system qbittorrent --name media-vm
 
-# Multiple applications with custom resources
-./target/release/vm-provisioner create --flatpak com.spotify.Client --flatpak com.slack.Slack --memory 8192 --vcpus 4
+# Development environment with multiple tools
+./target/release/vm-provisioner create --flatpak com.visualstudio.code --system git gcc rust cargo nodejs npm --name dev-vm --memory 8192
 
-# Custom VM name and packages
-./target/release/vm-provisioner create --flatpak org.mozilla.firefox --system htop --name my-browser-vm
+# Office suite with communication apps
+./target/release/vm-provisioner create --system libreoffice --flatpak com.slack.Slack --flatpak org.telegram.desktop --name office-vm
 ```
 
 2. **Start the VM**:
 ```bash
-./target/release/vm-provisioner start firefox-vm
-# SPICE viewer will launch automatically
-# Auto-login enabled - no password required
-# Specified applications will launch automatically
+./target/release/vm-provisioner start media-vm
+# SPICE viewer launches automatically with i3 window manager
+# Auto-login enabled - no password required  
+# Applications auto-launch on boot (LibreWolf + qBittorrent)
+# Auto-resize works when you resize virt-viewer window
+# Clipboard sharing enabled between host and VM
+# Use Mod+d for rofi launcher, Mod+Enter for terminal
 ```
 
 3. **Manage VMs**:
@@ -94,16 +97,16 @@ cargo build --release
 # Show all VM passwords (for console access if needed)
 ./target/release/vm-provisioner passwords
 
-# Connect to VM console
-./target/release/vm-provisioner console firefox-vm
+# Connect to VM console (if needed)
+./target/release/vm-provisioner console media-vm
 # Use credentials: user / [generated-password]
-# Note: SPICE viewer has auto-login, console needs password
+# Note: SPICE viewer has auto-login, console requires password
 
 # Stop VM
-./target/release/vm-provisioner stop firefox-vm
+./target/release/vm-provisioner stop media-vm
 
-# Destroy VM
-./target/release/vm-provisioner destroy firefox-vm
+# Destroy VM (with comprehensive cleanup)
+./target/release/vm-provisioner destroy media-vm
 ```
 
 ## Package Examples
@@ -253,9 +256,10 @@ vm-provisioner start firefox-vm
 
 VMs use the lightweight i3 window manager for optimal X11 compatibility and performance:
 
-### Basic i3 Shortcuts
+### Key Shortcuts
 - `Mod+Enter` - Open kitty terminal
-- `Mod+d` - Open dmenu (application launcher)  
+- `Mod+d` - Open rofi (application launcher with Flatpak support)
+- `Mod+Shift+d` - Open dmenu (traditional command launcher)
 - `Mod+Shift+q` - Close focused window
 - `Mod+1,2,3,4,5` - Switch to workspace 1-5
 - `Mod+Shift+1,2,3,4,5` - Move window to workspace 1-5
@@ -266,15 +270,19 @@ VMs use the lightweight i3 window manager for optimal X11 compatibility and perf
 
 **Note**: `Mod` key is typically the Windows/Super key
 
-### Launching Applications
-```bash
-# Via dmenu (Mod+d)
-# Type application name and press Enter
+### Application Launcher Features
+- **rofi** (`Mod+d`): Shows all applications including Flatpak packages with icons
+- **Auto-launch**: Installed packages start automatically on VM boot
+- **Flatpak Integration**: Proper XDG_DATA_DIRS configuration for app discovery
+- **Terminal**: Access via `Mod+Enter` for kitty terminal
 
+### Launching Applications Manually
+```bash
+# Via rofi (Mod+d) - recommended, shows all apps with icons
+# Via dmenu (Mod+Shift+d) - traditional text-based launcher
 # Via terminal (Mod+Enter, then type):
-firefox  # If installed as system package
-flatpak run org.mozilla.firefox  # If installed as Flatpak
-qbittorrent  # System package example
+qbittorrent                            # System package
+flatpak run io.gitlab.librewolf-community  # Flatpak package
 ```
 
 ### Window Management
@@ -364,19 +372,30 @@ vm-provisioner create
 - Verify KVM support: `lsmod | grep kvm`
 - Check disk space: `df -h /var/lib/libvirt/images/`
 
+### Auto-Resize Not Working
+- **Enable in virt-manager**: Go to View menu → "Auto resize VM with window" 
+- Check spice-autorandr service: `systemctl status spice-autorandr.service`
+- Start if needed: `sudo systemctl start spice-autorandr.service`
+- For ARM64: Uses spice-autorandr instead of QXL (QXL not supported on ARM64)
+
+### Flatpak Apps Not in Launcher
+- Fixed automatically with rofi and proper XDG_DATA_DIRS configuration
+- Use `Mod+d` for rofi launcher (shows all Flatpak apps)
+
+### Applications Not Auto-Starting
+- Applications should start automatically via i3 exec commands
+- Check i3 config: `cat ~/.config/i3/config | grep "exec --no-startup-id"`
+- Manual start: `DISPLAY=:0 flatpak run <app-id>` or `DISPLAY=:0 <system-app>`
+
 ### SPICE Connection Issues
 - Ensure VM is running: `virsh list`
-- Check SPICE port: `virsh domdisplay VM_NAME`
-- Install virt-viewer: `sudo dnf install virt-viewer`
-
-### Clipboard Not Working
-- Install wl-clipboard on host: `dnf install wl-clipboard`
-- Verify SPICE agent in VM: `systemctl status spice-vdagentd`
+- Check spice-vdagentd: `sudo systemctl status spice-vdagentd`
+- Verify clipboard sharing: SPICE protocol handles this automatically
 
 ### Performance Issues
 - Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`
 - Increase VM memory: Use `--memory` option
-- Enable hardware acceleration: Coming in future updates
+- VirtIO-GPU provides good performance on both x86_64 and ARM64
 
 ## Development
 
@@ -398,4 +417,4 @@ See `CLAUDE.md` for detailed development tasks and architecture decisions.
 
 ---
 
-**Note**: This project is under active development. The seamless window integration is not yet complete - VMs currently display via SPICE viewer. See `CLAUDE.md` for detailed development roadmap.
+**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and auto-resize capabilities. VMs currently display via SPICE viewer with seamless clipboard sharing and dynamic resolution adjustment. Future seamless window integration framework is in place - see `CLAUDE.md` for development details.
