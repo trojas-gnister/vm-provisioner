@@ -417,4 +417,4 @@ See `CLAUDE.md` for detailed development tasks and architecture decisions.
 
 ---
 
-**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and auto-resize capabilities. VMs currently display via SPICE viewer with seamless clipboard sharing and dynamic resolution adjustment. Future seamless window integration framework is in place - see `CLAUDE.md` for development details.
+**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and auto-resize capabilities. VMs currently display via SPICE viewer with seamless clipboard sharing and dynamic resolution adjustment. Future seamless window integration framework is in place.
