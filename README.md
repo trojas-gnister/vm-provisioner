@@ -412,8 +412,6 @@ cargo test
 2. Add to template matching in `src/main.rs`
 3. Update documentation and tests
 
-### Contributing to Window Proxy
-See `CLAUDE.md` for detailed development tasks and architecture decisions.
 
 ---
 
