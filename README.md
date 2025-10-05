@@ -39,6 +39,28 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - Reduce RAM requirement for VM installation (2GB of RAM currently unsupported. 4GB of RAM is the current minimum)
 - Enhance managing state of VM through CLI (Currently destroy command has inconsistencies)
 
+## VM Modes
+
+### GUI Mode (Default)
+Full desktop environment with i3 window manager, SPICE viewer, auto-login, and application auto-launch. Ideal for browser isolation, graphical applications, and desktop productivity tools.
+
+### Headless Mode
+Lightweight CLI-only VMs with no X11, no desktop environment, and no graphics. Access via serial console. Perfect for:
+- Development environments (compilers, interpreters, build tools)
+- Server applications (databases, web servers)
+- CLI tools and utilities
+- Minimal resource usage
+
+### PCI Passthrough
+Direct hardware access for VMs. Two modes:
+- **Hot-plug (dynamic)**: Devices attach when VM starts, detach when VM stops (gives device back to host)
+- **Permanent**: Devices reserved for VM in XML configuration
+
+Requirements:
+- IOMMU enabled in BIOS (VT-d for Intel, AMD-Vi for AMD)
+- Kernel parameter: `intel_iommu=on` or `amd_iommu=on`
+- Run `lspci` to find device addresses
+
 ## Quick Start
 
 ### Prerequisites
@@ -48,7 +70,7 @@ Install required tools:
 # Fedora/RHEL
 sudo dnf install libvirt qemu-kvm virt-install virt-viewer
 
-# Ubuntu/Debian  
+# Ubuntu/Debian
 sudo apt install libvirt-daemon qemu-kvm virtinst virt-viewer
 
 # Start libvirt service
@@ -82,13 +104,18 @@ cargo build --release
 
 2. **Start the VM**:
 ```bash
+# GUI VM - launches SPICE viewer
 ./target/release/vm-provisioner start media-vm
 # SPICE viewer launches automatically with i3 window manager
-# Auto-login enabled - no password required  
+# Auto-login enabled - no password required
 # Applications auto-launch on boot (LibreWolf + qBittorrent)
 # Auto-resize works when you resize virt-viewer window
 # Clipboard sharing enabled between host and VM
 # Use Mod+d for rofi launcher, Mod+Enter for terminal
+
+# Headless VM - connect via console
+./target/release/vm-provisioner start dev-vm
+# Then: virsh console dev-vm
 ```
 
 3. **Manage VMs**:
@@ -118,7 +145,7 @@ cargo build --release
 # Productivity
 --system libreoffice gimp inkscape
 
-# Development  
+# Development
 --system git gcc rust cargo python3 nodejs npm
 
 # Media
@@ -231,12 +258,12 @@ dev-vm = "vm-456def789ghi"
 VM Boot: Auto-login + auto-launch applications → X11 windows created
     ↓
 Guest Agent: xwininfo detects new windows
-    ↓  
+    ↓
 Guest Agent: Serializes WindowMessage::WindowCreated for each
     ↓
 TCP:9999: Sends length-prefixed binary data to host
     ↓
-Host Proxy: Receives and deserializes messages  
+Host Proxy: Receives and deserializes messages
     ↓
 Wayland Client: Processes events and creates native windows
 ```
@@ -304,7 +331,7 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 ## Commands
 
 - `create` - Create new VM with dynamic packages
-- `start` - Start VM and launch viewer  
+- `start` - Start VM and launch viewer
 - `stop` - Stop running VM
 - `list` - Show all VMs and their status
 - `passwords` - Show login credentials for all VMs
@@ -320,6 +347,9 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 - `--memory <mb>` - Memory allocation in MB (default: 4096)
 - `--vcpus <n>` - Number of virtual CPUs (default: 2)
 - `--disk <gb>` - Disk size in GB (default: 20)
+- `--headless` - Headless mode - no GUI/desktop environment (CLI only)
+- `--pci <address>` - PCI device to passthrough (format: 0000:01:00.0, repeatable)
+- `--pci-hotplug` - Enable PCI hot-plug mode (attach on start, detach on stop)
 - `--config <path>` - Use custom configuration file
 - `--yes, -y` - Skip confirmation prompts
 
@@ -339,11 +369,14 @@ vm-provisioner create --flatpak org.mozilla.firefox --name banking-browser
 
 ### Development Environment
 ```bash
-# Full development setup
+# Full development setup with GUI
 vm-provisioner create --flatpak com.visualstudio.code --system git gcc rust cargo python3 nodejs npm --name dev-env --memory 8192 --disk 40
 
-# Quick Python development
-vm-provisioner create --system python3 python3-pip git --flatpak com.visualstudio.code --name python-dev
+# Headless Python development (CLI only, no X11/desktop)
+vm-provisioner create --system python3 python3-pip git vim tmux --name python-dev --headless
+
+# Headless Rust toolchain
+vm-provisioner create --system rust cargo git --name rust-dev --headless --memory 2048
 ```
 
 ### Media & Productivity
@@ -355,9 +388,24 @@ vm-provisioner create --flatpak org.kde.kdenlive --flatpak org.gimp.GIMP --syste
 vm-provisioner create --system libreoffice --flatpak com.slack.Slack --flatpak org.telegram.desktop --name office-vm
 ```
 
+### PCI Passthrough Examples
+```bash
+# GPU passthrough with hot-plug (dynamic - gives GPU back to host when VM stops)
+vm-provisioner create --flatpak org.mozilla.firefox --pci 0000:01:00.0 --pci-hotplug --name gpu-browser
+
+# Permanent GPU passthrough (GPU reserved for VM)
+vm-provisioner create --flatpak org.mozilla.firefox --pci 0000:01:00.0 --name gpu-browser
+
+# Multiple PCI devices
+vm-provisioner create --pci 0000:01:00.0 --pci 0000:02:00.0 --pci-hotplug --name multi-device-vm
+
+# Find your PCI devices
+lspci -nn  # List all PCI devices with addresses
+```
+
 ### Auto-Generated VM Names
 ```bash
-# VM will be named "org-mozilla-firefox-vm" 
+# VM will be named "org-mozilla-firefox-vm"
 vm-provisioner create --flatpak org.mozilla.firefox
 
 # VM will be named "git-vm"
@@ -375,7 +423,7 @@ vm-provisioner create
 - Check disk space: `df -h /var/lib/libvirt/images/`
 
 ### Auto-Resize Not Working
-- **Enable in virt-manager**: Go to View menu → "Auto resize VM with window" 
+- **Enable in virt-manager**: Go to View menu → "Auto resize VM with window"
 - Check spice-autorandr service: `systemctl status spice-autorandr.service`
 - Start if needed: `sudo systemctl start spice-autorandr.service`
 - For ARM64: Uses spice-autorandr instead of QXL (QXL not supported on ARM64)
@@ -393,6 +441,21 @@ vm-provisioner create
 - Ensure VM is running: `virsh list`
 - Check spice-vdagentd: `sudo systemctl status spice-vdagentd`
 - Verify clipboard sharing: SPICE protocol handles this automatically
+
+### PCI Passthrough Issues
+- **IOMMU not enabled**: Enable VT-d/AMD-Vi in BIOS and add kernel parameter
+  ```bash
+  # Check if IOMMU enabled
+  dmesg | grep -e IOMMU -e DMAR
+
+  # Add to GRUB: /etc/default/grub
+  GRUB_CMDLINE_LINUX="intel_iommu=on"  # or amd_iommu=on
+  sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+  ```
+- **Device not found**: Use `lspci -nn -D` to find correct address
+- **IOMMU group warnings**: All devices in same group must be passed through together
+- **Permission denied**: Commands use sudo for driver binding
+- **Hot-plug fails**: Check `dmesg` and `virsh dumpxml <vm>` for errors
 
 ### Performance Issues
 - Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`
@@ -418,3 +481,7 @@ cargo test
 ---
 
 **Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and auto-resize capabilities. VMs currently display via SPICE viewer with seamless clipboard sharing and dynamic resolution adjustment. Future seamless window integration framework is in place.
+
+
+## PERSONAL TODOs
+- setup a vm with a torrent cli and wireguard vpn or mullvadvpn cli

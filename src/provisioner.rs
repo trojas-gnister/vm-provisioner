@@ -4,10 +4,87 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{AppVMConfig, GraphicsBackend};
+use crate::config::{AppVMConfig, GraphicsBackend, PciDevice};
 
 pub struct AppVMProvisioner {
     config: AppVMConfig,
+}
+
+/// Public function to detect and validate a PCI device
+pub fn detect_pci_device(address: &str) -> Result<PciDevice, Box<dyn std::error::Error>> {
+    // 1. Check device exists
+    let lspci_output = Command::new("lspci")
+        .args(&["-s", address, "-nn", "-k"])
+        .output()?;
+
+    if !lspci_output.status.success() || lspci_output.stdout.is_empty() {
+        return Err(format!("PCI device {} not found. Run 'lspci' to see available devices.", address).into());
+    }
+
+    let output_str = String::from_utf8_lossy(&lspci_output.stdout);
+    let first_line = output_str.lines().next().unwrap_or("");
+
+    // 2. Parse vendor:device IDs from lspci output
+    // Format: 01:00.0 VGA compatible controller [0300]: NVIDIA Corporation [10de:1c03] (rev a1)
+    let (vendor_id, device_id) = parse_vendor_device_ids(&output_str)?;
+
+    // 3. Extract description
+    let description = if let Some(desc_start) = first_line.find(": ") {
+        let desc = &first_line[desc_start + 2..];
+        // Remove the [vendor:device] part if present
+        if let Some(bracket_pos) = desc.find(" [") {
+            desc[..bracket_pos].to_string()
+        } else {
+            desc.to_string()
+        }
+    } else {
+        "Unknown device".to_string()
+    };
+
+    // 4. Get current driver
+    let original_driver = get_current_driver(address);
+
+    // 5. Get IOMMU group
+    let iommu_group = get_iommu_group(address);
+
+    Ok(PciDevice {
+        address: address.to_string(),
+        vendor_id,
+        device_id,
+        description,
+        original_driver,
+        iommu_group,
+    })
+}
+
+fn parse_vendor_device_ids(lspci_output: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    // Look for pattern like [10de:1c03]
+    if let Some(start) = lspci_output.find('[') {
+        if let Some(end) = lspci_output[start..].find(']') {
+            let ids = &lspci_output[start + 1..start + end];
+            if let Some(colon_pos) = ids.find(':') {
+                let vendor = ids[..colon_pos].to_string();
+                let device = ids[colon_pos + 1..].to_string();
+                return Ok((vendor, device));
+            }
+        }
+    }
+    Err("Could not parse vendor:device IDs from lspci output".into())
+}
+
+fn get_current_driver(address: &str) -> Option<String> {
+    let driver_path = format!("/sys/bus/pci/devices/{}/driver", address);
+    fs::read_link(&driver_path)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+}
+
+fn get_iommu_group(address: &str) -> Option<u32> {
+    let iommu_path = format!("/sys/bus/pci/devices/{}/iommu_group", address);
+    fs::read_link(&iommu_path)
+        .ok()
+        .and_then(|p| p.file_name()
+            .and_then(|n| n.to_string_lossy().parse::<u32>().ok()))
 }
 
 impl AppVMProvisioner {
@@ -19,9 +96,14 @@ impl AppVMProvisioner {
         println!("🚀 Starting Application VM provisioning...");
         println!("   System packages: {:?}", self.config.system_packages);
         println!("   Flatpak packages: {:?}", self.config.flatpak_packages);
-        
+
         // Check prerequisites
         self.check_prerequisites()?;
+
+        // Validate PCI passthrough if devices specified
+        if !self.config.pci_devices.is_empty() {
+            self.validate_pci_passthrough()?;
+        }
         
         // Download Fedora ISO
         let iso_path = self.download_fedora_iso()?;
@@ -37,7 +119,12 @@ impl AppVMProvisioner {
         
         // Configure window management integration
         self.setup_window_management()?;
-        
+
+        // Setup PCI passthrough if devices specified (permanent mode)
+        if !self.config.pci_devices.is_empty() && !self.config.pci_hotplug {
+            self.setup_pci_passthrough_permanent()?;
+        }
+
         println!("✅ Application VM provisioned successfully!");
         println!("   VM Name: {}", self.config.name);
         println!("   System packages: {:?}", self.config.system_packages);
@@ -124,32 +211,41 @@ impl AppVMProvisioner {
     fn generate_kickstart_config(&self) -> Result<String, Box<dyn std::error::Error>> {
         let kickstart_dir = format!("/tmp/{}-kickstart", self.config.name);
         fs::create_dir_all(&kickstart_dir)?;
-        
+
         let kickstart_path = format!("{}/kickstart.cfg", kickstart_dir);
-        
+
         println!("🏗️  Generating kickstart configuration...");
-        
+
         // Build package list from system packages, separating build deps from runtime deps
-        let mut base_packages = vec![
-            "@core".to_string(),
-            "@base-x".to_string(),
-            "i3".to_string(),
-            "i3status".to_string(),
-            "i3lock".to_string(),
-            "dmenu".to_string(),
-            "rofi".to_string(),
-            "xorg-x11-server-Xorg".to_string(),
-            "xorg-x11-xinit".to_string(),
-            "xset".to_string(),  // This is critical for X11 readiness check
-            "xrandr".to_string(),
-            "wmctrl".to_string(),
-            "xwininfo".to_string(),
-            "pipewire".to_string(),
-            "wl-clipboard".to_string(),
-            "spice-vdagent".to_string(),
-            "kitty".to_string(),
-            "git".to_string(), // Needed for cloning spice-autorandr
-        ];
+        let mut base_packages = if self.config.headless {
+            // Headless mode: minimal packages only
+            vec![
+                "@core".to_string(),
+                "git".to_string(),
+            ]
+        } else {
+            // GUI mode: full desktop environment
+            vec![
+                "@core".to_string(),
+                "@base-x".to_string(),
+                "i3".to_string(),
+                "i3status".to_string(),
+                "i3lock".to_string(),
+                "dmenu".to_string(),
+                "rofi".to_string(),
+                "xorg-x11-server-Xorg".to_string(),
+                "xorg-x11-xinit".to_string(),
+                "xset".to_string(),  // This is critical for X11 readiness check
+                "xrandr".to_string(),
+                "wmctrl".to_string(),
+                "xwininfo".to_string(),
+                "pipewire".to_string(),
+                "wl-clipboard".to_string(),
+                "spice-vdagent".to_string(),
+                "kitty".to_string(),
+                "git".to_string(), // Needed for cloning spice-autorandr
+            ]
+        };
         
         // Add user-specified system packages (filter out build deps)
         for pkg in &self.config.system_packages {
@@ -162,8 +258,8 @@ impl AppVMProvisioner {
         
         let packages = base_packages.join("\n");
         
-        // Build Flatpak configuration if flatpak packages specified
-        let flatpak_config = if !self.config.flatpak_packages.is_empty() {
+        // Build Flatpak configuration if flatpak packages specified (GUI mode only)
+        let flatpak_config = if !self.config.headless && !self.config.flatpak_packages.is_empty() {
             let mut config = String::from(r#"
 # Install and configure Flatpak
 dnf install -y flatpak
@@ -183,8 +279,8 @@ flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flat
             "".to_string()
         };
         
-        // Build auto-launch configuration
-        let auto_launch_config = if !self.config.auto_launch_apps.is_empty() {
+        // Build auto-launch configuration (GUI mode only)
+        let auto_launch_config = if !self.config.headless && !self.config.auto_launch_apps.is_empty() {
             let mut config = String::from("\n# Auto-launch applications\n");
             for (i, app_cmd) in self.config.auto_launch_apps.iter().enumerate() {
                 config.push_str(&format!(r#"
@@ -218,8 +314,9 @@ systemctl enable auto-launch-{}.service
             "".to_string()
         };
         
-        // Build guest agent service configuration
-        let app_config = format!(r#"
+        // Build guest agent service configuration (GUI mode only)
+        let app_config = if !self.config.headless {
+            format!(r#"
 # Create guest agent service
 cat > /etc/systemd/system/guest-agent.service << 'EOF'
 [Unit]
@@ -250,7 +347,11 @@ systemctl enable guest-agent.service
 # Set multi-user target as default (since we're using auto-login)
 systemctl set-default multi-user.target"#,
             self.get_autologin_config(),
-        );
+        )
+        } else {
+            // Headless mode: no GUI services
+            "".to_string()
+        };
         
         // Build clipboard daemon configuration if enabled
         let clipboard_config = if self.config.enable_clipboard {
@@ -528,9 +629,13 @@ reboot"#,
         let disk_arg = format!("path={},size={},format=qcow2,bus=virtio", 
                                disk_path, self.config.disk_size_gb);
         
-        // Configure graphics based on backend and architecture
+        // Configure graphics based on backend, architecture, and headless mode
         let arch = std::env::consts::ARCH;
-        let graphics_args = match self.config.graphics_backend {
+        let graphics_args = if self.config.headless {
+            // Headless mode: no graphics, serial console only
+            vec!["--graphics", "none"]
+        } else {
+            match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu => {
                 if arch == "aarch64" {
                     // ARM64: Use virtio video with spice-autorandr for auto-resize
@@ -554,6 +659,7 @@ reboot"#,
             GraphicsBackend::VncOnly => {
                 vec!["--graphics", "vnc,listen=127.0.0.1,port=5900"]
             },
+            }
         };
         
         let mut virt_install_args = vec![
@@ -636,14 +742,26 @@ reboot"#,
     
     pub fn start_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("▶️  Starting VM: {}", self.config.name);
-        
+
         Command::new("virsh")
             .args(&["start", &self.config.name])
             .status()?;
-            
+
         // Wait for VM to boot
         thread::sleep(Duration::from_secs(5));
-        
+
+        // Hot-attach PCI devices if in hot-plug mode
+        if self.config.pci_hotplug && !self.config.pci_devices.is_empty() {
+            self.attach_pci_devices_hotplug()?;
+        }
+
+        // Handle display based on headless mode
+        if self.config.headless {
+            println!("🖥️  Headless VM started - use serial console to connect");
+            println!("   Connect with: virsh console {}", self.config.name);
+            return Ok(());
+        }
+
         // Launch SPICE viewer for immediate functionality
         match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu | GraphicsBackend::QxlSpice => {
@@ -688,30 +806,37 @@ reboot"#,
     
     pub fn stop_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("⏹️  Stopping VM: {}", self.config.name);
-        
+
+        // Hot-detach PCI devices if in hot-plug mode (before shutdown)
+        if self.config.pci_hotplug && !self.config.pci_devices.is_empty() {
+            // Wait a bit to ensure VM is responsive
+            thread::sleep(Duration::from_secs(2));
+            self.detach_pci_devices_hotplug()?;
+        }
+
         Command::new("virsh")
             .args(&["shutdown", &self.config.name])
             .status()?;
-            
+
         Ok(())
     }
     
     pub fn destroy_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🗑️  Destroying VM: {}", self.config.name);
-        
-        // Check if VM exists first
-        let list_output = Command::new("virsh")
-            .args(&["list", "--all"])
+
+        // Check if VM exists first (use sudo to ensure we see all VMs)
+        let list_output = Command::new("sudo")
+            .args(&["virsh", "list", "--all"])
             .output()?;
-        
+
         if !String::from_utf8_lossy(&list_output.stdout).contains(&self.config.name) {
-            println!("   VM {} not found in virsh list", self.config.name);
+            println!("   VM {} not found", self.config.name);
             // Still try to clean up disk
         } else {
             // Force stop if running
             println!("   Force stopping VM...");
-            let destroy_output = Command::new("virsh")
-                .args(&["destroy", &self.config.name])
+            let destroy_output = Command::new("sudo")
+                .args(&["virsh", "destroy", &self.config.name])
                 .output();
             
             match destroy_output {
@@ -730,22 +855,22 @@ reboot"#,
             
             // Undefine VM (remove from libvirt)
             println!("   Removing VM definition...");
-            let undefine_output = Command::new("virsh")
-                .args(&["undefine", &self.config.name, "--remove-all-storage", "--nvram"])
+            let undefine_output = Command::new("sudo")
+                .args(&["virsh", "undefine", &self.config.name, "--remove-all-storage", "--nvram"])
                 .output();
-            
+
             match undefine_output {
                 Ok(output) => {
                     if output.status.success() {
                         println!("   VM definition removed with storage");
                     } else {
-                        println!("   Undefine with storage failed: {}", 
+                        println!("   Undefine with storage failed: {}",
                                 String::from_utf8_lossy(&output.stderr));
                         println!("   Trying without storage flags...");
-                        
+
                         // Try simpler undefine
-                        let simple_undefine = Command::new("virsh")
-                            .args(&["undefine", &self.config.name])
+                        let simple_undefine = Command::new("sudo")
+                            .args(&["virsh", "undefine", &self.config.name])
                             .output()?;
                         
                         if simple_undefine.status.success() {
@@ -792,8 +917,8 @@ reboot"#,
         }
         
         // Final verification
-        let final_check = Command::new("virsh")
-            .args(&["list", "--all"])
+        let final_check = Command::new("sudo")
+            .args(&["virsh", "list", "--all"])
             .output()?;
         
         if String::from_utf8_lossy(&final_check.stdout).contains(&self.config.name) {
@@ -1110,5 +1235,257 @@ systemctl enable spice-autorandr.service"#);
         } else {
             "".to_string()
         }
+    }
+
+    // ===== PCI Passthrough Methods =====
+
+    fn validate_pci_passthrough(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔍 Validating PCI passthrough setup...");
+
+        // 1. Check IOMMU enabled
+        let dmesg = Command::new("dmesg").output()?;
+        let dmesg_str = String::from_utf8_lossy(&dmesg.stdout);
+
+        if !dmesg_str.contains("IOMMU") && !dmesg_str.contains("DMAR") {
+            eprintln!("❌ IOMMU not enabled!");
+            eprintln!("   Enable VT-d (Intel) or AMD-Vi (AMD) in BIOS");
+            eprintln!("   Add to kernel cmdline: intel_iommu=on (Intel) or amd_iommu=on (AMD)");
+            return Err("IOMMU not enabled".into());
+        }
+        println!("   ✓ IOMMU enabled");
+
+        // 2. Check vfio-pci module available
+        let modprobe = Command::new("modprobe")
+            .arg("vfio-pci")
+            .status();
+
+        if modprobe.is_err() {
+            eprintln!("❌ vfio-pci module not available");
+            return Err("vfio-pci module not available".into());
+        }
+        println!("   ✓ vfio-pci module available");
+
+        // 3. Validate each device and check IOMMU groups
+        for device in &self.config.pci_devices {
+            if let Some(group) = device.iommu_group {
+                let group_devices = self.get_iommu_group_devices(group)?;
+                if group_devices.len() > 1 {
+                    println!("   ⚠️  Warning: IOMMU group {} contains {} devices:", group, group_devices.len());
+                    for dev in &group_devices {
+                        println!("       {}", dev);
+                    }
+                    println!("       All devices in the group will be isolated from the host.");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_iommu_group_devices(&self, group: u32) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let group_path = format!("/sys/kernel/iommu_groups/{}/devices", group);
+        let mut devices = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&group_path) {
+            for entry in entries.flatten() {
+                if let Some(device_name) = entry.file_name().to_str() {
+                    // Get device description
+                    let lspci = Command::new("lspci")
+                        .args(&["-s", device_name])
+                        .output();
+
+                    if let Ok(output) = lspci {
+                        let desc = String::from_utf8_lossy(&output.stdout);
+                        devices.push(desc.trim().to_string());
+                    } else {
+                        devices.push(device_name.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(devices)
+    }
+
+    fn setup_pci_passthrough_permanent(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Setting up permanent PCI passthrough...");
+
+        for device in &self.config.pci_devices {
+            println!("   Adding {} to VM XML", device.address);
+
+            // Generate XML for PCI device
+            let xml = self.generate_pci_device_xml(device)?;
+            let xml_path = format!("/tmp/{}-pci-{}.xml",
+                                  self.config.name,
+                                  device.address.replace(":", "-"));
+            fs::write(&xml_path, xml)?;
+
+            // Attach device to VM configuration (offline)
+            let result = Command::new("virsh")
+                .args(&["attach-device", &self.config.name, &xml_path, "--config"])
+                .status();
+
+            fs::remove_file(xml_path)?;
+
+            if result.is_err() || !result?.success() {
+                eprintln!("   ⚠️  Warning: Failed to attach {} to VM XML", device.address);
+            } else {
+                println!("   ✓ {} attached to VM (permanent)", device.address);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn generate_pci_device_xml(&self, device: &PciDevice) -> Result<String, Box<dyn std::error::Error>> {
+        // Parse address: 0000:01:00.0 -> domain:0000, bus:01, slot:00, function:0
+        let parts: Vec<&str> = device.address.split(&[':', '.']).collect();
+
+        if parts.len() != 4 {
+            return Err(format!("Invalid PCI address format: {}", device.address).into());
+        }
+
+        let xml = format!(r#"<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x{}' bus='0x{}' slot='0x{}' function='0x{}'/>
+  </source>
+</hostdev>"#, parts[0], parts[1], parts[2], parts[3]);
+
+        Ok(xml)
+    }
+
+    // Hot-plug methods
+
+    fn attach_pci_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Hot-attaching PCI devices...");
+
+        for device in &self.config.pci_devices {
+            println!("   Attaching {} ({})", device.address, device.description);
+
+            // 1. Unbind from current driver
+            if device.original_driver.is_some() {
+                self.unbind_device(&device.address)?;
+                thread::sleep(Duration::from_millis(500));
+            }
+
+            // 2. Bind to vfio-pci
+            self.bind_to_vfio(device)?;
+            thread::sleep(Duration::from_millis(500));
+
+            // 3. Generate device XML
+            let xml = self.generate_pci_device_xml(device)?;
+            let xml_path = format!("/tmp/{}-pci-{}.xml",
+                                  self.config.name,
+                                  device.address.replace(":", "-"));
+            fs::write(&xml_path, xml)?;
+
+            // 4. Hot-attach to running VM
+            let result = Command::new("virsh")
+                .args(&["attach-device", &self.config.name, &xml_path, "--live"])
+                .status();
+
+            fs::remove_file(xml_path)?;
+
+            if result.is_err() || !result?.success() {
+                eprintln!("   ⚠️  Failed to attach {}", device.address);
+            } else {
+                println!("   ✓ {} attached successfully", device.address);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn detach_pci_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Hot-detaching PCI devices...");
+
+        for device in &self.config.pci_devices {
+            println!("   Detaching {} ({})", device.address, device.description);
+
+            // 1. Generate XML for detach
+            let xml = self.generate_pci_device_xml(device)?;
+            let xml_path = format!("/tmp/{}-pci-{}.xml",
+                                  self.config.name,
+                                  device.address.replace(":", "-"));
+            fs::write(&xml_path, xml)?;
+
+            // 2. Detach from VM
+            let result = Command::new("virsh")
+                .args(&["detach-device", &self.config.name, &xml_path, "--live"])
+                .status();
+
+            fs::remove_file(xml_path)?;
+
+            if result.is_ok() && result?.success() {
+                println!("   ✓ {} detached from VM", device.address);
+            }
+
+            thread::sleep(Duration::from_millis(500));
+
+            // 3. Unbind from vfio-pci
+            self.unbind_device(&device.address)?;
+            thread::sleep(Duration::from_millis(500));
+
+            // 4. Rebind to original driver (if known)
+            if let Some(ref driver) = device.original_driver {
+                println!("   Restoring driver: {}", driver);
+                self.rebind_to_driver(&device.address, driver)?;
+                println!("   ✓ {} restored to {}", device.address, driver);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn unbind_device(&self, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", address);
+
+        if Path::new(&unbind_path).exists() {
+            let result = Command::new("sudo")
+                .args(&["bash", "-c", &format!("echo '{}' > {}", address, unbind_path)])
+                .status();
+
+            if result.is_err() || !result?.success() {
+                // Device may already be unbound, not a fatal error
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn bind_to_vfio(&self, device: &PciDevice) -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure vfio-pci module loaded
+        Command::new("sudo").args(&["modprobe", "vfio-pci"]).status()?;
+
+        // Bind device to vfio-pci using new_id
+        let new_id = format!("{} {}", device.vendor_id, device.device_id);
+        let new_id_path = "/sys/bus/pci/drivers/vfio-pci/new_id";
+
+        let result = Command::new("sudo")
+            .args(&["bash", "-c", &format!("echo '{}' > {}", new_id, new_id_path)])
+            .status();
+
+        if result.is_err() || !result?.success() {
+            // May already be bound, try manual bind
+            let bind_path = "/sys/bus/pci/drivers/vfio-pci/bind";
+            Command::new("sudo")
+                .args(&["bash", "-c", &format!("echo '{}' > {}", device.address, bind_path)])
+                .status()?;
+        }
+
+        Ok(())
+    }
+
+    fn rebind_to_driver(&self, address: &str, driver: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let bind_path = format!("/sys/bus/pci/drivers/{}/bind", driver);
+
+        if Path::new(&bind_path).exists() {
+            Command::new("sudo")
+                .args(&["bash", "-c", &format!("echo '{}' > {}", address, bind_path)])
+                .status()?;
+        }
+
+        Ok(())
     }
 }

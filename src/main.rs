@@ -67,34 +67,46 @@ enum Commands {
         /// VM name
         #[arg(short, long)]
         name: Option<String>,
-        
+
         /// System packages to install (can be used multiple times)
         #[arg(long, action = clap::ArgAction::Append)]
         system: Vec<String>,
-        
+
         /// Flatpak packages to install (can be used multiple times)
         #[arg(long, action = clap::ArgAction::Append)]
         flatpak: Vec<String>,
-        
+
         /// Skip interactive configuration
         #[arg(short = 'y', long)]
         yes: bool,
-        
+
         /// Configuration file path
         #[arg(short, long)]
         config: Option<String>,
-        
+
         /// Memory in MB (default: 4096)
         #[arg(long, default_value = "4096")]
         memory: u64,
-        
+
         /// Number of CPUs (default: 2)
         #[arg(long, default_value = "2")]
         vcpus: u32,
-        
+
         /// Disk size in GB (default: 20)
         #[arg(long, default_value = "20")]
         disk: u64,
+
+        /// Headless mode - no GUI/desktop environment (CLI only)
+        #[arg(long)]
+        headless: bool,
+
+        /// PCI device to passthrough (can be used multiple times, format: 0000:01:00.0)
+        #[arg(long, action = clap::ArgAction::Append)]
+        pci: Vec<String>,
+
+        /// Enable PCI hot-plug mode (attach on start, detach on stop)
+        #[arg(long)]
+        pci_hotplug: bool,
     },
     
     /// Start an existing VM
@@ -142,8 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Create { name, system, flatpak, yes, config, memory, vcpus, disk } => {
-            create_vm(name, system, flatpak, yes, config, memory, vcpus, disk).await?;
+        Commands::Create { name, system, flatpak, yes, config, memory, vcpus, disk, headless, pci, pci_hotplug } => {
+            create_vm(name, system, flatpak, yes, config, memory, vcpus, disk, headless, pci, pci_hotplug).await?;
         }
         
         Commands::Start { name, seamless } => {
@@ -184,6 +196,9 @@ async fn create_vm(
     memory: u64,
     vcpus: u32,
     disk: u64,
+    headless: bool,
+    pci_addresses: Vec<String>,
+    pci_hotplug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
@@ -204,22 +219,60 @@ async fn create_vm(
             format!("app-vm-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
         };
         
+        // Detect and validate PCI devices
+        let pci_devices = if !pci_addresses.is_empty() {
+            println!("\n🔍 Detecting PCI devices...");
+            let mut devices = Vec::new();
+            for address in &pci_addresses {
+                match provisioner::detect_pci_device(address) {
+                    Ok(device) => {
+                        println!("   ✓ {} - {}", device.address, device.description);
+                        if let Some(driver) = &device.original_driver {
+                            println!("     Current driver: {}", driver);
+                        }
+                        if let Some(group) = device.iommu_group {
+                            println!("     IOMMU group: {}", group);
+                        }
+                        devices.push(device);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to detect PCI device {}: {}", address, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            devices
+        } else {
+            Vec::new()
+        };
+
         // Create config with dynamic packages
-        AppVMConfig::new(vm_name, memory, vcpus, disk, system_packages, flatpak_packages)
+        AppVMConfig::new(vm_name, memory, vcpus, disk, system_packages, flatpak_packages, headless, pci_devices, pci_hotplug)
     };
     
     // Display configuration
     println!("\n📋 VM Configuration:");
     println!("   Name: {}", config.name);
+    println!("   Mode: {}", if config.headless { "Headless (CLI only)" } else { "GUI" });
     println!("   System Packages: {:?}", config.system_packages);
     println!("   Flatpak Packages: {:?}", config.flatpak_packages);
     println!("   Memory: {} MB", config.memory_mb);
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
-    println!("   Graphics: {:?}", config.graphics_backend);
+    if !config.headless {
+        println!("   Graphics: {:?}", config.graphics_backend);
+        println!("   Clipboard: {}", if config.enable_clipboard { "✓" } else { "✗" });
+        println!("   Audio: {}", if config.enable_audio { "✓" } else { "✗" });
+    }
     println!("   Network: {:?}", config.network_mode);
-    println!("   Clipboard: {}", if config.enable_clipboard { "✓" } else { "✗" });
-    println!("   Audio: {}", if config.enable_audio { "✓" } else { "✗" });
+
+    if !config.pci_devices.is_empty() {
+        println!("   PCI Passthrough: {} devices", config.pci_devices.len());
+        println!("   PCI Mode: {}", if config.pci_hotplug { "Hot-plug (dynamic)" } else { "Permanent (XML)" });
+        for device in &config.pci_devices {
+            println!("     - {} ({})", device.address, device.description);
+        }
+    }
     
     if !skip_confirm {
         let confirm = Confirm::new()
@@ -280,11 +333,21 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
     // Start the VM
     let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.start_vm()?;
-    
-    // Start window proxy for seamless integration (always enabled now)
+
+    // For headless VMs, skip window proxy and SPICE viewer
+    if config.headless {
+        println!("\n🔑 VM Login Credentials:");
+        println!("   Username: user");
+        println!("   Password: {}", config.user_password);
+        println!("   Console: virsh console {}", name);
+        println!("\n💡 Headless VM - connect via console");
+        return Ok(());
+    }
+
+    // Start window proxy for seamless integration (GUI mode only)
     println!("🪟 Starting window proxy...");
-    
-    // Launch window proxy in background  
+
+    // Launch window proxy in background
     let vm_name_clone = name.clone();
     std::thread::spawn(move || {
         let mut integration = VMIntegrationHost::new(vm_name_clone);
@@ -292,19 +355,19 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
             eprintln!("Window integration error: {}", e);
         }
     });
-    
+
     println!("✅ Window proxy started");
     println!("   Waiting for guest agent connection...");
-    
+
     if config.enable_clipboard {
         println!("   Clipboard sharing enabled");
     }
-    
+
     // Display login credentials
     println!("\n🔑 VM Login Credentials:");
     println!("   Username: user");
     println!("   Password: {}", config.user_password);
-    println!("   Console: sudo virsh console {}", name);
+    println!("   Console: virsh console {}", name);
     
     Ok(())
 }
@@ -369,38 +432,57 @@ fn list_vms() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("🗑️  Preparing to destroy VM: {}", name);
-    
+
     if !skip_confirm {
         println!("⚠️  This will permanently delete the VM and all its data!");
-        
+
         let confirm = Confirm::new()
             .with_prompt("Are you sure?")
             .default(false)
             .interact()?;
-            
+
         if !confirm {
             println!("❌ Destruction cancelled");
             return Ok(());
         }
     }
-    
-    // Load configuration
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", 
+
+    // Check both user config and root config locations
+    let user_config = format!("{}/.config/vm-provisioner/{}.toml",
                              std::env::var("HOME")?, name);
-    
-    if Path::new(&config_file).exists() {
-        let content = std::fs::read_to_string(&config_file)?;
-        let config = toml::from_str::<AppVMConfig>(&content)?;
-        
-        let provisioner = AppVMProvisioner::new(config);
-        provisioner.destroy_vm()?;
-        
-        // Remove configuration file
-        std::fs::remove_file(&config_file)?;
+    let root_config = format!("/root/.config/vm-provisioner/{}.toml", name);
+
+    let config_file = if Path::new(&user_config).exists() {
+        user_config
+    } else if Path::new(&root_config).exists() {
+        root_config
+    } else {
+        eprintln!("❌ VM configuration not found for: {}", name);
+        eprintln!("   Checked: {}", user_config);
+        eprintln!("   Checked: {}", root_config);
+        eprintln!("   The VM may have been created with sudo.");
+        eprintln!("   Try running: sudo ./target/release/vm-provisioner destroy {} --yes", name);
+        std::process::exit(1);
+    };
+
+    println!("   Using config: {}", config_file);
+
+    let content = std::fs::read_to_string(&config_file)?;
+    let config = toml::from_str::<AppVMConfig>(&content)?;
+
+    let provisioner = AppVMProvisioner::new(config);
+    provisioner.destroy_vm()?;
+
+    // Remove configuration file
+    if let Err(e) = std::fs::remove_file(&config_file) {
+        println!("   ⚠️  Warning: Could not remove config file: {}", e);
+        println!("   You may need to run: sudo rm {}", config_file);
+    } else {
+        println!("   ✅ Config file removed");
     }
-    
+
     println!("✅ VM destroyed");
-    
+
     Ok(())
 }
 
