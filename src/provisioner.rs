@@ -697,18 +697,56 @@ reboot"#,
         }
         
         println!("⏳ Running automated installation (15-20 minutes)...");
-        
+
         let status = Command::new("sudo")
             .arg("virt-install")
             .args(&virt_install_args)
             .status()?;
-            
+
         if !status.success() {
             return Err(format!("VM installation failed with exit code: {:?}", status.code()).into());
         }
-        
-        println!("✅ Installation completed!");
-        
+
+        // Validate installation actually succeeded
+        println!("🔍 Validating installation...");
+
+        // Check 1: Disk should have grown significantly (at least 1GB)
+        if let Ok(metadata) = fs::metadata(disk_path) {
+            let disk_size_mb = metadata.len() / (1024 * 1024);
+            println!("   Disk size: {} MB", disk_size_mb);
+
+            if disk_size_mb < 500 {
+                eprintln!("❌ Installation failed: Disk size is only {} MB (expected at least 500 MB)", disk_size_mb);
+                eprintln!("   This usually means the installer ran out of memory or disk space.");
+                eprintln!("   Try increasing RAM with --memory 4096 (4GB minimum for network install)");
+                return Err("Installation validation failed: disk too small".into());
+            }
+        } else {
+            eprintln!("⚠️  Warning: Could not check disk size");
+        }
+
+        // Check 2: Try to start the VM to see if it boots
+        println!("   Testing VM boot...");
+        let boot_test = Command::new("sudo")
+            .args(&["virsh", "start", &self.config.name])
+            .output()?;
+
+        if !boot_test.status.success() {
+            eprintln!("❌ Installation failed: VM will not start");
+            eprintln!("   Error: {}", String::from_utf8_lossy(&boot_test.stderr));
+            return Err("Installation validation failed: VM won't boot".into());
+        }
+
+        // Give it a moment to boot
+        thread::sleep(Duration::from_secs(5));
+
+        // Stop the VM
+        Command::new("sudo")
+            .args(&["virsh", "destroy", &self.config.name])
+            .output()?;
+
+        println!("✅ Installation completed and validated!");
+
         Ok(())
     }
     
