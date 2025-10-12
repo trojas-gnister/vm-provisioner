@@ -8,7 +8,6 @@ use crate::config::AppVMConfig;
 pub struct XpraManager {
     vm_name: String,
     vm_ip: String,
-    xpra_port: u16,
     username: String,
     system_packages: Vec<String>,
     flatpak_packages: Vec<String>,
@@ -21,7 +20,6 @@ impl XpraManager {
         Ok(Self {
             vm_name: config.name.clone(),
             vm_ip,
-            xpra_port: 14500,
             username: "user".to_string(),
             system_packages: config.system_packages.clone(),
             flatpak_packages: config.flatpak_packages.clone(),

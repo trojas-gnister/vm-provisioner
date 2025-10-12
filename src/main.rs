@@ -148,7 +148,7 @@ enum Commands {
         name: String,
     },
 
-    /// Launch a specific application in a VM via RDP
+    /// Launch a specific application in a VM via Xpra
     Launch {
         /// VM name
         name: String,
@@ -362,7 +362,7 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.start_vm()?;
 
-    // For headless VMs, skip RDP and SPICE viewer
+    // For headless VMs, skip Xpra and SPICE viewer
     if config.headless {
         println!("\n🔑 VM Login Credentials:");
         println!("   Username: user");
@@ -372,16 +372,16 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Display information about RDP RemoteApp integration
-    println!("\n🪟 Seamless Window Integration via RDP RemoteApp");
-    println!("   xrdp server running on port 3389");
+    // Display information about Xpra integration
+    println!("\n🪟 Seamless Window Integration via Xpra");
+    println!("   Xpra connects via SSH (passwordless)");
     println!("   Use commands:");
     println!("     vm-provisioner generate-shortcuts {}  # Create .desktop files", name);
     println!("     vm-provisioner launch {} <app>       # Launch specific app", name);
     println!("     vm-provisioner apps {}               # List available apps", name);
 
     if config.enable_clipboard {
-        println!("\n📋 Clipboard sharing enabled via RDP");
+        println!("\n📋 Clipboard sharing enabled via Xpra");
     }
 
     // Display login credentials
@@ -491,8 +491,17 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
     let content = std::fs::read_to_string(&config_file)?;
     let config = toml::from_str::<AppVMConfig>(&content)?;
 
-    let provisioner = AppVMProvisioner::new(config);
+    let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.destroy_vm()?;
+
+    // Remove desktop shortcuts
+    if let Ok(xpra_manager) = XpraManager::new(&config) {
+        if let Err(e) = xpra_manager.remove_desktop_files() {
+            println!("   ⚠️  Warning: Could not remove desktop files: {}", e);
+        } else {
+            println!("   ✅ Desktop shortcuts removed");
+        }
+    }
 
     // Remove configuration file
     if let Err(e) = std::fs::remove_file(&config_file) {
@@ -589,7 +598,7 @@ async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Erro
     println!("⏳ Waiting for VM to be fully ready...");
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    // Create RDP manager and generate shortcuts
+    // Create Xpra manager and generate shortcuts
     let xpra_manager = XpraManager::new(&config)?;
     xpra_manager.generate_desktop_files()?;
 
@@ -624,7 +633,7 @@ async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error:
         std::process::exit(1);
     }
 
-    // Create RDP manager and launch app
+    // Create Xpra manager and launch app
     let xpra_manager = XpraManager::new(&config)?;
     xpra_manager.launch_app(&app)?;
 
@@ -649,7 +658,7 @@ fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(&config_file)?;
     let config = toml::from_str::<AppVMConfig>(&content)?;
 
-    // Create RDP manager and list apps
+    // Create Xpra manager and list apps
     let xpra_manager = XpraManager::new(&config)
         .unwrap_or_else(|_| {
             eprintln!("⚠️  Could not get VM IP (VM may not be running)");

@@ -88,7 +88,7 @@ impl AppVMConfig {
                 "git".to_string(),               // Version control
             ]
         } else {
-            // GUI mode: full desktop environment with RDP support
+            // GUI mode: full desktop environment with Xpra support
             vec![
                 "i3".to_string(),
                 "i3status".to_string(),
