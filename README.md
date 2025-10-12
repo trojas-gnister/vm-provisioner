@@ -9,13 +9,14 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - 🚀 **Auto-Launch Applications**: Specified applications start automatically when VM boots
 - 🔓 **Auto-Login**: Passwordless login with i3 window manager and desktop access
 - 🖥️ **kitty Terminal**: Default terminal emulator included in every VM
-- 🪟 **SPICE Integration**: Auto-resize functionality with comprehensive window management
-- 📋 **Clipboard Sharing**: Bidirectional clipboard sharing between host and VMs via SPICE
+- 🪟 **Seamless Window Integration**: VM applications appear as native host windows via Xpra
+- 📋 **Clipboard Sharing**: Bidirectional clipboard sharing between host and VMs via Xpra
 - 🖥️ **i3 Window Manager**: Lightweight tiling window manager with full X11 compatibility
-- 🚀 **Application Launcher**: rofi with complete Flatpak integration and discovery
+- 🚀 **Application Launcher**: rofi with complete Flatpak integration + native host integration
 - 💾 **Password Management**: Centralized storage and individual VM credential management
 - 🔧 **Cross-Architecture**: Full support for x86_64 and aarch64 (ARM64)
-- 📏 **Auto-Resize**: Dynamic resolution adjustment using spice-autorandr (ARM64 compatible)
+- 📏 **Dynamic Resolution**: Applications adapt to host display resolution automatically
+- 🔗 **Desktop Integration**: Generated .desktop files make VM apps appear in host application menu
 
 ## Current Status
 
@@ -23,21 +24,24 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - **Complete VM isolation**: Each application runs in its own secure VM
 - **Dynamic package installation**: Install any system (dnf) or Flatpak packages on-demand
 - **Auto-login & auto-launch**: Passwordless login with applications starting automatically
-- **SPICE integration**: Full clipboard sharing and auto-resize functionality working on ARM64/x86_64
-- **Robust package management**: All critical packages (xset, i3, kitty, etc.) install correctly
+- **Seamless window integration**: VM applications appear as native host windows via Xpra (WinApps-style)
+- **Desktop integration**: .desktop files make VM apps appear in host application menu
+- **Xpra seamless mode**: Individual applications launch seamlessly with passwordless SSH
+- **Clipboard sharing**: Bidirectional clipboard between host and VMs via Xpra
+- **Robust package management**: All critical packages (xset, i3, kitty, xpra, SSH) install correctly
 - **Cross-architecture support**: ARM64 and x86_64 compatibility verified and working
 - **Advanced CLI**: --system and --flatpak flags for dynamic VM creation
 - **Application launcher**: rofi with full Flatpak integration and discovery
 - **Comprehensive logging**: Detailed installation logs for troubleshooting
-- **VM lifecycle management**: create/start/stop/destroy/list/passwords all working
+- **VM lifecycle management**: create/start/stop/destroy/list/passwords/apps/launch/generate-shortcuts
 - **Centralized password storage**: Secure credential management system
 
 **🚧 Future Enhancements:**
-- Seamless window integration (framework complete, needs surface instantiation)
+- GPU passthrough for hardware acceleration (virgl/Venus)
 - VirtIO channels for improved performance
-- GPU passthrough for hardware acceleration
 - Reduce RAM requirement for VM installation (2GB of RAM currently unsupported. 4GB of RAM is the current minimum)
-- Enhance managing state of VM through CLI (Currently destroy command has inconsistencies)
+- Pre-configured VM templates (Firefox, VS Code, development, media, etc)
+- Shared folders via 9p/virtiofs
 
 ## VM Modes
 
@@ -240,46 +244,57 @@ dev-vm = "vm-456def789ghi"
          └───────────────────────┘
 ```
 
-## Current Implementation: Window Proxy System
+## Seamless Window Integration via Xpra
 
-**How it works:**
-1. VM runs applications in pure X11 environment with i3 window manager and auto-login
-2. SPICE agent provides automatic resolution adjustment and clipboard sharing
-3. kitty terminal and specified packages (system + Flatpak) are auto-installed
-4. Auto-launch systemd services start specified applications on boot
-5. Guest agent monitors X11 windows using xwininfo/wmctrl
-6. Window events (8 types: create/destroy/resize/move/focus/title) sent to host via TCP
-7. Host window proxy receives events with length-prefixed binary protocol
-8. Wayland client framework processes events and creates native windows
-9. Clipboard synchronized bidirectionally with SPICE and wl-clipboard integration
+**Architecture** (inspired by WinApps):
+1. VM runs applications in X11 environment with i3 window manager and auto-login
+2. SSH server configured with passwordless key-based authentication
+3. Xpra server configured for seamless window mode in the VM
+4. Xpra client on host connects via SSH and launches individual applications
+5. Applications appear as native host windows with full integration
+6. .desktop files make VM apps appear in host application menu
+7. Clipboard, audio, and window management via Xpra protocol
 
-**Window Detection Flow:**
+**How It Works:**
 ```
-VM Boot: Auto-login + auto-launch applications → X11 windows created
-    ↓
-Guest Agent: xwininfo detects new windows
-    ↓
-Guest Agent: Serializes WindowMessage::WindowCreated for each
-    ↓
-TCP:9999: Sends length-prefixed binary data to host
-    ↓
-Host Proxy: Receives and deserializes messages
-    ↓
-Wayland Client: Processes events and creates native windows
+Host Application Menu         Guest VM (Xpra + SSH)
+┌─────────────────┐           ┌──────────────────────┐
+│ Firefox (VM)    │─SSH+Xpra─▶│  i3 + Firefox         │
+│ LibreWolf (VM)  │─Seamless─▶│  i3 + LibreWolf       │
+│ VSCode (VM)     │───────────▶│  i3 + VSCode          │
+└─────────────────┘           └──────────────────────┘
+      ▲                                  │
+      └──── .desktop files ──────────────┘
 ```
 
-**Commands:**
-```bash
-# Start VM with window proxy
-vm-provisioner start firefox-vm
-# SPICE viewer opens with i3 window manager
-# Auto-login enabled - no password needed
-# Applications auto-launch on boot
-# Use Mod+Enter for terminal, Mod+d for app launcher
-
-# Manual guest agent (inside VM) - connects to host TCP:9999
-/usr/local/bin/guest-agent
+**Workflow:**
 ```
+1. Create VM with applications:
+   vm-provisioner create --flatpak org.mozilla.firefox --name browser-vm
+
+2. Start VM (SSH keys & Xpra auto-configured):
+   vm-provisioner start browser-vm
+
+3. Generate desktop shortcuts:
+   vm-provisioner generate-shortcuts browser-vm
+   → Creates ~/.local/share/applications/vm-provisioner/browser-vm-firefox.desktop
+
+4. Launch from host application menu:
+   Click "Firefox (VM: browser-vm)" in application menu
+   → Opens Firefox in seamless window via Xpra
+
+5. Or launch manually:
+   vm-provisioner launch browser-vm "flatpak run org.mozilla.firefox"
+```
+
+**Benefits of Xpra:**
+- ✅ Designed specifically for seamless remote applications on Linux
+- ✅ SSH-based security with passwordless key authentication
+- ✅ True per-application window integration (like Qubes OS)
+- ✅ Clipboard, audio, window management built-in
+- ✅ Dynamic resolution adaptation
+- ✅ No complex RDP setup or RemoteApp limitations
+- ✅ Native Linux solution with excellent X11 integration
 
 ## i3 Window Manager Usage
 
@@ -337,6 +352,9 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 - `passwords` - Show login credentials for all VMs
 - `destroy` - Remove VM and cleanup
 - `console` - Connect to VM console
+- `generate-shortcuts` - Create .desktop files for VM applications
+- `launch` - Launch specific application in VM via Xpra
+- `apps` - List all applications available in a VM
 
 ### Command Options
 
@@ -415,6 +433,83 @@ vm-provisioner create --system git
 vm-provisioner create
 ```
 
+## Seamless Window Usage
+
+### Setting Up Seamless Applications
+
+1. **Create VM with your desired applications:**
+```bash
+# Browser VM
+vm-provisioner create --flatpak org.mozilla.firefox --name browser-vm
+
+# Development VM
+vm-provisioner create --flatpak com.visualstudio.code --system git --name dev-vm
+
+# Media VM
+vm-provisioner create --flatpak org.videolan.VLC --system qbittorrent --name media-vm
+```
+
+2. **Start the VM:**
+```bash
+vm-provisioner start browser-vm
+# SSH server and Xpra automatically configured with passwordless authentication
+```
+
+3. **Generate desktop shortcuts (makes apps appear in your application menu):**
+```bash
+vm-provisioner generate-shortcuts browser-vm
+# Creates .desktop files in ~/.local/share/applications/vm-provisioner/
+```
+
+4. **Launch applications:**
+```bash
+# From application menu: Just click the app!
+
+# Or manually from command line:
+vm-provisioner launch browser-vm "flatpak run org.mozilla.firefox"
+vm-provisioner launch dev-vm "flatpak run com.visualstudio.code"
+```
+
+5. **List available applications:**
+```bash
+vm-provisioner apps browser-vm
+```
+
+### Generated .desktop Files
+
+Each application gets a .desktop file that launches it seamlessly:
+
+```desktop
+[Desktop Entry]
+Name=Firefox (VM: browser-vm)
+Exec=xpra start ssh://user@192.168.122.X --start-child="flatpak run org.mozilla.firefox" --exit-with-children
+Icon=firefox
+Type=Application
+Categories=Network;WebBrowser;
+```
+
+**Features enabled in .desktop files:**
+- Passwordless SSH authentication (using host SSH keys)
+- Seamless window mode (applications appear as native windows)
+- Clipboard sharing (copy/paste between host and VM)
+- Audio passthrough (PulseAudio/PipeWire)
+- Dynamic resolution (adapts to your display)
+- Exit-with-children (closes when application closes)
+
+### Prerequisites on Host
+
+Install Xpra client:
+```bash
+# Fedora/RHEL
+sudo dnf install xpra
+
+# Ubuntu/Debian
+sudo apt install xpra
+
+# Arch
+sudo pacman -S xpra
+```
+
 ## Troubleshooting
 
 ### VM Creation Fails
@@ -480,8 +575,4 @@ cargo test
 
 ---
 
-**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and auto-resize capabilities. VMs currently display via SPICE viewer with seamless clipboard sharing and dynamic resolution adjustment. Future seamless window integration framework is in place.
-
-
-## PERSONAL TODOs
-- setup a vm with a torrent cli and wireguard vpn or mullvadvpn cli
+**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and seamless window integration. VMs display via SPICE viewer for console access, and **per-application seamless windows via Xpra** for true application isolation (WinApps/Qubes-style). Clipboard sharing, audio passthrough, and dynamic resolution all work seamlessly.

@@ -397,7 +397,68 @@ systemctl --user enable pipewire pipewire-pulse wireplumber"#
         } else {
             ""
         };
-        
+
+        // Read SSH public key from host for passwordless authentication
+        let ssh_public_key = self.get_ssh_public_key()?;
+
+        // Build SSH and Xpra configuration for seamless window integration (GUI mode only)
+        let ssh_xpra_config = if !self.config.headless {
+            format!(r#"
+# Configure SSH and Xpra for seamless window mode
+echo "=== Configuring SSH and Xpra for seamless mode ==="
+
+# Set up SSH key for passwordless authentication
+mkdir -p /home/{0}/.ssh
+chmod 700 /home/{0}/.ssh
+cat > /home/{0}/.ssh/authorized_keys << 'SSH_KEY_EOF'
+{1}
+SSH_KEY_EOF
+chmod 600 /home/{0}/.ssh/authorized_keys
+chown -R {0}:{0} /home/{0}/.ssh
+
+# Enable and start SSH server
+systemctl enable sshd
+systemctl start sshd
+
+# Allow SSH through firewall
+firewall-cmd --permanent --add-service=ssh
+firewall-cmd --reload
+
+# Create Xpra configuration directory
+mkdir -p /etc/xpra/conf.d
+
+# Configure Xpra for seamless window support
+cat > /etc/xpra/conf.d/60_seamless.conf << 'XPRA_EOF'
+# Seamless window mode configuration
+start-new-commands = yes
+start = i3
+bind-tcp = 0.0.0.0:14500
+
+# Audio support
+pulseaudio = yes
+speaker = on
+microphone = on
+
+# Clipboard support
+clipboard = yes
+
+# Performance optimizations
+encoding = rgb
+compression = 0
+speed = 100
+min-speed = 50
+
+# Window management
+window-close = disconnect
+exit-with-children = yes
+XPRA_EOF
+
+echo "=== SSH and Xpra configuration complete ==="
+"#, "user", ssh_public_key)
+        } else {
+            String::new()
+        };
+
         // Build firewall rules
         let firewall_rules = self.config.firewall_rules
             .iter()
@@ -479,6 +540,8 @@ cat > /home/user/.config/environment << 'EOF'
 DISPLAY=:0
 XDG_SESSION_TYPE=x11
 EOF
+
+{}
 
 {}
 
@@ -605,6 +668,7 @@ reboot"#,
             app_config,
             clipboard_config,
             audio_config,
+            ssh_xpra_config,
             firewall_rules,
             self.config.name
         );
@@ -725,24 +789,36 @@ reboot"#,
             eprintln!("⚠️  Warning: Could not check disk size");
         }
 
-        // Check 2: Try to start the VM to see if it boots
-        println!("   Testing VM boot...");
-        let boot_test = Command::new("sudo")
-            .args(&["virsh", "start", &self.config.name])
+        // Check 2: VM should auto-reboot after installation, check if it's running
+        println!("   Checking VM status...");
+        let status_check = Command::new("virsh")
+            .args(&["-c", "qemu:///system", "domstate", &self.config.name])
             .output()?;
 
-        if !boot_test.status.success() {
-            eprintln!("❌ Installation failed: VM will not start");
-            eprintln!("   Error: {}", String::from_utf8_lossy(&boot_test.stderr));
-            return Err("Installation validation failed: VM won't boot".into());
+        let vm_state = String::from_utf8_lossy(&status_check.stdout).trim().to_string();
+
+        if vm_state != "running" {
+            // VM not running, try to start it
+            println!("   VM not running (state: {}), attempting to start...", vm_state);
+            let boot_test = Command::new("virsh")
+                .args(&["-c", "qemu:///system", "start", &self.config.name])
+                .output()?;
+
+            if !boot_test.status.success() {
+                eprintln!("❌ Installation failed: VM will not start");
+                eprintln!("   Error: {}", String::from_utf8_lossy(&boot_test.stderr));
+                return Err("Installation validation failed: VM won't boot".into());
+            }
+
+            // Give it a moment to boot
+            thread::sleep(Duration::from_secs(5));
+        } else {
+            println!("   ✓ VM is already running");
         }
 
-        // Give it a moment to boot
-        thread::sleep(Duration::from_secs(5));
-
-        // Stop the VM
-        Command::new("sudo")
-            .args(&["virsh", "destroy", &self.config.name])
+        // Stop the VM (user in libvirt group doesn't need sudo)
+        Command::new("virsh")
+            .args(&["-c", "qemu:///system", "destroy", &self.config.name])
             .output()?;
 
         println!("✅ Installation completed and validated!");
@@ -782,7 +858,7 @@ reboot"#,
         println!("▶️  Starting VM: {}", self.config.name);
 
         Command::new("virsh")
-            .args(&["start", &self.config.name])
+            .args(&["-c", "qemu:///system", "start", &self.config.name])
             .status()?;
 
         // Wait for VM to boot
@@ -810,7 +886,7 @@ reboot"#,
                     
                     // Get the actual SPICE port from virsh
                     if let Ok(output) = std::process::Command::new("virsh")
-                        .args(&["domdisplay", &vm_name])
+                        .args(&["-c", "qemu:///system", "domdisplay", &vm_name])
                         .output()
                     {
                         if let Ok(display) = String::from_utf8(output.stdout) {
@@ -853,18 +929,18 @@ reboot"#,
         }
 
         Command::new("virsh")
-            .args(&["shutdown", &self.config.name])
+            .args(&["-c", "qemu:///system", "shutdown", &self.config.name])
             .status()?;
 
         Ok(())
     }
-    
+
     pub fn destroy_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🗑️  Destroying VM: {}", self.config.name);
 
-        // Check if VM exists first (use sudo to ensure we see all VMs)
-        let list_output = Command::new("sudo")
-            .args(&["virsh", "list", "--all"])
+        // Check if VM exists first
+        let list_output = Command::new("virsh")
+            .args(&["-c", "qemu:///system", "list", "--all"])
             .output()?;
 
         if !String::from_utf8_lossy(&list_output.stdout).contains(&self.config.name) {
@@ -873,8 +949,8 @@ reboot"#,
         } else {
             // Force stop if running
             println!("   Force stopping VM...");
-            let destroy_output = Command::new("sudo")
-                .args(&["virsh", "destroy", &self.config.name])
+            let destroy_output = Command::new("virsh")
+                .args(&["-c", "qemu:///system", "destroy", &self.config.name])
                 .output();
             
             match destroy_output {
@@ -893,8 +969,8 @@ reboot"#,
             
             // Undefine VM (remove from libvirt)
             println!("   Removing VM definition...");
-            let undefine_output = Command::new("sudo")
-                .args(&["virsh", "undefine", &self.config.name, "--remove-all-storage", "--nvram"])
+            let undefine_output = Command::new("virsh")
+                .args(&["-c", "qemu:///system", "undefine", &self.config.name, "--remove-all-storage", "--nvram"])
                 .output();
 
             match undefine_output {
@@ -907,8 +983,8 @@ reboot"#,
                         println!("   Trying without storage flags...");
 
                         // Try simpler undefine
-                        let simple_undefine = Command::new("sudo")
-                            .args(&["virsh", "undefine", &self.config.name])
+                        let simple_undefine = Command::new("virsh")
+                            .args(&["-c", "qemu:///system", "undefine", &self.config.name])
                             .output()?;
                         
                         if simple_undefine.status.success() {
@@ -955,8 +1031,8 @@ reboot"#,
         }
         
         // Final verification
-        let final_check = Command::new("sudo")
-            .args(&["virsh", "list", "--all"])
+        let final_check = Command::new("virsh")
+            .args(&["-c", "qemu:///system", "list", "--all"])
             .output()?;
         
         if String::from_utf8_lossy(&final_check.stdout).contains(&self.config.name) {
@@ -1360,7 +1436,7 @@ systemctl enable spice-autorandr.service"#);
 
             // Attach device to VM configuration (offline)
             let result = Command::new("virsh")
-                .args(&["attach-device", &self.config.name, &xml_path, "--config"])
+                .args(&["-c", "qemu:///system", "attach-device", &self.config.name, &xml_path, "--config"])
                 .status();
 
             fs::remove_file(xml_path)?;
@@ -1419,7 +1495,7 @@ systemctl enable spice-autorandr.service"#);
 
             // 4. Hot-attach to running VM
             let result = Command::new("virsh")
-                .args(&["attach-device", &self.config.name, &xml_path, "--live"])
+                .args(&["-c", "qemu:///system", "attach-device", &self.config.name, &xml_path, "--live"])
                 .status();
 
             fs::remove_file(xml_path)?;
@@ -1449,7 +1525,7 @@ systemctl enable spice-autorandr.service"#);
 
             // 2. Detach from VM
             let result = Command::new("virsh")
-                .args(&["detach-device", &self.config.name, &xml_path, "--live"])
+                .args(&["-c", "qemu:///system", "detach-device", &self.config.name, &xml_path, "--live"])
                 .status();
 
             fs::remove_file(xml_path)?;
@@ -1525,5 +1601,58 @@ systemctl enable spice-autorandr.service"#);
         }
 
         Ok(())
+    }
+
+    fn get_ssh_public_key(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let home_dir = std::env::var("HOME")?;
+        let ssh_dir = Path::new(&home_dir).join(".ssh");
+
+        // Try common SSH key types in order of preference
+        let key_files = vec![
+            ssh_dir.join("id_ed25519.pub"),
+            ssh_dir.join("id_rsa.pub"),
+            ssh_dir.join("id_ecdsa.pub"),
+        ];
+
+        // Check for existing keys
+        for key_file in &key_files {
+            if key_file.exists() {
+                let public_key = fs::read_to_string(key_file)?
+                    .trim()
+                    .to_string();
+                println!("   Using existing SSH key: {}", key_file.display());
+                return Ok(public_key);
+            }
+        }
+
+        // No keys found, generate a new ed25519 key
+        println!("   No SSH key found, generating new ed25519 key...");
+        fs::create_dir_all(&ssh_dir)?;
+
+        let key_path = ssh_dir.join("id_ed25519");
+        let output = Command::new("ssh-keygen")
+            .args(&[
+                "-t", "ed25519",
+                "-f", key_path.to_str().unwrap(),
+                "-N", "",  // No passphrase
+                "-C", &format!("vm-provisioner@{}", hostname::get()?.to_string_lossy()),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to generate SSH key: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ).into());
+        }
+
+        // Read the newly generated public key
+        let pub_key_path = ssh_dir.join("id_ed25519.pub");
+        let public_key = fs::read_to_string(pub_key_path)?
+            .trim()
+            .to_string();
+
+        println!("   ✅ Generated new SSH key: {}", key_path.display());
+        Ok(public_key)
     }
 }

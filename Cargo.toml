@@ -18,17 +18,13 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 bincode = "1.3"
 
-# Wayland dependencies for window management
-wayland-client = "0.31"
-wayland-protocols = { version = "0.31", features = ["client"] }
-smithay-client-toolkit = "0.18"
-
 # Additional utilities
 anyhow = "1.0"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
 regex = "1.10"
+hostname = "0.4"
 
 [dev-dependencies]
 tempfile = "3.12"
@@ -44,6 +40,7 @@ strip = true
 name = "vm-provisioner"
 path = "src/main.rs"
 
-[[bin]]
-name = "guest-agent"
-path = "src/guest_agent.rs"
+# Legacy guest-agent removed - replaced by RDP RemoteApp integration
+# [[bin]]
+# name = "guest-agent"
+# path = "src/guest_agent.rs"

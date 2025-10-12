@@ -1,7 +1,6 @@
 mod config;
 mod provisioner;
-mod window_proxy;
-mod guest_agent;
+mod xpra_manager;
 
 use std::path::Path;
 use std::collections::HashMap;
@@ -12,7 +11,7 @@ use serde::{Serialize, Deserialize};
 
 use config::AppVMConfig;
 use provisioner::AppVMProvisioner;
-use window_proxy::VMIntegrationHost;
+use xpra_manager::XpraManager;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct VMPasswords {
@@ -113,10 +112,6 @@ enum Commands {
     Start {
         /// VM name
         name: String,
-        
-        /// Enable seamless window mode
-        #[arg(short, long, default_value = "true")]
-        seamless: bool,
     },
     
     /// Stop a running VM
@@ -146,7 +141,28 @@ enum Commands {
         /// VM name
         name: String,
     },
-    
+
+    /// Generate .desktop shortcuts for VM applications
+    GenerateShortcuts {
+        /// VM name
+        name: String,
+    },
+
+    /// Launch a specific application in a VM via RDP
+    Launch {
+        /// VM name
+        name: String,
+
+        /// Application command to launch
+        app: String,
+    },
+
+    /// List applications available in a VM
+    Apps {
+        /// VM name
+        name: String,
+    },
+
 }
 
 #[tokio::main]
@@ -158,8 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             create_vm(name, system, flatpak, yes, config, memory, vcpus, disk, headless, pci, pci_hotplug).await?;
         }
         
-        Commands::Start { name, seamless } => {
-            start_vm(name, seamless).await?;
+        Commands::Start { name } => {
+            start_vm(name).await?;
         }
         
         Commands::Stop { name } => {
@@ -181,9 +197,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Console { name } => {
             connect_console(name)?;
         }
-        
+
+        Commands::GenerateShortcuts { name } => {
+            generate_shortcuts(name).await?;
+        }
+
+        Commands::Launch { name, app } => {
+            launch_app(name, app).await?;
+        }
+
+        Commands::Apps { name } => {
+            list_apps(name)?;
+        }
+
     }
-    
+
     Ok(())
 }
 
@@ -313,7 +341,7 @@ async fn create_vm(
     Ok(())
 }
 
-async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("▶️  Starting VM: {}", name);
     
     // Load VM configuration
@@ -334,7 +362,7 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
     let provisioner = AppVMProvisioner::new(config.clone());
     provisioner.start_vm()?;
 
-    // For headless VMs, skip window proxy and SPICE viewer
+    // For headless VMs, skip RDP and SPICE viewer
     if config.headless {
         println!("\n🔑 VM Login Credentials:");
         println!("   Username: user");
@@ -344,23 +372,16 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
         return Ok(());
     }
 
-    // Start window proxy for seamless integration (GUI mode only)
-    println!("🪟 Starting window proxy...");
-
-    // Launch window proxy in background
-    let vm_name_clone = name.clone();
-    std::thread::spawn(move || {
-        let mut integration = VMIntegrationHost::new(vm_name_clone);
-        if let Err(e) = integration.start() {
-            eprintln!("Window integration error: {}", e);
-        }
-    });
-
-    println!("✅ Window proxy started");
-    println!("   Waiting for guest agent connection...");
+    // Display information about RDP RemoteApp integration
+    println!("\n🪟 Seamless Window Integration via RDP RemoteApp");
+    println!("   xrdp server running on port 3389");
+    println!("   Use commands:");
+    println!("     vm-provisioner generate-shortcuts {}  # Create .desktop files", name);
+    println!("     vm-provisioner launch {} <app>       # Launch specific app", name);
+    println!("     vm-provisioner apps {}               # List available apps", name);
 
     if config.enable_clipboard {
-        println!("   Clipboard sharing enabled");
+        println!("\n📋 Clipboard sharing enabled via RDP");
     }
 
     // Display login credentials
@@ -368,7 +389,7 @@ async fn start_vm(name: String, seamless: bool) -> Result<(), Box<dyn std::error
     println!("   Username: user");
     println!("   Password: {}", config.user_password);
     println!("   Console: virsh console {}", name);
-    
+
     Ok(())
 }
 
@@ -488,18 +509,18 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
 
 fn connect_console(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Connecting to VM console: {}", name);
-    
+
     std::process::Command::new("virsh")
-        .args(&["console", &name])
+        .args(&["-c", "qemu:///system", "console", &name])
         .status()?;
-    
+
     Ok(())
 }
 
 
 fn get_vm_status(name: &str) -> String {
     match std::process::Command::new("virsh")
-        .args(&["domstate", name])
+        .args(&["-c", "qemu:///system", "domstate", name])
         .output()
     {
         Ok(output) if output.status.success() => {
@@ -537,6 +558,126 @@ fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n💡 Usage:");
     println!("   sudo virsh console <vm-name>");
     println!("   vm-provisioner start <vm-name>  # Shows password");
-    
+
+    Ok(())
+}
+
+async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔗 Generating application shortcuts for VM: {}", name);
+
+    // Load VM configuration
+    let config_file = format!("{}/.config/vm-provisioner/{}.toml",
+                             std::env::var("HOME")?, name);
+
+    if !Path::new(&config_file).exists() {
+        eprintln!("❌ VM configuration not found: {}", name);
+        std::process::exit(1);
+    }
+
+    let content = std::fs::read_to_string(&config_file)?;
+    let config = toml::from_str::<AppVMConfig>(&content)?;
+
+    // Check if VM is running
+    let status = get_vm_status(&name);
+    if status != "running" {
+        eprintln!("❌ VM is not running (status: {})", status);
+        eprintln!("   Start it with: vm-provisioner start {}", name);
+        std::process::exit(1);
+    }
+
+    // Wait a bit for VM to be fully ready
+    println!("⏳ Waiting for VM to be fully ready...");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Create RDP manager and generate shortcuts
+    let xpra_manager = XpraManager::new(&config)?;
+    xpra_manager.generate_desktop_files()?;
+
+    println!("\n✅ Application shortcuts created!");
+    println!("   Location: ~/.local/share/applications/vm-provisioner/");
+    println!("   Applications should now appear in your application menu");
+    println!("\n💡 Tip: You may need to refresh your application menu or log out/in");
+
+    Ok(())
+}
+
+async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 Launching application in VM: {}", name);
+
+    // Load VM configuration
+    let config_file = format!("{}/.config/vm-provisioner/{}.toml",
+                             std::env::var("HOME")?, name);
+
+    if !Path::new(&config_file).exists() {
+        eprintln!("❌ VM configuration not found: {}", name);
+        std::process::exit(1);
+    }
+
+    let content = std::fs::read_to_string(&config_file)?;
+    let config = toml::from_str::<AppVMConfig>(&content)?;
+
+    // Check if VM is running
+    let status = get_vm_status(&name);
+    if status != "running" {
+        eprintln!("❌ VM is not running (status: {})", status);
+        eprintln!("   Start it with: vm-provisioner start {}", name);
+        std::process::exit(1);
+    }
+
+    // Create RDP manager and launch app
+    let xpra_manager = XpraManager::new(&config)?;
+    xpra_manager.launch_app(&app)?;
+
+    println!("✅ Application launch initiated");
+
+    Ok(())
+}
+
+fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("📱 Applications available in VM: {}", name);
+    println!("=====================================");
+
+    // Load VM configuration
+    let config_file = format!("{}/.config/vm-provisioner/{}.toml",
+                             std::env::var("HOME")?, name);
+
+    if !Path::new(&config_file).exists() {
+        eprintln!("❌ VM configuration not found: {}", name);
+        std::process::exit(1);
+    }
+
+    let content = std::fs::read_to_string(&config_file)?;
+    let config = toml::from_str::<AppVMConfig>(&content)?;
+
+    // Create RDP manager and list apps
+    let xpra_manager = XpraManager::new(&config)
+        .unwrap_or_else(|_| {
+            eprintln!("⚠️  Could not get VM IP (VM may not be running)");
+            eprintln!("   Showing configured packages only");
+            panic!();
+        });
+
+    let apps = xpra_manager.list_applications();
+
+    if apps.is_empty() {
+        println!("   No applications installed");
+    } else {
+        println!("\n📦 System Packages:");
+        for pkg in &config.system_packages {
+            println!("   - {}", pkg);
+        }
+
+        if !config.flatpak_packages.is_empty() {
+            println!("\n📦 Flatpak Packages:");
+            for pkg in &config.flatpak_packages {
+                println!("   - {}", pkg);
+            }
+        }
+
+        println!("\n💡 Usage:");
+        println!("   vm-provisioner launch {} <app-command>", name);
+        println!("   vm-provisioner generate-shortcuts {}  # Create .desktop files", name);
+    }
+
     Ok(())
 }
