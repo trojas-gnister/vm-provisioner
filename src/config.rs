@@ -97,15 +97,10 @@ impl AppVMConfig {
                 "rofi".to_string(),                  // Better application launcher with Flatpak support
                 "xorg-x11-server-Xorg".to_string(),
                 "xorg-x11-xinit".to_string(),
-                "xset".to_string(),                  // X11 settings utility (CRITICAL for startup)
-                "xrandr".to_string(),                // X11 resolution control
-                "wmctrl".to_string(),                // Window management
-                "xwininfo".to_string(),              // Window information
                 "pipewire".to_string(),              // Audio system
-                "wl-clipboard".to_string(),          // Clipboard utilities
-                "spice-vdagent".to_string(),         // SPICE agent for clipboard/resolution
+                "spice-vdagent".to_string(),         // SPICE agent for clipboard/resolution (useful for SPICE debugging)
                 "kitty".to_string(),                 // Default terminal emulator
-                "git".to_string(),                   // Version control (needed for spice-autorandr)
+                "git".to_string(),                   // Version control
                 "xpra".to_string(),                  // Xpra for seamless window integration
                 "openssh-server".to_string(),        // SSH server for Xpra connections
             ]

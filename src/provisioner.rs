@@ -105,8 +105,8 @@ impl AppVMProvisioner {
             self.validate_pci_passthrough()?;
         }
         
-        // Download Fedora ISO
-        let iso_path = self.download_fedora_iso()?;
+        // Download Alpine ISO
+        let iso_path = self.download_alpine_iso()?;
         
         // Create VM disk
         let disk_path = self.create_vm_disk()?;
@@ -162,28 +162,31 @@ impl AppVMProvisioner {
         Ok(())
     }
     
-    fn download_fedora_iso(&self) -> Result<String, Box<dyn std::error::Error>> {
+    fn download_alpine_iso(&self) -> Result<String, Box<dyn std::error::Error>> {
         let arch = std::env::consts::ARCH;
-        let iso_name = format!("fedora-minimal-{}.iso", arch);
+        let version = "3.22.2";
+        let iso_name = format!("alpine-virt-{}-{}.iso", version, arch);
         let iso_path = format!("{}/{}", self.config.vm_dir, iso_name);
-        
+
         if Path::new(&iso_path).exists() {
-            println!("📦 Using existing Fedora ISO");
+            println!("📦 Using existing Alpine ISO");
             return Ok(iso_path);
         }
-        
-        println!("📥 Downloading Fedora ISO...");
-        
+
+        println!("📥 Downloading Alpine ISO (~50MB)...");
+
         let download_url = match arch {
-            "x86_64" => "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Server/x86_64/iso/Fedora-Server-netinst-x86_64-41-1.4.iso",
-            "aarch64" => "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Server/aarch64/iso/Fedora-Server-netinst-aarch64-41-1.4.iso",
+            "x86_64" => format!("https://dl-cdn.alpinelinux.org/alpine/v{}/releases/x86_64/alpine-virt-{}-x86_64.iso",
+                               "3.22", version),
+            "aarch64" => format!("https://dl-cdn.alpinelinux.org/alpine/v{}/releases/aarch64/alpine-virt-{}-aarch64.iso",
+                                "3.22", version),
             _ => return Err(format!("Unsupported architecture: {}", arch).into()),
         };
-        
+
         Command::new("curl")
-            .args(&["-L", "-o", &iso_path, download_url])
+            .args(&["-L", "-o", &iso_path, &download_url])
             .status()?;
-            
+
         Ok(iso_path)
     }
     
@@ -235,15 +238,10 @@ impl AppVMProvisioner {
                 "rofi".to_string(),
                 "xorg-x11-server-Xorg".to_string(),
                 "xorg-x11-xinit".to_string(),
-                "xset".to_string(),  // This is critical for X11 readiness check
-                "xrandr".to_string(),
-                "wmctrl".to_string(),
-                "xwininfo".to_string(),
                 "pipewire".to_string(),
-                "wl-clipboard".to_string(),
                 "spice-vdagent".to_string(),
                 "kitty".to_string(),
-                "git".to_string(), // Needed for cloning spice-autorandr
+                "git".to_string(),
             ]
         };
         
@@ -601,22 +599,13 @@ echo "Date: $(date)"
 echo ""
 
 echo "Critical packages status:"
-for pkg in i3 xset xrandr kitty git rofi wmctrl xwininfo spice-vdagent; do
+for pkg in i3 kitty git rofi spice-vdagent; do
     if rpm -q $pkg &>/dev/null; then
         echo "✓ $pkg: INSTALLED"
     else
         echo "✗ $pkg: MISSING"
     fi
 done
-
-echo ""
-echo "spice-autorandr status:"
-if [ -f /usr/local/bin/spice-autorandr ]; then
-    echo "✓ spice-autorandr: INSTALLED"
-    ls -la /usr/local/bin/spice-autorandr
-else
-    echo "✗ spice-autorandr: MISSING"
-fi
 
 echo ""
 echo "Auto-login service status:"
@@ -702,7 +691,7 @@ reboot"#,
             match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu => {
                 if arch == "aarch64" {
-                    // ARM64: Use virtio video with spice-autorandr for auto-resize
+                    // ARM64: Use virtio video with SPICE
                     vec!["--graphics", "spice", "--video", "virtio", 
                          "--channel", "spicevmc,target_type=virtio,name=com.redhat.spice.0"]
                 } else {
@@ -1289,61 +1278,7 @@ chown -R user:user /home/user/.bash_profile
 # Ensure proper permissions for user directories
 chmod 755 /home/user/.config
 chmod 755 /home/user/.cache
-chmod 755 /home/user/.local
-
-# Install build dependencies for spice-autorandr (must be done in post-install)
-echo "Installing build dependencies for spice-autorandr..."
-dnf install -y gcc make autoconf automake libtool libXrandr-devel libX11-devel systemd-devel pkgconfig xorg-x11-proto-devel xorg-x11-util-macros
-
-# Install and configure spice-autorandr for automatic resolution adjustment
-echo "Building spice-autorandr..."
-cd /tmp
-if git clone https://github.com/seife/spice-autorandr.git; then
-    cd spice-autorandr
-    if autoreconf -is; then
-        if ./configure; then
-            if make; then
-                cp spice-autorandr /usr/local/bin/
-                chmod +x /usr/local/bin/spice-autorandr
-                echo "spice-autorandr installed successfully"
-            else
-                echo "ERROR: spice-autorandr make failed"
-            fi
-        else
-            echo "ERROR: spice-autorandr configure failed"
-        fi
-    else
-        echo "ERROR: spice-autorandr autoreconf failed"
-    fi
-else
-    echo "ERROR: spice-autorandr git clone failed"
-fi
-
-# Create systemd service for spice-autorandr
-cat > /etc/systemd/system/spice-autorandr.service << 'EOF'
-[Unit]
-Description=SPICE Auto Resolution Adjustment
-After=multi-user.target
-Wants=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/spice-autorandr
-Restart=always
-RestartSec=5
-Environment=DISPLAY=:0
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-User=user
-Group=user
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable the spice-autorandr service
-systemctl enable spice-autorandr.service"#);
+chmod 755 /home/user/.local"#);
 
             result
         } else {
