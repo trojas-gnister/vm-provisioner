@@ -109,15 +109,8 @@ impl AppVMConfig {
         // Add user-specified system packages
         default_system_packages.extend(system_packages);
 
-        // Generate auto-launch commands for installed packages
-        let mut auto_launch_apps = Vec::new();
-
-        // Auto-launch flatpak packages (only in GUI mode)
-        if !headless {
-            for pkg in &flatpak_packages {
-                auto_launch_apps.push(format!("flatpak run {}", pkg));
-            }
-        }
+        // Auto-launch commands (empty by default - user can manually configure in i3)
+        let auto_launch_apps = Vec::new();
         
         Self {
             name,

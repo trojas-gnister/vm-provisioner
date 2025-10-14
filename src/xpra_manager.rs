@@ -8,7 +8,6 @@ use crate::config::AppVMConfig;
 pub struct XpraManager {
     vm_name: String,
     vm_ip: String,
-    username: String,
     system_packages: Vec<String>,
     flatpak_packages: Vec<String>,
 }
@@ -20,7 +19,6 @@ impl XpraManager {
         Ok(Self {
             vm_name: config.name.clone(),
             vm_ip,
-            username: "user".to_string(),
             system_packages: config.system_packages.clone(),
             flatpak_packages: config.flatpak_packages.clone(),
         })
@@ -28,9 +26,9 @@ impl XpraManager {
 
     /// Get VM IP address from libvirt
     fn get_vm_ip_static(vm_name: &str) -> Result<String, Box<dyn std::error::Error>> {
-        // Get IP from virsh domifaddr using system connection
-        let output = Command::new("virsh")
-            .args(&["-c", "qemu:///system", "domifaddr", vm_name])
+        // Get IP from virsh domifaddr using system connection (requires sudo)
+        let output = Command::new("sudo")
+            .args(&["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
             .output()?;
 
         if output.status.success() {
@@ -166,11 +164,11 @@ impl XpraManager {
 
         let categories = self.guess_categories(package);
 
-        // Build Xpra command using SSH connection with passwordless authentication
-        // Format: xpra start ssh://user@ip --start-child="command"
+        // Build Xpra command to attach to persistent server via SSH
+        // The Xpra server is running on :10 in the VM
+        // Format: ssh://user@host/display (slash not colon!)
         let xpra_command = format!(
-            "xpra start ssh://{}@{} --start-child=\"{}\" --exit-with-children",
-            self.username,
+            "xpra attach ssh://user@{}/10 --start-child=\"{}\"",
             self.vm_ip,
             exec_command
         );
@@ -227,14 +225,19 @@ Keywords=vm;isolated;sandbox;{package};
     pub fn launch_app(&self, app_command: &str) -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Launching {} in VM {}", app_command, self.vm_name);
 
-        // Use xpra start with SSH to launch the application
-        // The application will appear as a native window on the host
+        // Attach to persistent Xpra server via SSH and launch the application
+        // The Xpra server is running on :10 in the VM
+        // Multiple apps can be launched in the same session, each appearing as separate windows
+        // Format: ssh://user@host/display (slash not colon!)
         Command::new("xpra")
             .args(&[
-                "start",
-                &format!("ssh://{}@{}", self.username, self.vm_ip),
+                "attach",
+                &format!("ssh://user@{}/10", self.vm_ip),
                 &format!("--start-child={}", app_command),
-                "--exit-with-children",
+                "--speaker-codec=opus",     // Opus has lowest latency
+                "--microphone-codec=opus",  // Opus for mic too
+                "--speaker=on",
+                "--microphone=off",         // Disable mic by default
             ])
             .spawn()?;
 

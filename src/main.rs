@@ -83,8 +83,8 @@ enum Commands {
         #[arg(short, long)]
         config: Option<String>,
 
-        /// Memory in MB (default: 4096)
-        #[arg(long, default_value = "4096")]
+        /// Memory in MB (default: 2048)
+        #[arg(long, default_value = "2048")]
         memory: u64,
 
         /// Number of CPUs (default: 2)

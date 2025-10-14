@@ -35,11 +35,13 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - **Comprehensive logging**: Detailed installation logs for troubleshooting
 - **VM lifecycle management**: create/start/stop/destroy/list/passwords/apps/launch/generate-shortcuts
 - **Centralized password storage**: Secure credential management system
+- **Smart memory management**: 2GB default, temporarily uses 4GB during installation
+- **Low-latency audio**: Optimized Xpra configuration for minimal delay (<500ms)
+- **Automatic SSH key acceptance**: Seamless Xpra connections without manual setup
 
 **🚧 Future Enhancements:**
 - GPU passthrough for hardware acceleration (virgl/Venus)
 - VirtIO channels for improved performance
-- Reduce RAM requirement for VM installation (2GB of RAM currently unsupported. 4GB of RAM is the current minimum)
 - Pre-configured VM templates (Firefox, VS Code, development, media, etc)
 - Shared folders via 9p/virtiofs
 
@@ -274,6 +276,9 @@ Host Application Menu         Guest VM (Xpra + SSH)
 
 2. Start VM (SSH keys & Xpra auto-configured):
    vm-provisioner start browser-vm
+   → SSH public key injected into VM during provisioning
+   → VM's SSH host key automatically added to ~/.ssh/known_hosts
+   → Passwordless authentication ready immediately
 
 3. Generate desktop shortcuts:
    vm-provisioner generate-shortcuts browser-vm
@@ -295,6 +300,50 @@ Host Application Menu         Guest VM (Xpra + SSH)
 - ✅ Dynamic resolution adaptation
 - ✅ No complex RDP setup or RemoteApp limitations
 - ✅ Native Linux solution with excellent X11 integration
+
+### Audio Configuration
+
+Xpra is configured for low-latency audio with minimal delay (<500ms):
+
+**Client-side optimizations:**
+- Buffer time: 32ms (reduced from 200ms default)
+- Latency time: 16ms (reduced from 10ms default)
+- Codec: Opus (lowest latency audio codec)
+- Environment variables set automatically
+
+**Server-side optimizations:**
+- Matching buffer/latency configuration in VM
+- Opus codec for both speaker and microphone
+- PulseAudio integration enabled
+- Configuration applied during VM provisioning
+
+These settings are automatically applied when launching applications via Xpra, providing smooth audio playback for videos, music, and communication applications.
+
+## Memory Management
+
+VMs run with **2GB RAM by default** (configurable with `--memory`). During installation, the system temporarily uses **4GB RAM** (required for Fedora network installation), then automatically reduces to the configured amount after the VM is created.
+
+**This happens transparently:**
+1. **Installation**: VM uses 4GB RAM for package download and installation
+2. **First boot**: Automatic reduction to configured amount (default 2GB)
+3. **Runtime**: VM runs with configured memory allocation
+
+**Why this works:**
+- Fedora network installation requires 4GB to download packages during install
+- Once installed, VMs run efficiently with 2GB (or your custom amount)
+- Smart memory management happens automatically without user intervention
+
+**Manual configuration:**
+```bash
+# 2GB VM (uses 4GB during install, then 2GB)
+vm-provisioner create --flatpak org.mozilla.firefox --memory 2048
+
+# 1GB VM (uses 4GB during install, then 1GB)
+vm-provisioner create --system git vim --headless --memory 1024
+
+# 8GB VM (no temporary increase needed)
+vm-provisioner create --flatpak com.visualstudio.code --memory 8192
+```
 
 ## i3 Window Manager Usage
 
@@ -362,7 +411,7 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 - `--name <name>` - Custom VM name (auto-generated if not provided)
 - `--system <pkg>` - System packages to install (can be used multiple times)
 - `--flatpak <pkg>` - Flatpak packages to install (can be used multiple times)
-- `--memory <mb>` - Memory allocation in MB (default: 4096)
+- `--memory <mb>` - Memory allocation in MB (default: 2048)
 - `--vcpus <n>` - Number of virtual CPUs (default: 2)
 - `--disk <gb>` - Disk size in GB (default: 20)
 - `--headless` - Headless mode - no GUI/desktop environment (CLI only)
@@ -510,6 +559,13 @@ sudo apt install xpra
 sudo pacman -S xpra
 ```
 
+**SSH Configuration:**
+SSH authentication is configured automatically during VM provisioning:
+- Host's SSH public key (`~/.ssh/id_rsa.pub`) is injected into VM
+- VM's SSH host key is automatically added to `~/.ssh/known_hosts`
+- No manual SSH setup or password entry required
+- If you don't have SSH keys, generate them: `ssh-keygen -t rsa -b 4096`
+
 ## Troubleshooting
 
 ### VM Creation Fails
@@ -551,6 +607,21 @@ sudo pacman -S xpra
 - **IOMMU group warnings**: All devices in same group must be passed through together
 - **Permission denied**: Commands use sudo for driver binding
 - **Hot-plug fails**: Check `dmesg` and `virsh dumpxml <vm>` for errors
+
+### Xpra Connection Issues
+- **SSH host key verification failed**: Automatically resolved during provisioning, but if you see this:
+  ```bash
+  # Manually accept the host key
+  ssh-keyscan -H <vm-ip> >> ~/.ssh/known_hosts
+  ```
+- **Permission denied**: Ensure your SSH public key exists at `~/.ssh/id_rsa.pub`
+- **Connection refused**: VM may still be booting, wait 30 seconds and retry
+
+### Audio Issues with Xpra
+- **Audio delay or sync problems**: Configuration is optimized automatically for <500ms latency
+- **No audio**: Ensure PulseAudio/PipeWire is running on host: `pactl info`
+- **Choppy audio**: Check network latency if using remote host
+- **Manual tuning**: Audio settings are in `/etc/xpra/conf.d/60_seamless.conf` in VM
 
 ### Performance Issues
 - Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`

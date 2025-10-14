@@ -105,15 +105,15 @@ impl AppVMProvisioner {
             self.validate_pci_passthrough()?;
         }
         
-        // Download Alpine ISO
-        let iso_path = self.download_alpine_iso()?;
-        
+        // Download Fedora ISO (reused across VMs)
+        let iso_path = self.download_fedora_iso()?;
+
         // Create VM disk
         let disk_path = self.create_vm_disk()?;
-        
+
         // Generate kickstart configuration
         let kickstart_path = self.generate_kickstart_config()?;
-        
+
         // Start automated installation
         self.start_installation(&iso_path, &disk_path, &kickstart_path)?;
         
@@ -162,31 +162,35 @@ impl AppVMProvisioner {
         Ok(())
     }
     
-    fn download_alpine_iso(&self) -> Result<String, Box<dyn std::error::Error>> {
+    fn download_fedora_iso(&self) -> Result<String, Box<dyn std::error::Error>> {
         let arch = std::env::consts::ARCH;
-        let version = "3.22.2";
-        let iso_name = format!("alpine-virt-{}-{}.iso", version, arch);
+        let version = "41";
+        let iso_name = format!("Fedora-Server-dvd-{}.iso", arch);
         let iso_path = format!("{}/{}", self.config.vm_dir, iso_name);
 
         if Path::new(&iso_path).exists() {
-            println!("📦 Using existing Alpine ISO");
+            println!("📦 Using existing Fedora ISO");
             return Ok(iso_path);
         }
 
-        println!("📥 Downloading Alpine ISO (~50MB)...");
+        println!("📥 Downloading Fedora Server ISO (~2GB)...");
+        println!("   This is a one-time download and will be reused for future VMs");
 
         let download_url = match arch {
-            "x86_64" => format!("https://dl-cdn.alpinelinux.org/alpine/v{}/releases/x86_64/alpine-virt-{}-x86_64.iso",
-                               "3.22", version),
-            "aarch64" => format!("https://dl-cdn.alpinelinux.org/alpine/v{}/releases/aarch64/alpine-virt-{}-aarch64.iso",
-                                "3.22", version),
+            "x86_64" => format!("https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/x86_64/iso/Fedora-Server-dvd-x86_64-{}-1.2.iso", version, version),
+            "aarch64" => format!("https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/aarch64/iso/Fedora-Server-dvd-aarch64-{}-1.2.iso", version, version),
             _ => return Err(format!("Unsupported architecture: {}", arch).into()),
         };
 
-        Command::new("curl")
-            .args(&["-L", "-o", &iso_path, &download_url])
+        let status = Command::new("curl")
+            .args(&["-L", "-o", &iso_path, "--progress-bar", &download_url])
             .status()?;
 
+        if !status.success() {
+            return Err("Failed to download Fedora ISO".into());
+        }
+
+        println!("✅ Download complete");
         Ok(iso_path)
     }
     
@@ -432,10 +436,16 @@ start-new-commands = yes
 start = i3
 bind-tcp = 0.0.0.0:14500
 
-# Audio support
+# Audio support - optimized for low latency
 pulseaudio = yes
 speaker = on
 microphone = on
+speaker-codec = opus
+microphone-codec = opus
+
+# Audio buffer settings for minimal latency
+sound-source-buffer-time = 32
+sound-source-latency-time = 16
 
 # Clipboard support
 clipboard = yes
@@ -665,25 +675,33 @@ reboot"#,
         fs::write(&kickstart_path, kickstart_content)?;
         Ok(kickstart_path)
     }
-    
-    fn start_installation(&self, _iso_path: &str, disk_path: &str, kickstart_path: &str) 
+
+    fn start_installation(&self, _iso_path: &str, disk_path: &str, kickstart_path: &str)
         -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Starting VM installation...");
-        
+
+        // For network install, we need more RAM during installation
+        // Use 4GB for install, VM will use configured amount after first boot
+        let install_memory = if self.config.memory_mb < 4096 {
+            println!("   ⚠️  Using 4GB RAM for installation (VM will use {}MB after first boot)", self.config.memory_mb);
+            4096
+        } else {
+            self.config.memory_mb
+        };
+
         let arch = std::env::consts::ARCH;
         let install_location = match arch {
             "x86_64" => "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Server/x86_64/os/",
             "aarch64" => "https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Everything/aarch64/os/",
             _ => return Err(format!("Unsupported architecture: {}", arch).into()),
         };
-        
-        let memory_str = self.config.memory_mb.to_string();
+
+        let memory_str = install_memory.to_string();
         let vcpus_str = self.config.vcpus.to_string();
-        let disk_arg = format!("path={},size={},format=qcow2,bus=virtio", 
+        let disk_arg = format!("path={},size={},format=qcow2,bus=virtio",
                                disk_path, self.config.disk_size_gb);
-        
+
         // Configure graphics based on backend, architecture, and headless mode
-        let arch = std::env::consts::ARCH;
         let graphics_args = if self.config.headless {
             // Headless mode: no graphics, serial console only
             vec!["--graphics", "none"]
@@ -723,6 +741,7 @@ reboot"#,
             "--location", install_location,
             "--initrd-inject", kickstart_path,
             "--extra-args", "inst.ks=file:/kickstart.cfg console=tty0 console=ttyS0,115200n8",
+            "--osinfo", "fedora41",
             "--network", "network=default,model=virtio",
             "--noautoconsole",
             "--wait", "-1",
@@ -771,7 +790,7 @@ reboot"#,
             if disk_size_mb < 500 {
                 eprintln!("❌ Installation failed: Disk size is only {} MB (expected at least 500 MB)", disk_size_mb);
                 eprintln!("   This usually means the installer ran out of memory or disk space.");
-                eprintln!("   Try increasing RAM with --memory 4096 (4GB minimum for network install)");
+                eprintln!("   Try increasing RAM with --memory 3072 or --memory 4096 if the issue persists");
                 return Err("Installation validation failed: disk too small".into());
             }
         } else {
@@ -805,12 +824,155 @@ reboot"#,
             println!("   ✓ VM is already running");
         }
 
-        // Stop the VM (user in libvirt group doesn't need sudo)
-        Command::new("virsh")
-            .args(&["-c", "qemu:///system", "destroy", &self.config.name])
+        // Reduce memory if we increased it for installation
+        if install_memory > self.config.memory_mb {
+            println!("   Reducing VM memory to {}MB...", self.config.memory_mb);
+
+            // Stop the VM first (requires sudo)
+            Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "shutdown", &self.config.name])
+                .output()?;
+
+            // Wait for shutdown
+            for _ in 0..30 {
+                thread::sleep(Duration::from_secs(1));
+                let state_check = Command::new("sudo")
+                    .args(&["virsh", "-c", "qemu:///system", "domstate", &self.config.name])
+                    .output()?;
+                let state = String::from_utf8_lossy(&state_check.stdout).trim().to_string();
+                if state == "shut off" {
+                    break;
+                }
+            }
+
+            // Update memory configuration (requires sudo)
+            Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "setmaxmem", &self.config.name,
+                       &format!("{}M", self.config.memory_mb), "--config"])
+                .output()?;
+
+            Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "setmem", &self.config.name,
+                       &format!("{}M", self.config.memory_mb), "--config"])
+                .output()?;
+
+            println!("   ✓ Memory reduced to {}MB", self.config.memory_mb);
+            println!("   (VM will use this amount on next boot)");
+
+            // Start the VM again with the new memory settings
+            println!("   Starting VM with new memory configuration...");
+            Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "start", &self.config.name])
+                .output()?;
+
+            // Wait a moment for VM to start
+            thread::sleep(Duration::from_secs(5));
+        } else {
+            // VM is already running with correct memory, no restart needed
+        }
+
+        // Accept SSH host key for seamless Xpra connections
+        self.accept_ssh_host_key()?;
+
+        // Stop the VM (requires sudo)
+        Command::new("sudo")
+            .args(&["virsh", "-c", "qemu:///system", "destroy", &self.config.name])
             .output()?;
 
         println!("✅ Installation completed and validated!");
+
+        Ok(())
+    }
+
+    fn accept_ssh_host_key(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔑 Adding VM SSH host key...");
+        println!("   Waiting for VM networking to be ready...");
+
+        // Retry getting VM IP address with delays (networking might not be ready immediately)
+        let mut vm_ip = None;
+        for attempt in 1..=30 {
+            let output = Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "domifaddr", &self.config.name])
+                .output()?;
+
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+
+                // Parse IP from output like:
+                // vnet0      52:54:00:12:34:56    ipv4         192.168.122.100/24
+                for line in output_str.lines() {
+                    if line.contains("ipv4") {
+                        if let Some(ip_part) = line.split_whitespace().nth(3) {
+                            // Remove /24 suffix
+                            if let Some(ip) = ip_part.split('/').next() {
+                                vm_ip = Some(ip.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if vm_ip.is_some() {
+                    break;
+                }
+            }
+
+            if attempt < 30 {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        let vm_ip = vm_ip.ok_or("Could not determine VM IP address after 60 seconds")?;
+        println!("   VM IP: {}", vm_ip);
+
+        // Get user's home directory
+        let home = if let Ok(h) = std::env::var("HOME") {
+            h
+        } else if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            // Running under sudo, get the actual user's home
+            let output = Command::new("getent")
+                .args(&["passwd", &sudo_user])
+                .output()?;
+            let passwd = String::from_utf8_lossy(&output.stdout);
+            passwd.split(':').nth(5).unwrap_or("/root").to_string()
+        } else {
+            "/root".to_string()
+        };
+
+        let known_hosts = format!("{}/.ssh/known_hosts", home);
+
+        // Use ssh-keyscan to get the host key (retry for up to 2 minutes)
+        println!("   Waiting for SSH server to be ready...");
+        let mut scan_output = None;
+        for attempt in 1..=60 {
+            let output = Command::new("ssh-keyscan")
+                .args(&["-H", &vm_ip])
+                .output()?;
+
+            if output.status.success() && !output.stdout.is_empty() {
+                scan_output = Some(output);
+                break;
+            }
+
+            if attempt < 60 {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        let output = scan_output.ok_or("Failed to scan SSH host key after 2 minutes")?;
+
+        // Append to known_hosts
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&known_hosts)?;
+
+        file.write_all(&output.stdout)?;
+
+        println!("   ✓ SSH host key added to {}", known_hosts);
 
         Ok(())
     }
@@ -1257,6 +1419,8 @@ bar {
 }
 
 # Auto-start applications
+# Start persistent Xpra server for seamless window integration
+exec --no-startup-id xpra start :10 --daemon=yes
 EOF
 
 # Add auto-start commands for installed applications"#.to_string();
