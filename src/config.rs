@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -8,6 +9,12 @@ pub struct PciDevice {
     pub description: String,             // "NVIDIA GeForce GTX 1050"
     pub original_driver: Option<String>, // "nvidia" - for restoration
     pub iommu_group: Option<u32>,        // IOMMU group number
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ValueEnum)]
+pub enum DisplayProtocol {
+    Waypipe,
+    X2Go,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -26,6 +33,7 @@ pub struct AppVMConfig {
 
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
+    pub display_protocol: DisplayProtocol,
     pub enable_clipboard: bool,
     pub enable_audio: bool,
     pub enable_usb_passthrough: bool,
@@ -80,30 +88,46 @@ impl AppVMConfig {
         headless: bool,
         pci_devices: Vec<PciDevice>,
         pci_hotplug: bool,
+        display_protocol: DisplayProtocol,
     ) -> Self {
         // Default system packages - different for headless vs GUI
         let mut default_system_packages = if headless {
             // Headless mode: minimal packages, no GUI/X11
-            vec![
-                "git".to_string(), // Version control
-            ]
+            vec!["git".to_string()]
         } else {
-            // GUI mode: Wayland desktop environment with Waypipe support
-            vec![
-                "sway".to_string(),     // Wayland compositor
-                "swaylock".to_string(), // Lock screen
-                "swayidle".to_string(), // Idle management
-                "waybar".to_string(),   // Status bar
-                "i3status".to_string(), // Status command for waybar/i3bar
-                "dmenu".to_string(),
-                "rofi".to_string(), // Application launcher with Flatpak support
-                "wl-clipboard".to_string(), // Clipboard utilities
-                "pipewire".to_string(), // Audio system
-                "kitty".to_string(), // Default terminal emulator
-                "git".to_string(),  // Version control
-                "waypipe".to_string(), // Wayland remoting
-                "openssh-server".to_string(), // SSH server for Waypipe connections
-            ]
+            match display_protocol {
+                DisplayProtocol::Waypipe => vec![
+                    "sway".to_string(),
+                    "swaylock".to_string(),
+                    "swayidle".to_string(),
+                    "waybar".to_string(),
+                    "i3status".to_string(),
+                    "dmenu".to_string(),
+                    "rofi".to_string(),
+                    "wl-clipboard".to_string(),
+                    "pipewire".to_string(),
+                    "kitty".to_string(),
+                    "git".to_string(),
+                    "waypipe".to_string(),
+                    "openssh-server".to_string(),
+                ],
+                DisplayProtocol::X2Go => vec![
+                    "xorg-x11-server-Xorg".to_string(),
+                    "xorg-x11-xinit".to_string(),
+                    "i3".to_string(),
+                    "i3status".to_string(),
+                    "dmenu".to_string(),
+                    "rofi".to_string(),
+                    "x2goserver".to_string(),
+                    "x2goserver-xsession".to_string(),
+                    "pulseaudio".to_string(),
+                    "pulseaudio-utils".to_string(),
+                    "xclip".to_string(),
+                    "kitty".to_string(),
+                    "git".to_string(),
+                    "openssh-server".to_string(),
+                ],
+            }
         };
 
         // Add user-specified system packages
@@ -125,6 +149,7 @@ impl AppVMConfig {
             } else {
                 GraphicsBackend::VirtioGpu
             },
+            display_protocol,
             enable_clipboard: !headless,
             enable_audio: !headless,
             enable_usb_passthrough: false,

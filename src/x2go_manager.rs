@@ -2,109 +2,14 @@ use crate::config::AppVMConfig;
 use crate::display_bridge::DisplayBridge;
 use std::error::Error;
 use std::fs;
-use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Waypipe manager handles desktop integration and per-app launching.
-pub struct WaypipeManager {
+pub struct X2GoManager {
     config: AppVMConfig,
-    vm_ip: String,
-    host_pulse_socket: String,
-    remote_pulse_socket: String,
 }
 
-impl WaypipeManager {
-    pub fn get_ssh_public_key() -> Result<String, Box<dyn Error>> {
-        let home_dir = std::env::var("HOME")?;
-        let ssh_dir = Path::new(&home_dir).join(".ssh");
-
-        let key_files = vec![
-            ssh_dir.join("id_ed25519.pub"),
-            ssh_dir.join("id_rsa.pub"),
-            ssh_dir.join("id_ecdsa.pub"),
-        ];
-
-        for key_file in &key_files {
-            if key_file.exists() {
-                let public_key = fs::read_to_string(key_file)?.trim().to_string();
-                println!("   Using existing SSH key: {}", key_file.display());
-                return Ok(public_key);
-            }
-        }
-
-        println!("   No SSH key found, generating new ed25519 key...");
-        fs::create_dir_all(&ssh_dir)?;
-
-        let key_path = ssh_dir.join("id_ed25519");
-        let output = Command::new("ssh-keygen")
-            .args(&[
-                "-t",
-                "ed25519",
-                "-f",
-                key_path.to_str().unwrap(),
-                "-N",
-                "",
-                "-C",
-                "vm-provisioner-key",
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to generate SSH key: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        let pub_key_path = ssh_dir.join("id_ed25519.pub");
-        let public_key = fs::read_to_string(pub_key_path)?.trim().to_string();
-
-        println!("   ✅ Generated new SSH key: {}", key_path.display());
-        Ok(public_key)
-    }
-
-    fn ensure_waypipe_available() -> Result<(), Box<dyn Error>> {
-        match Command::new("waypipe").arg("--version").output() {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(
-                "waypipe binary not found on host. Install it (e.g., `sudo dnf install waypipe` or `sudo apt install waypipe`)".into(),
-            ),
-            Err(e) => Err(format!("failed to execute waypipe: {}", e).into()),
-        }
-    }
-
-    fn detect_host_pulse_socket() -> String {
-        if let Ok(socket) = std::env::var("WAYPIPE_PULSE_SOCKET") {
-            if !socket.is_empty() {
-                return socket;
-            }
-        }
-
-        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            let candidate = format!("{}/pulse/native", runtime_dir);
-            if Path::new(&candidate).exists() {
-                return candidate;
-            }
-        }
-
-        if let Ok(output) = Command::new("id").arg("-u").output() {
-            if output.status.success() {
-                if let Ok(uid) = String::from_utf8(output.stdout) {
-                    let uid = uid.trim();
-                    let candidate = format!("/run/user/{}/pulse/native", uid);
-                    if Path::new(&candidate).exists() {
-                        return candidate;
-                    }
-                    return candidate;
-                }
-            }
-        }
-
-        "/run/user/1000/pulse/native".to_string()
-    }
-
+impl X2GoManager {
     fn get_vm_ip_static(vm_name: &str) -> Result<String, Box<dyn Error>> {
         let output = Command::new("sudo")
             .args(&["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
@@ -122,14 +27,27 @@ impl WaypipeManager {
                 }
             }
         }
-
         Err("Could not determine VM IP address. VM may not be running.".into())
+    }
+
+    fn get_ssh_key_path() -> Result<PathBuf, Box<dyn Error>> {
+        let home_dir = std::env::var("HOME")?;
+        let ssh_dir = Path::new(&home_dir).join(".ssh");
+        let key_files = ["id_ed25519", "id_rsa", "id_ecdsa"];
+        for key_file in &key_files {
+            let key_path = ssh_dir.join(key_file);
+            if key_path.exists() {
+                return Ok(key_path);
+            }
+        }
+        Err("No suitable SSH private key found in ~/.ssh/".into())
     }
 
     fn is_application_package(&self, package: &str) -> bool {
         let skip_patterns = [
-            "sway", "waybar", "swaylock", "swayidle", "wl-clipboard", "pipewire", "git",
-            "waypipe", "openssh-server", "seatd", "dmenu", "-devel", "-libs", "lib",
+            "xorg-x11-server-Xorg", "xorg-x11-xinit", "i3", "i3status", "dmenu", "rofi",
+            "x2goserver", "x2goserver-xsession", "pulseaudio", "pulseaudio-utils", "xclip",
+            "git", "openssh-server", "-devel", "-libs", "lib",
         ];
         !skip_patterns.iter().any(|p| package.contains(p))
     }
@@ -178,7 +96,7 @@ impl WaypipeManager {
 Version=1.0
 Type=Application
 Name={app_name} (VM: {vm_name})
-Comment=Run in isolated VM via Waypipe
+Comment=Run in isolated VM via X2Go
 Icon={icon}
 Exec={exec_line}
 Terminal=false
@@ -227,41 +145,58 @@ Keywords=vm;isolated;sandbox;{package};
     }
 }
 
-impl DisplayBridge for WaypipeManager {
+impl DisplayBridge for X2GoManager {
     fn new(config: &AppVMConfig) -> Result<Self, Box<dyn Error>> {
-        Self::ensure_waypipe_available()?;
-        let vm_ip = Self::get_vm_ip_static(&config.name)?;
-
         Ok(Self {
             config: config.clone(),
-            vm_ip,
-            host_pulse_socket: Self::detect_host_pulse_socket(),
-            remote_pulse_socket: "/run/user/1000/pulse/native".to_string(),
         })
     }
 
     fn generate_exec_command(&self, app_command: &str) -> String {
-        format!(
-            "waypipe --compress zstd ssh -R {remote}:{host} user@{ip} {cmd}",
-            remote = self.remote_pulse_socket,
-            host = self.host_pulse_socket,
-            ip = self.vm_ip,
-            cmd = app_command
-        )
-    }
+        let vm_ip = match Self::get_vm_ip_static(&self.config.name) {
+            Ok(ip) => ip,
+            Err(_) => return String::from("echo 'Error: VM IP not found'"),
+        };
+        let ssh_key_path = match Self::get_ssh_key_path() {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(_) => return String::from("echo 'Error: SSH key not found'"),
+        };
 
-    fn launch_app(&self, app_command: &str) -> Result<(), Box<dyn Error>> {
-        let exec_command = self.generate_exec_command(app_command);
-        println!(
-            "🚀 Launching {} in VM {} via Waypipe",
-            app_command, self.config.name
+        let session_dir = Path::new("/tmp/vm-provisioner/sessions");
+        fs::create_dir_all(session_dir).unwrap_or_default();
+
+        let app_name = app_command.split_whitespace().next().unwrap_or("app");
+        let session_file_path = session_dir.join(format!("{}-{}.x2go", self.config.name, app_name));
+
+        let session_content = format!(
+            r#"[Session]
+host={}
+user=user
+sshport=22
+useproxy=false
+autologin=true
+key={}
+command={}
+name={}-{}
+rootless=true
+sound=true
+soundsystem=pulse
+startsoundsystem=true
+clipboard=both
+"#,
+            vm_ip,
+            ssh_key_path,
+            app_command,
+            self.config.name,
+            app_name
         );
-        let mut parts = exec_command.split_whitespace();
-        let cmd = parts.next().unwrap_or("waypipe");
-        let args: Vec<&str> = parts.collect();
-        Command::new(cmd).args(&args).spawn()?;
-        println!("✅ Application launched via Waypipe");
-        Ok(())
+
+        fs::write(&session_file_path, session_content).unwrap_or_default();
+
+        format!(
+            "x2goclient --session-conf {}",
+            session_file_path.to_string_lossy()
+        )
     }
 
     fn generate_desktop_files(&self) -> Result<(), Box<dyn Error>> {
@@ -323,20 +258,49 @@ impl DisplayBridge for WaypipeManager {
         apps
     }
 
+    fn launch_app(&self, app_command: &str) -> Result<(), Box<dyn Error>> {
+        let exec_command = self.generate_exec_command(app_command);
+        println!(
+            "🚀 Launching {} in VM {} via X2Go",
+            app_command, self.config.name
+        );
+
+        let mut parts = exec_command.split_whitespace();
+        let client = parts.next().unwrap_or("x2goclient");
+        let args: Vec<&str> = parts.collect();
+
+        Command::new(client).args(&args).spawn()?;
+
+        println!("✅ Application launched via X2Go");
+        Ok(())
+    }
+
     fn guest_packages(&self) -> Vec<String> {
         vec![
-            "sway".to_string(), "swaylock".to_string(), "swayidle".to_string(),
-            "waybar".to_string(), "i3status".to_string(), "dmenu".to_string(), "rofi".to_string(),
-            "wl-clipboard".to_string(), "pipewire".to_string(), "kitty".to_string(),
-            "git".to_string(), "waypipe".to_string(), "openssh-server".to_string(),
+            "xorg-x11-server-Xorg".to_string(),
+            "xorg-x11-xinit".to_string(),
+            "i3".to_string(),
+            "i3status".to_string(),
+            "dmenu".to_string(),
+            "rofi".to_string(),
+            "x2goserver".to_string(),
+            "x2goserver-xsession".to_string(),
+            "pulseaudio".to_string(),
+            "pulseaudio-utils".to_string(),
+            "xclip".to_string(),
+            "kitty".to_string(),
+            "git".to_string(),
+            "openssh-server".to_string(),
         ]
     }
 
     fn kickstart_config(&self, ssh_public_key: &str) -> String {
         format!(
             r#"
-# Configure SSH, Sway, and Waypipe for seamless window mode
-echo "=== Configuring SSH, Sway, and Waypipe for seamless mode ==="
+# Configure SSH, X2Go, and i3 for seamless window mode
+echo "=== Configuring SSH, X2Go, and i3 for seamless mode ==="
+
+# SSH key for passwordless authentication
 mkdir -p /home/user/.ssh
 chmod 700 /home/user/.ssh
 cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
@@ -344,10 +308,18 @@ cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
 SSH_KEY_EOF
 chmod 600 /home/user/.ssh/authorized_keys
 chown -R user:user /home/user/.ssh
+
+# Enable and start SSH and X2Go servers
 systemctl enable sshd
 systemctl start sshd
+systemctl enable x2goserver
+systemctl start x2goserver
+
+# Allow SSH through firewall
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
+
+# Configure auto-login on tty1
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/override.conf << 'AUTOLOGIN_EOF'
 [Service]
@@ -359,21 +331,28 @@ RestartSec=0
 TTYVTDisallocate=yes
 AUTOLOGIN_EOF
 systemctl enable getty@tty1.service
-cat >> /home/user/.bash_profile << 'SWAY_EOF'
-if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    export XDG_RUNTIME_DIR=/run/user/$(id -u)
-    exec sway
+
+# Auto-start X11 on tty1 login
+cat >> /home/user/.bash_profile << 'X11_EOF'
+
+# Auto-start X11 on tty1
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    exec startx
 fi
-SWAY_EOF
-mkdir -p /home/user/.config/sway
-cat > /home/user/.config/sway/config << 'SWAY_CONFIG_EOF'
-set $mod Mod4
-bindsym $mod+Return exec kitty
-bindsym $mod+d exec rofi -show drun
-bindsym $mod+Shift+q kill
-SWAY_CONFIG_EOF
-chown -R user:user /home/user/.config
-chown user:user /home/user/.bash_profile
+X11_EOF
+
+# Create .xinitrc to start i3
+cat > /home/user/.xinitrc << 'XINIT_EOF'
+#!/bin/sh
+exec i3
+XINIT_EOF
+
+chown user:user /home/user/.bash_profile /home/user/.xinitrc
+chmod +x /home/user/.xinitrc
+
+# Enable user-level pulseaudio
+sudo -u user systemctl --user enable pulseaudio
+
 systemctl set-default multi-user.target
 "#,
             ssh_public_key

@@ -1,10 +1,12 @@
+use crate::config::{AppVMConfig, DisplayProtocol, GraphicsBackend, PciDevice};
+use crate::display_bridge::DisplayBridge;
+use crate::waypipe_manager::WaypipeManager;
+use crate::x2go_manager::X2GoManager;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-
-use crate::config::{AppVMConfig, GraphicsBackend, PciDevice};
 
 pub struct AppVMProvisioner {
     config: AppVMConfig,
@@ -254,44 +256,18 @@ impl AppVMProvisioner {
 
         println!("🏗️  Generating kickstart configuration...");
 
-        // Build package list from system packages, separating build deps from runtime deps
-        let mut base_packages = if self.config.headless {
-            // Headless mode: minimal packages only
-            vec!["@core".to_string(), "git".to_string()]
-        } else {
-            // GUI mode: full desktop environment
-            vec![
-                "@core".to_string(),
-                "@base-x".to_string(),
-                "i3".to_string(),
-                "i3status".to_string(),
-                "i3lock".to_string(),
-                "dmenu".to_string(),
-                "rofi".to_string(),
-                "xorg-x11-server-Xorg".to_string(),
-                "xorg-x11-xinit".to_string(),
-                "pipewire".to_string(),
-                "spice-vdagent".to_string(),
-                "kitty".to_string(),
-                "git".to_string(),
-            ]
-        };
+        let display_bridge: Box<dyn DisplayBridge> =
+            match self.config.display_protocol {
+                DisplayProtocol::Waypipe => Box::new(WaypipeManager::new(&self.config)?),
+                DisplayProtocol::X2Go => Box::new(X2GoManager::new(&self.config)?),
+            };
 
-        // Add user-specified system packages (filter out build deps)
-        for pkg in &self.config.system_packages {
-            if !pkg.contains("-devel")
-                && !pkg.contains("autoconf")
-                && !pkg.contains("automake")
-                && !pkg.contains("libtool")
-                && !pkg.contains("pkgconfig")
-                && !pkg.contains("gcc")
-                && !pkg.contains("make")
-            {
-                base_packages.push(pkg.clone());
-            }
-        }
-
+        let mut base_packages = display_bridge.guest_packages();
+        base_packages.extend(self.config.system_packages.clone());
         let packages = base_packages.join("\n");
+
+        let ssh_public_key = WaypipeManager::get_ssh_public_key()?;
+        let display_specific_config = display_bridge.kickstart_config(&ssh_public_key);
 
         // Build Flatpak configuration if flatpak packages specified (GUI mode only)
         let flatpak_config = if !self.config.headless && !self.config.flatpak_packages.is_empty() {
@@ -337,145 +313,6 @@ chmod +x /home/user/.local/bin/start-pipewire.sh
 chown -R user:user /home/user/.local/bin"#
         } else {
             ""
-        };
-
-        let sway_autostart = if !self.config.headless && !self.config.auto_launch_apps.is_empty() {
-            let commands = self
-                .config
-                .auto_launch_apps
-                .iter()
-                .map(|cmd| format!("exec {}", cmd))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("\n# Auto-start applications\n{}\n", commands)
-        } else {
-            "".to_string()
-        };
-
-        // Read SSH public key from host for passwordless authentication
-        let ssh_public_key = self.get_ssh_public_key()?;
-
-        // Configure SSH, Sway, and Waypipe for seamless window integration (GUI mode only)
-        let ssh_waypipe_sway_config = if !self.config.headless {
-            format!(
-                r#"
-# Configure SSH, Sway, and Waypipe for seamless window mode
-echo "=== Configuring SSH, Sway, and Waypipe for seamless mode ==="
-
-# SSH key for passwordless authentication
-mkdir -p /home/{0}/.ssh
-chmod 700 /home/{0}/.ssh
-cat > /home/{0}/.ssh/authorized_keys << 'SSH_KEY_EOF'
-{1}
-SSH_KEY_EOF
-chmod 600 /home/{0}/.ssh/authorized_keys
-chown -R {0}:{0} /home/{0}/.ssh
-
-# Enable and start SSH server
-systemctl enable sshd
-systemctl start sshd
-
-# Allow SSH through firewall
-firewall-cmd --permanent --add-service=ssh
-firewall-cmd --reload
-
-# Configure auto-login on tty1
-mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat > /etc/systemd/system/getty@tty1.service.d/override.conf << 'AUTOLOGIN_EOF'
-[Service]
-ExecStart=
-ExecStart=-/usr/sbin/agetty --autologin {0} --noclear %I $TERM
-Type=idle
-Restart=always
-RestartSec=0
-TTYVTDisallocate=yes
-AUTOLOGIN_EOF
-
-systemctl enable getty@tty1.service
-
-# Auto-start Sway on tty1 login
-cat >> /home/{0}/.bash_profile << 'SWAY_EOF'
-
-# Auto-start Sway on tty1
-if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    export XDG_RUNTIME_DIR=/run/user/$(id -u)
-    exec sway
-fi
-SWAY_EOF
-
-# Create Sway configuration
-mkdir -p /home/{0}/.config/sway
-cat > /home/{0}/.config/sway/config << 'SWAY_CONFIG_EOF'
-# Sway configuration (i3-compatible)
-set $mod Mod4
-
-# Terminal
-bindsym $mod+Return exec kitty
-
-# Application launcher
-bindsym $mod+d exec rofi -show drun
-
-# Window management
-bindsym $mod+Shift+q kill
-bindsym $mod+Left focus left
-bindsym $mod+Right focus right
-bindsym $mod+Up focus up
-bindsym $mod+Down focus down
-bindsym $mod+Shift+Left move left
-bindsym $mod+Shift+Right move right
-bindsym $mod+Shift+Up move up
-bindsym $mod+Shift+Down move down
-
-# Workspaces
-bindsym $mod+1 workspace number 1
-bindsym $mod+2 workspace number 2
-bindsym $mod+3 workspace number 3
-bindsym $mod+4 workspace number 4
-bindsym $mod+5 workspace number 5
-
-# Move to workspace
-bindsym $mod+Shift+1 move container to workspace number 1
-bindsym $mod+Shift+2 move container to workspace number 2
-bindsym $mod+Shift+3 move container to workspace number 3
-bindsym $mod+Shift+4 move container to workspace number 4
-bindsym $mod+Shift+5 move container to workspace number 5
-
-# Resize mode
-mode "resize" {{
-    bindsym Left resize shrink width 10px
-    bindsym Right resize grow width 10px
-    bindsym Up resize shrink height 10px
-    bindsym Down resize grow height 10px
-    bindsym Return mode "default"
-    bindsym Escape mode "default"
-}}
-bindsym $mod+r mode "resize"
-
-# Status bar
-bar {{
-    status_command i3status
-    position top
-}}
-
-# Exit Sway
-bindsym $mod+Shift+e exec "swaymsg exit"
-
-# Floating modifier
-floating_modifier $mod
-{2}
-SWAY_CONFIG_EOF
-
-chown -R {0}:{0} /home/{0}/.config
-chown {0}:{0} /home/{0}/.bash_profile
-
-systemctl set-default multi-user.target
-
-echo "=== SSH, Sway, and Waypipe configuration complete ==="
-"#,
-                "user", ssh_public_key, sway_autostart
-            )
-        } else {
-            String::new()
         };
 
         // Build firewall rules
@@ -525,83 +362,18 @@ set -x
 exec > >(tee -a /var/log/kickstart-post-detailed.log) 2>&1
 echo "=== Post-installation script started at $(date) ==="
 
-# Check what packages were actually installed in the base install
-echo "=== Checking installed packages ==="
-rpm -qa | grep -E "(sway|waybar|waypipe|kitty|git|rofi)" | sort
-
-# Verify critical packages and install if missing
-echo "=== Verifying critical packages ==="
-MISSING_PACKAGES=()
-for pkg in sway swaylock swayidle waybar waypipe wl-clipboard kitty git rofi; do
-    if ! rpm -q $pkg &>/dev/null; then
-        echo "Missing package: $pkg"
-        MISSING_PACKAGES+=($pkg)
-    else
-        echo "Package installed: $pkg"
-    fi
-done
-
-# Install any missing critical packages
-if [ ${{#MISSING_PACKAGES[@]}} -gt 0 ]; then
-    echo "=== Installing missing packages ==="
-    dnf install -y "${{MISSING_PACKAGES[@]}}"
-fi
-
 # Install flatpak packages if specified
 {flatpak_config}
 
 # Configure sudo for user
 echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/user
 
-# Configure Wayland environment
-mkdir -p /home/user/.config
-cat > /home/user/.config/environment << 'EOF'
-WAYLAND_DISPLAY=wayland-0
-XDG_SESSION_TYPE=wayland
-EOF
-
 {audio_config}
 
-{ssh_waypipe_sway_config}
+{display_specific_config}
 
 # Configure firewall rules
 {firewall_rules}
-
-# Install build tools and compile guest agent
-dnf install -y rust cargo git
-
-# Create guest agent source
-mkdir -p /tmp/guest-agent-build
-cat > /tmp/guest-agent-build/Cargo.toml << 'EOF'
-[package]
-name = "guest-agent"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-serde = {{ version = "1.0", features = ["derive"] }}
-bincode = "1.3"
-regex = "1.10"
-EOF
-
-# Copy guest agent source (this would be injected from the host)
-# For now, create a minimal version
-cat > /tmp/guest-agent-build/src/main.rs << 'EOF'
-fn main() {{
-    println!("Guest agent placeholder - will be replaced with full implementation");
-    std::thread::sleep(std::time::Duration::from_secs(60));
-}}
-EOF
-
-mkdir -p /tmp/guest-agent-build/src
-cd /tmp/guest-agent-build
-cargo build --release
-cp target/release/guest-agent /usr/local/bin/guest-agent
-chmod +x /usr/local/bin/guest-agent
-
-# Cleanup build files
-cd /
-rm -rf /tmp/guest-agent-build
 
 # Disable unnecessary services
 systemctl disable bluetooth
@@ -609,50 +381,6 @@ systemctl disable cups
 
 # Set hostname  
 echo "{vm_name}" > /etc/hostname
-
-# Final verification and status report
-echo "=== FINAL VERIFICATION ==="
-echo "Date: $(date)"
-echo ""
-
-echo "Critical packages status:"
-for pkg in sway swaylock swayidle waybar waypipe wl-clipboard; do
-    if rpm -q $pkg &>/dev/null; then
-        echo "✓ $pkg: INSTALLED"
-    else
-        echo "✗ $pkg: MISSING"
-    fi
-done
-
-echo ""
-echo "Auto-login service status:"
-if [ -f /etc/systemd/system/getty@tty1.service.d/override.conf ]; then
-    echo "✓ getty@tty1 override: CONFIGURED"
-else
-    echo "✗ tty1 override: MISSING"
-fi
-
-echo ""
-echo "User configuration status:"
-echo "User home directory contents:"
-ls -la /home/user/
-echo ""
-echo "User .bash_profile contains sway start:"
-if grep -q "exec sway" /home/user/.bash_profile; then
-    echo "✓ .bash_profile: CONFIGURED"
-else
-    echo "✗ .bash_profile missing sway auto-start"
-fi
-
-echo ""
-echo "Sway config exists:"
-if [ -f /home/user/.config/sway/config ]; then
-    echo "✓ Sway config: EXISTS"
-    echo "Auto-start entries:"
-    grep -c "^exec" /home/user/.config/sway/config || echo "0"
-else
-    echo "✗ Sway config: MISSING"
-fi
 
 echo ""
 echo "=== POST-INSTALL SCRIPT COMPLETED ==="
@@ -670,7 +398,7 @@ reboot"#,
             packages = packages,
             flatpak_config = flatpak_config,
             audio_config = audio_config,
-            ssh_waypipe_sway_config = ssh_waypipe_sway_config,
+            display_specific_config = display_specific_config,
             firewall_rules = firewall_rules
         );
 
@@ -1623,59 +1351,5 @@ reboot"#,
         }
 
         Ok(())
-    }
-
-    fn get_ssh_public_key(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let home_dir = std::env::var("HOME")?;
-        let ssh_dir = Path::new(&home_dir).join(".ssh");
-
-        // Try common SSH key types in order of preference
-        let key_files = vec![
-            ssh_dir.join("id_ed25519.pub"),
-            ssh_dir.join("id_rsa.pub"),
-            ssh_dir.join("id_ecdsa.pub"),
-        ];
-
-        // Check for existing keys
-        for key_file in &key_files {
-            if key_file.exists() {
-                let public_key = fs::read_to_string(key_file)?.trim().to_string();
-                println!("   Using existing SSH key: {}", key_file.display());
-                return Ok(public_key);
-            }
-        }
-
-        // No keys found, generate a new ed25519 key
-        println!("   No SSH key found, generating new ed25519 key...");
-        fs::create_dir_all(&ssh_dir)?;
-
-        let key_path = ssh_dir.join("id_ed25519");
-        let output = Command::new("ssh-keygen")
-            .args(&[
-                "-t",
-                "ed25519",
-                "-f",
-                key_path.to_str().unwrap(),
-                "-N",
-                "", // No passphrase
-                "-C",
-                &format!("vm-provisioner@{}", hostname::get()?.to_string_lossy()),
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to generate SSH key: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        // Read the newly generated public key
-        let pub_key_path = ssh_dir.join("id_ed25519.pub");
-        let public_key = fs::read_to_string(pub_key_path)?.trim().to_string();
-
-        println!("   ✅ Generated new SSH key: {}", key_path.display());
-        Ok(public_key)
     }
 }
