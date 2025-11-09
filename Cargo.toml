@@ -40,7 +40,7 @@ strip = true
 name = "vm-provisioner"
 path = "src/main.rs"
 
-# Legacy guest-agent and window proxy removed - replaced by Xpra seamless integration
+# Legacy guest-agent and window proxy removed - replaced by Waypipe seamless integration
 # [[bin]]
 # name = "guest-agent"
 # path = "src/guest_agent.rs"

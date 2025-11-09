@@ -4,3 +4,5 @@ vm.env
 debug
 target
 TODO.md
+*.md
+!README.md

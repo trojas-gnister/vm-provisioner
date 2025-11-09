@@ -1,17 +1,17 @@
 # VM Provisioner - Qubes-like Application Isolation System
 
-A Rust-based application isolation system inspired by Qubes OS. Creates lightweight VMs with dynamic package installation (system + Flatpak) featuring auto-login, auto-launch applications, i3 window manager, SPICE integration with auto-resize functionality, and comprehensive Flatpak support.
+A Rust-based application isolation system inspired by Qubes OS. Creates lightweight VMs with dynamic package installation (system + Flatpak) featuring auto-login, a Sway (Wayland) desktop, SPICE integration with auto-resize functionality, and comprehensive Flatpak support.
 
 ## Features
 
 - 🔒 **Application Isolation**: Each application runs in its own VM for security
 - 📦 **Dynamic Package Installation**: Install any system (dnf) or Flatpak packages on-demand
-- 🚀 **Auto-Launch Applications**: Specified applications start automatically when VM boots
-- 🔓 **Auto-Login**: Passwordless login with i3 window manager and desktop access
+- 🚀 **Legacy Auto-Launch Hooks**: Optional per-VM startup commands remain available for manual configuration
+- 🔓 **Auto-Login**: Passwordless login with the Sway Wayland compositor
 - 🖥️ **kitty Terminal**: Default terminal emulator included in every VM
-- 🪟 **Seamless Window Integration**: VM applications appear as native host windows via Xpra
-- 📋 **Clipboard Sharing**: Bidirectional clipboard sharing between host and VMs via Xpra
-- 🖥️ **i3 Window Manager**: Lightweight tiling window manager with full X11 compatibility
+- 🪟 **Seamless Window Integration**: VM applications appear as native host windows via Waypipe (Wayland)
+- 📋 **Clipboard Sharing**: Bidirectional clipboard sharing between host and VMs via Waypipe's native clipboard protocol
+- 🖥️ **Sway Compositor**: Wayland-first i3-compatible environment tuned for virtual machines
 - 🚀 **Application Launcher**: rofi with complete Flatpak integration + native host integration
 - 💾 **Password Management**: Centralized storage and individual VM credential management
 - 🔧 **Cross-Architecture**: Full support for x86_64 and aarch64 (ARM64)
@@ -23,12 +23,12 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 **✅ Fully Working System:**
 - **Complete VM isolation**: Each application runs in its own secure VM
 - **Dynamic package installation**: Install any system (dnf) or Flatpak packages on-demand
-- **Auto-login & auto-launch**: Passwordless login with applications starting automatically
-- **Seamless window integration**: VM applications appear as native host windows via Xpra (WinApps-style)
-- **Desktop integration**: .desktop files make VM apps appear in host application menu
-- **Xpra seamless mode**: Individual applications launch seamlessly with passwordless SSH
-- **Clipboard sharing**: Bidirectional clipboard between host and VMs via Xpra
-- **Robust package management**: All critical packages (xset, i3, kitty, xpra, SSH) install correctly
+- **Auto-login**: Passwordless login with the Sway Wayland compositor ready at boot
+- **Seamless window integration**: VM applications appear as native host windows via Waypipe (WinApps-style)
+- **Desktop integration**: .desktop files make VM apps appear in the host application menu with Waypipe launchers
+- **Waypipe seamless mode**: Individual applications launch over SSH with Zstd compression and PulseAudio socket forwarding
+- **Clipboard sharing**: Bidirectional clipboard between host and VMs via Wayland protocol bridging
+- **Robust package management**: All critical packages (sway, waybar, wl-clipboard, kitty, SSH) install correctly
 - **Cross-architecture support**: ARM64 and x86_64 compatibility verified and working
 - **Advanced CLI**: --system and --flatpak flags for dynamic VM creation
 - **Application launcher**: rofi with full Flatpak integration and discovery
@@ -36,8 +36,8 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - **VM lifecycle management**: create/start/stop/destroy/list/passwords/apps/launch/generate-shortcuts
 - **Centralized password storage**: Secure credential management system
 - **Smart memory management**: 2GB default, temporarily uses 4GB during installation
-- **Low-latency audio**: Optimized Xpra configuration for minimal delay (<500ms)
-- **Automatic SSH key acceptance**: Seamless Xpra connections without manual setup
+- **Low-latency audio**: PulseAudio/PipeWire socket forwarding keeps audio in sync
+- **Automatic SSH key acceptance**: Seamless Waypipe connections without manual setup
 
 **🚧 Future Enhancements:**
 - GPU passthrough for hardware acceleration (virgl/Venus)
@@ -48,7 +48,7 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 ## VM Modes
 
 ### GUI Mode (Default)
-Full desktop environment with i3 window manager, SPICE viewer, auto-login, and application auto-launch. Ideal for browser isolation, graphical applications, and desktop productivity tools.
+Full desktop environment with the Sway compositor, SPICE viewer, and auto-login. Ideal for browser isolation, graphical applications, and desktop productivity tools.
 
 ### Headless Mode
 Lightweight CLI-only VMs with no X11, no desktop environment, and no graphics. Access via serial console. Perfect for:
@@ -66,6 +66,7 @@ Requirements:
 - IOMMU enabled in BIOS (VT-d for Intel, AMD-Vi for AMD)
 - Kernel parameter: `intel_iommu=on` or `amd_iommu=on`
 - Run `lspci` to find device addresses
+- Use `--pci <BDF>` (repeatable) on `vm-provisioner create`, optionally combining with `--pci-hotplug` for dynamic attach. A full Steam/Wine GPU passthrough example is shown in the “PCI Passthrough Examples” section.
 
 ## Quick Start
 
@@ -112,9 +113,8 @@ cargo build --release
 ```bash
 # GUI VM - launches SPICE viewer
 ./target/release/vm-provisioner start media-vm
-# SPICE viewer launches automatically with i3 window manager
+# SPICE viewer launches automatically with Sway running inside the VM
 # Auto-login enabled - no password required
-# Applications auto-launch on boot (LibreWolf + qBittorrent)
 # Auto-resize works when you resize virt-viewer window
 # Clipboard sharing enabled between host and VM
 # Use Mod+d for rofi launcher, Mod+Enter for terminal
@@ -200,6 +200,7 @@ vm_dir = "/var/lib/libvirt/images"
 # Package installation
 system_packages = ["@base-x", "gdm", "xorg-x11-server-Xorg", "wmctrl", "xwininfo", "pipewire", "wl-clipboard", "kitty"]
 flatpak_packages = ["org.mozilla.firefox"]
+# Legacy auto-launch hooks (not populated by CLI)
 auto_launch_apps = ["flatpak run org.mozilla.firefox"]
 
 # Graphics and features
@@ -246,24 +247,24 @@ dev-vm = "vm-456def789ghi"
          └───────────────────────┘
 ```
 
-## Seamless Window Integration via Xpra
+## Seamless Window Integration via Waypipe
 
-**Architecture** (inspired by WinApps):
-1. VM runs applications in X11 environment with i3 window manager and auto-login
-2. SSH server configured with passwordless key-based authentication
-3. Xpra server configured for seamless window mode in the VM
-4. Xpra client on host connects via SSH and launches individual applications
-5. Applications appear as native host windows with full integration
-6. .desktop files make VM apps appear in host application menu
-7. Clipboard, audio, and window management via Xpra protocol
+**Architecture** (WinApps/Qubes inspired, Wayland-native):
+1. VM boots directly into Sway (Wayland compositor) with auto-login.
+2. SSH server is configured with passwordless authentication and firewall rules.
+3. Waypipe on the host launches per-application sessions via `waypipe --compress zstd ssh ...`.
+4. Each .desktop file in `~/.local/share/applications/vm-provisioner/` wraps the appropriate Waypipe command.
+5. Waypipe mirrors Wayland buffers so application windows appear on the host as native windows.
+6. Clipboard sharing, pointer events, and keyboard focus are delivered by the Wayland protocol.
+7. PulseAudio/PipeWire audio is forwarded by reverse SSH socket tunneling.
 
 **How It Works:**
 ```
-Host Application Menu         Guest VM (Xpra + SSH)
+Host Application Menu         Guest VM (Sway + Waypipe)
 ┌─────────────────┐           ┌──────────────────────┐
-│ Firefox (VM)    │─SSH+Xpra─▶│  i3 + Firefox         │
-│ LibreWolf (VM)  │─Seamless─▶│  i3 + LibreWolf       │
-│ VSCode (VM)     │───────────▶│  i3 + VSCode          │
+│ Firefox (VM)    │─Waypipe──▶│  Sway + Firefox       │
+│ LibreWolf (VM)  │─SSH+PA───▶│  Sway + LibreWolf     │
+│ VSCode (VM)     │──────────▶│  Sway + VSCode        │
 └─────────────────┘           └──────────────────────┘
       ▲                                  │
       └──── .desktop files ──────────────┘
@@ -271,53 +272,47 @@ Host Application Menu         Guest VM (Xpra + SSH)
 
 **Workflow:**
 ```
-1. Create VM with applications:
+1. Create a VM with apps:
    vm-provisioner create --flatpak org.mozilla.firefox --name browser-vm
 
-2. Start VM (SSH keys & Xpra auto-configured):
+2. Start the VM (SSH + Sway auto-configured):
    vm-provisioner start browser-vm
-   → SSH public key injected into VM during provisioning
-   → VM's SSH host key automatically added to ~/.ssh/known_hosts
-   → Passwordless authentication ready immediately
+   → SSH public key injected automatically
+   → VM host key trusted via ssh-keyscan
+   → tty1 auto-login launches Sway immediately
 
-3. Generate desktop shortcuts:
+3. Generate Waypipe shortcuts:
    vm-provisioner generate-shortcuts browser-vm
    → Creates ~/.local/share/applications/vm-provisioner/browser-vm-firefox.desktop
 
-4. Launch from host application menu:
-   Click "Firefox (VM: browser-vm)" in application menu
-   → Opens Firefox in seamless window via Xpra
+4. Launch from the host application launcher:
+   Click "Firefox (VM: browser-vm)"
+   → Runs: waypipe --compress zstd ssh -R /run/user/1000/pulse/native:/run/user/1000/pulse/native user@${VM_IP} flatpak run org.mozilla.firefox
 
 5. Or launch manually:
    vm-provisioner launch browser-vm "flatpak run org.mozilla.firefox"
 ```
 
-**Benefits of Xpra:**
-- ✅ Designed specifically for seamless remote applications on Linux
-- ✅ SSH-based security with passwordless key authentication
-- ✅ True per-application window integration (like Qubes OS)
-- ✅ Clipboard, audio, window management built-in
-- ✅ Dynamic resolution adaptation
-- ✅ No complex RDP setup or RemoteApp limitations
-- ✅ Native Linux solution with excellent X11 integration
+**Why Waypipe?**
+- ✅ Wayland-native protocol forwarding with minimal overhead
+- ✅ SSH transport with key-based auth plus optional Zstd/LZ4 compression
+- ✅ Clipboard sync piggybacks on Wayland; no extra daemons required
+- ✅ Audio stays on the host via a PulseAudio/PipeWire socket tunnel
+- ✅ Simpler than X2Go/Xpra—no server daemons or NX stack inside the VM
+- ✅ Future-proof: aligned with modern Wayland desktops on host and guest
 
 ### Audio Configuration
 
-Xpra is configured for low-latency audio with minimal delay (<500ms):
+Waypipe focuses on graphics, so audio travels over SSH:
 
-**Client-side optimizations:**
-- Buffer time: 32ms (reduced from 200ms default)
-- Latency time: 16ms (reduced from 10ms default)
-- Codec: Opus (lowest latency audio codec)
-- Environment variables set automatically
+```bash
+waypipe --compress zstd ssh   -R /run/user/1000/pulse/native:/run/user/$(id -u)/pulse/native   user@${VM_IP} flatpak run org.mozilla.firefox
+```
 
-**Server-side optimizations:**
-- Matching buffer/latency configuration in VM
-- Opus codec for both speaker and microphone
-- PulseAudio integration enabled
-- Configuration applied during VM provisioning
-
-These settings are automatically applied when launching applications via Xpra, providing smooth audio playback for videos, music, and communication applications.
+- The reverse tunnel exposes the host PulseAudio socket inside the VM.
+- Applications in the VM connect to that socket and play audio through the host speakers.
+- PipeWire/PulseAudio helper scripts inside the VM ensure the sound server is available.
+- Latency stays ~50–100 ms on the LAN without buffer growth.
 
 ## Memory Management
 
@@ -345,9 +340,9 @@ vm-provisioner create --system git vim --headless --memory 1024
 vm-provisioner create --flatpak com.visualstudio.code --memory 8192
 ```
 
-## i3 Window Manager Usage
+## Sway (i3-Compatible) Usage
 
-VMs use the lightweight i3 window manager for optimal X11 compatibility and performance:
+GUI VMs now use the lightweight Sway compositor (i3-compatible) for optimal Wayland performance:
 
 ### Key Shortcuts
 - `Mod+Enter` - Open kitty terminal
@@ -358,14 +353,14 @@ VMs use the lightweight i3 window manager for optimal X11 compatibility and perf
 - `Mod+Shift+1,2,3,4,5` - Move window to workspace 1-5
 - `Mod+Arrow Keys` - Change window focus
 - `Mod+Shift+Arrow Keys` - Move focused window
-- `Mod+Shift+r` - Restart i3
-- `Mod+Shift+e` - Exit i3
+- `Mod+Shift+r` - Reload Sway config
+- `Mod+Shift+e` - Exit Sway
 
 **Note**: `Mod` key is typically the Windows/Super key
 
 ### Application Launcher Features
 - **rofi** (`Mod+d`): Shows all applications including Flatpak packages with icons
-- **Auto-launch**: Installed packages start automatically on VM boot
+- **Legacy auto-launch hooks**: You can add commands to `auto_launch_apps` manually if needed
 - **Flatpak Integration**: Proper XDG_DATA_DIRS configuration for app discovery
 - **Terminal**: Access via `Mod+Enter` for kitty terminal
 
@@ -379,7 +374,7 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 ```
 
 ### Window Management
-- i3 automatically tiles windows
+- Sway automatically tiles windows (same workflow as i3)
 - Drag windows while holding `Mod` key to make them floating
 - Windows are organized in workspaces (1-5 by default)
 - Status bar shows current workspace and system information
@@ -402,7 +397,7 @@ flatpak run io.gitlab.librewolf-community  # Flatpak package
 - `destroy` - Remove VM and cleanup
 - `console` - Connect to VM console
 - `generate-shortcuts` - Create .desktop files for VM applications
-- `launch` - Launch specific application in VM via Xpra
+- `launch` - Launch specific application in VM via Waypipe
 - `apps` - List all applications available in a VM
 
 ### Command Options
@@ -468,7 +463,31 @@ vm-provisioner create --pci 0000:01:00.0 --pci 0000:02:00.0 --pci-hotplug --name
 
 # Find your PCI devices
 lspci -nn  # List all PCI devices with addresses
+
+# Steam + Wine gaming VM with dedicated GPU (permanent passthrough)
+vm-provisioner create \
+  --flatpak com.valvesoftware.Steam \
+  --system wine winetricks vulkan-loader mesa-dri-drivers \
+  --name steam-gaming-vm \
+  --memory 16384 \
+  --vcpus 6 \
+  --disk 80 \
+  --pci 0000:01:00.0 \
+  --pci 0000:01:00.1
+
+# Same VM but keep the GPU on the host when the VM is off (hot-plug)
+vm-provisioner create \
+  --flatpak com.valvesoftware.Steam \
+  --system wine winetricks vulkan-loader mesa-dri-drivers \
+  --name steam-gaming-vm \
+  --memory 16384 \
+  --vcpus 6 \
+  --disk 80 \
+  --pci 0000:01:00.0 \
+  --pci 0000:01:00.1 \
+  --pci-hotplug
 ```
+In the Steam/Wine example, `0000:01:00.0` is the GPU itself and `0000:01:00.1` is its HDMI/DP audio function (both must move together). Replace the addresses with the ones reported by `lspci -nn` on your system. The `--system wine winetricks vulkan-loader mesa-dri-drivers` bundle installs Wine, helper tooling, and the Vulkan userspace bits that Steam Proton expects; feel free to add other packages (e.g., `gamemode`, `steam-devices`) if your distro provides them.
 
 ### Auto-Generated VM Names
 ```bash
@@ -501,7 +520,7 @@ vm-provisioner create --flatpak org.videolan.VLC --system qbittorrent --name med
 2. **Start the VM:**
 ```bash
 vm-provisioner start browser-vm
-# SSH server and Xpra automatically configured with passwordless authentication
+# SSH server and Waypipe auto-login configured with passwordless authentication
 ```
 
 3. **Generate desktop shortcuts (makes apps appear in your application menu):**
@@ -531,7 +550,7 @@ Each application gets a .desktop file that launches it seamlessly:
 ```desktop
 [Desktop Entry]
 Name=Firefox (VM: browser-vm)
-Exec=xpra start ssh://user@192.168.122.X --start-child="flatpak run org.mozilla.firefox" --exit-with-children
+Exec=waypipe --compress zstd ssh -R /run/user/1000/pulse/native:/run/user/1000/pulse/native user@192.168.122.X flatpak run org.mozilla.firefox
 Icon=firefox
 Type=Application
 Categories=Network;WebBrowser;
@@ -541,30 +560,29 @@ Categories=Network;WebBrowser;
 - Passwordless SSH authentication (using host SSH keys)
 - Seamless window mode (applications appear as native windows)
 - Clipboard sharing (copy/paste between host and VM)
-- Audio passthrough (PulseAudio/PipeWire)
+- Audio passthrough (PulseAudio/PipeWire via NX protocol)
 - Dynamic resolution (adapts to your display)
-- Exit-with-children (closes when application closes)
+- Session suspend/resume support
 
 ### Prerequisites on Host
 
-Install Xpra client:
+Install Waypipe on the host:
 ```bash
 # Fedora/RHEL
-sudo dnf install xpra
+sudo dnf install waypipe
 
 # Ubuntu/Debian
-sudo apt install xpra
+sudo apt install waypipe
 
 # Arch
-sudo pacman -S xpra
+sudo pacman -S waypipe
 ```
 
-**SSH Configuration:**
-SSH authentication is configured automatically during VM provisioning:
-- Host's SSH public key (`~/.ssh/id_rsa.pub`) is injected into VM
-- VM's SSH host key is automatically added to `~/.ssh/known_hosts`
-- No manual SSH setup or password entry required
-- If you don't have SSH keys, generate them: `ssh-keygen -t rsa -b 4096`
+Waypipe relies on native SSH:
+- Host's SSH public key (`~/.ssh/id_rsa.pub`, `id_ed25519.pub`, etc.) is injected into the VM automatically
+- VM host keys are accepted via `ssh-keyscan` so there are no prompts
+- PulseAudio/PipeWire travels over SSH via a reverse socket (`-R /run/user/.../pulse/native`)
+- Generate a key first if needed: `ssh-keygen -t ed25519`
 
 ## Troubleshooting
 
@@ -584,9 +602,9 @@ SSH authentication is configured automatically during VM provisioning:
 - Use `Mod+d` for rofi launcher (shows all Flatpak apps)
 
 ### Applications Not Auto-Starting
-- Applications should start automatically via i3 exec commands
-- Check i3 config: `cat ~/.config/i3/config | grep "exec --no-startup-id"`
-- Manual start: `DISPLAY=:0 flatpak run <app-id>` or `DISPLAY=:0 <system-app>`
+- Applications should start automatically via Sway `exec` directives
+- Check Sway config: `cat ~/.config/sway/config | grep "^exec"`
+- Manual start (inside VM terminal): `flatpak run <app-id>` or `<system-app>`
 
 ### SPICE Connection Issues
 - Ensure VM is running: `virsh list`
@@ -608,20 +626,18 @@ SSH authentication is configured automatically during VM provisioning:
 - **Permission denied**: Commands use sudo for driver binding
 - **Hot-plug fails**: Check `dmesg` and `virsh dumpxml <vm>` for errors
 
-### Xpra Connection Issues
-- **SSH host key verification failed**: Automatically resolved during provisioning, but if you see this:
-  ```bash
-  # Manually accept the host key
-  ssh-keyscan -H <vm-ip> >> ~/.ssh/known_hosts
-  ```
-- **Permission denied**: Ensure your SSH public key exists at `~/.ssh/id_rsa.pub`
-- **Connection refused**: VM may still be booting, wait 30 seconds and retry
+### Waypipe Connection Issues
+- **waypipe not found**: Install it on the host (`sudo dnf install waypipe`, `sudo apt install waypipe`, etc.)
+- **SSH host key verification failed**: Provisioning adds the VM key via `ssh-keyscan`, but you can rerun `ssh-keyscan -H <vm-ip> >> ~/.ssh/known_hosts`
+- **Permission denied**: Ensure a public key exists in `~/.ssh` (generate one with `ssh-keygen -t ed25519`)
+- **No window appears**: Confirm the VM is running and Sway is active (`vm-provisioner start <vm>` then `vm-provisioner apps <vm>`)
+- **.desktop file launches nothing**: Regenerate shortcuts after installing Waypipe and verify the Waypipe binary is on `PATH`
 
-### Audio Issues with Xpra
-- **Audio delay or sync problems**: Configuration is optimized automatically for <500ms latency
-- **No audio**: Ensure PulseAudio/PipeWire is running on host: `pactl info`
-- **Choppy audio**: Check network latency if using remote host
-- **Manual tuning**: Audio settings are in `/etc/xpra/conf.d/60_seamless.conf` in VM
+### Audio Issues with Waypipe
+- **No audio**: Waypipe needs the SSH reverse tunnel. Verify `-R /run/user/1000/pulse/native:/run/user/<host_uid>/pulse/native` is present in the Exec line.
+- **Unknown PulseAudio socket**: Run `pactl info | grep 'Server String'` on the host and use that path for the second half of the `-R` flag.
+- **Choppy audio**: Check network latency and ensure PipeWire/PulseAudio is running on the host (`pactl info`).
+- **VM apps still silent**: Confirm PipeWire helper script in the VM is executable (`/home/user/.local/bin/start-pipewire.sh`) and restart the VM.
 
 ### Performance Issues
 - Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`
@@ -646,4 +662,4 @@ cargo test
 
 ---
 
-**Status**: This project provides a **fully functional VM isolation system** with complete auto-login, auto-launch, and seamless window integration. VMs display via SPICE viewer for console access, and **per-application seamless windows via Xpra** for true application isolation (WinApps/Qubes-style). Clipboard sharing, audio passthrough, and dynamic resolution all work seamlessly.
+**Status**: This project provides a **fully functional VM isolation system** with complete auto-login and seamless window integration. VMs display via SPICE viewer for console access, and **per-application seamless windows via Waypipe** for true application isolation (WinApps/Qubes-style). Clipboard sharing, audio passthrough, and dynamic resolution all work seamlessly.

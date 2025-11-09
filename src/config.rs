@@ -2,12 +2,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PciDevice {
-    pub address: String,                  // "0000:01:00.0"
-    pub vendor_id: String,                // "10de"
-    pub device_id: String,                // "1c03"
-    pub description: String,              // "NVIDIA GeForce GTX 1050"
-    pub original_driver: Option<String>,  // "nvidia" - for restoration
-    pub iommu_group: Option<u32>,         // IOMMU group number
+    pub address: String,                 // "0000:01:00.0"
+    pub vendor_id: String,               // "10de"
+    pub device_id: String,               // "1c03"
+    pub description: String,             // "NVIDIA GeForce GTX 1050"
+    pub original_driver: Option<String>, // "nvidia" - for restoration
+    pub iommu_group: Option<u32>,        // IOMMU group number
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -18,29 +18,29 @@ pub struct AppVMConfig {
     pub vcpus: u32,
     pub disk_size_gb: u64,
     pub vm_dir: String,
-    
+
     // Package installation
     pub system_packages: Vec<String>,
     pub flatpak_packages: Vec<String>,
-    pub auto_launch_apps: Vec<String>,  // Commands to run on startup
-    
+    pub auto_launch_apps: Vec<String>, // Commands to run on startup
+
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
     pub enable_clipboard: bool,
     pub enable_audio: bool,
     pub enable_usb_passthrough: bool,
     pub enable_auto_login: bool,
-    pub headless: bool,  // CLI-only mode, no GUI
+    pub headless: bool, // CLI-only mode, no GUI
 
     // PCI passthrough
     pub pci_devices: Vec<PciDevice>,
-    pub pci_hotplug: bool,  // true = hot-attach/detach, false = permanent XML
-    
+    pub pci_hotplug: bool, // true = hot-attach/detach, false = permanent XML
+
     // Security settings
     pub network_mode: NetworkMode,
     pub firewall_rules: Vec<String>,
     pub vpn_config: Option<VpnConfig>,
-    
+
     // Authentication
     pub user_password: String,
 }
@@ -49,9 +49,9 @@ pub struct AppVMConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum GraphicsBackend {
-    VirtioGpu,      // Hardware accelerated
-    QxlSpice,       // SPICE protocol
-    VncOnly,        // Fallback
+    VirtioGpu, // Hardware accelerated
+    QxlSpice,  // SPICE protocol
+    VncOnly,   // Fallback
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -85,33 +85,30 @@ impl AppVMConfig {
         let mut default_system_packages = if headless {
             // Headless mode: minimal packages, no GUI/X11
             vec![
-                "git".to_string(),               // Version control
+                "git".to_string(), // Version control
             ]
         } else {
-            // GUI mode: full desktop environment with Xpra support
+            // GUI mode: Wayland desktop environment with Waypipe support
             vec![
-                "i3".to_string(),
-                "i3status".to_string(),
-                "i3lock".to_string(),
+                "sway".to_string(),     // Wayland compositor
+                "swaylock".to_string(), // Lock screen
+                "swayidle".to_string(), // Idle management
+                "waybar".to_string(),   // Status bar
+                "i3status".to_string(), // Status command for waybar/i3bar
                 "dmenu".to_string(),
-                "rofi".to_string(),                  // Better application launcher with Flatpak support
-                "xorg-x11-server-Xorg".to_string(),
-                "xorg-x11-xinit".to_string(),
-                "pipewire".to_string(),              // Audio system
-                "spice-vdagent".to_string(),         // SPICE agent for clipboard/resolution (useful for SPICE debugging)
-                "kitty".to_string(),                 // Default terminal emulator
-                "git".to_string(),                   // Version control
-                "xpra".to_string(),                  // Xpra for seamless window integration
-                "openssh-server".to_string(),        // SSH server for Xpra connections
+                "rofi".to_string(), // Application launcher with Flatpak support
+                "wl-clipboard".to_string(), // Clipboard utilities
+                "pipewire".to_string(), // Audio system
+                "kitty".to_string(), // Default terminal emulator
+                "git".to_string(),  // Version control
+                "waypipe".to_string(), // Wayland remoting
+                "openssh-server".to_string(), // SSH server for Waypipe connections
             ]
         };
 
         // Add user-specified system packages
         default_system_packages.extend(system_packages);
 
-        // Auto-launch commands (empty by default - user can manually configure in i3)
-        let auto_launch_apps = Vec::new();
-        
         Self {
             name,
             memory_mb,
@@ -120,10 +117,14 @@ impl AppVMConfig {
             vm_dir: "/var/lib/libvirt/images".to_string(),
 
             system_packages: default_system_packages,
-            flatpak_packages: if headless { vec![] } else { flatpak_packages.clone() },
-            auto_launch_apps,
+            flatpak_packages: if headless { vec![] } else { flatpak_packages },
+            auto_launch_apps: Vec::new(),
 
-            graphics_backend: if headless { GraphicsBackend::VncOnly } else { GraphicsBackend::VirtioGpu },
+            graphics_backend: if headless {
+                GraphicsBackend::VncOnly
+            } else {
+                GraphicsBackend::VirtioGpu
+            },
             enable_clipboard: !headless,
             enable_audio: !headless,
             enable_usb_passthrough: false,
@@ -143,7 +144,7 @@ impl AppVMConfig {
                 "OUTPUT -p tcp --dport 443 -j ACCEPT".to_string(),
             ],
             vpn_config: None,
-            
+
             user_password: generate_password(),
         }
     }
@@ -153,7 +154,7 @@ fn generate_password() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     let mut hasher = DefaultHasher::new();
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
