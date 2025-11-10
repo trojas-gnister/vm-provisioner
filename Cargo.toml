@@ -36,6 +36,10 @@ lto = true
 codegen-units = 1
 strip = true
 
+[lib]
+name = "vm_provisioner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vm-provisioner"
 path = "src/main.rs"

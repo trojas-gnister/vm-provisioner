@@ -45,6 +45,77 @@ A Rust-based application isolation system inspired by Qubes OS. Creates lightwei
 - Pre-configured VM templates (Firefox, VS Code, development, media, etc)
 - Shared folders via 9p/virtiofs
 
+## Display Protocols
+
+vm-provisioner supports two display protocols for seamless window integration:
+
+### Waypipe (Default) ⭐ Recommended
+- **Technology:** Wayland-native protocol forwarding
+- **Best for:** Modern applications, future-proof setup, lower resource usage
+- **Window Manager:** Sway (i3-compatible Wayland compositor)
+- **Requirements:** Waypipe binary on host
+- **Install:**
+  ```bash
+  # Fedora/RHEL
+  sudo dnf install waypipe
+
+  # Debian/Ubuntu
+  sudo apt install waypipe
+  ```
+
+### X2Go (Alternative)
+- **Technology:** X11 with NX compression
+- **Best for:** Legacy X11 apps, hosts without Wayland support
+- **Window Manager:** i3 (classic X11 window manager)
+- **Requirements:** x2goclient on host
+- **Install:**
+  ```bash
+  # Fedora/RHEL
+  sudo dnf install x2goclient
+
+  # Debian/Ubuntu
+  sudo apt install x2goclient
+
+  # Arch
+  sudo pacman -S x2goclient
+  ```
+
+### Choosing a Protocol
+
+| Criterion | Waypipe | X2Go |
+|-----------|---------|------|
+| Performance | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| Resource usage | Low | Medium |
+| Compatibility | Modern Wayland apps | All X11 apps |
+| Future-proof | Yes | X11 legacy |
+| Setup complexity | Simple | Simple |
+
+### Usage Examples
+
+```bash
+# Use default protocol (Waypipe)
+vm-provisioner create --flatpak io.gitlab.librewolf-community
+
+# Explicitly use Waypipe
+vm-provisioner create --display-protocol waypipe --flatpak io.gitlab.librewolf-community
+
+# Use X2Go for better X11 compatibility
+vm-provisioner create --display-protocol x2go --flatpak io.gitlab.librewolf-community
+
+# X2Go with system packages
+vm-provisioner create --display-protocol x2go --system firefox --system libreoffice
+```
+
+### Switching Protocols
+
+To change an existing VM's display protocol, you must recreate it:
+```bash
+vm-provisioner destroy old-vm
+vm-provisioner create --display-protocol x2go --flatpak <package> --name old-vm
+```
+
+**Note:** VM data is not preserved when switching protocols.
+
 ## VM Modes
 
 ### GUI Mode (Default)
@@ -638,6 +709,14 @@ Waypipe relies on native SSH:
 - **Unknown PulseAudio socket**: Run `pactl info | grep 'Server String'` on the host and use that path for the second half of the `-R` flag.
 - **Choppy audio**: Check network latency and ensure PipeWire/PulseAudio is running on the host (`pactl info`).
 - **VM apps still silent**: Confirm PipeWire helper script in the VM is executable (`/home/user/.local/bin/start-pipewire.sh`) and restart the VM.
+
+### X2Go Issues
+- **x2goclient not found**: Install x2goclient on the host (`sudo dnf install x2goclient`, `sudo apt install x2goclient`, or `sudo pacman -S x2goclient`)
+- **X2Go session fails to start**: VM may still be booting. Wait 1-2 minutes and retry. Check VM status with `virsh list --all`
+- **Audio not working in X2Go**: Ensure PulseAudio is running on host (`pactl info`). Restart if needed: `systemctl --user restart pulseaudio`
+- **Clipboard not working**: Verify `xclip` is installed in VM. Test: `echo "test" | xclip -selection clipboard && xclip -selection clipboard -o`
+- **Connection refused**: VM may not be fully booted or x2goserver not running. Check with: `ssh user@<vm-ip> systemctl status x2goserver`
+- **No seamless window appears**: Check that the VM is running (`vm-provisioner list`) and the .x2go session file has correct host IP
 
 ### Performance Issues
 - Enable KVM acceleration: Check `kvm-ok` or `/proc/cpuinfo`

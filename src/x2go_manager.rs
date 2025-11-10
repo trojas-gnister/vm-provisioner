@@ -2,6 +2,7 @@ use crate::config::AppVMConfig;
 use crate::display_bridge::DisplayBridge;
 use std::error::Error;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -123,6 +124,24 @@ Keywords=vm;isolated;sandbox;{package};
         Ok(())
     }
 
+    fn ensure_x2goclient_available() -> Result<(), Box<dyn Error>> {
+        match Command::new("x2goclient").arg("--version").output() {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(
+                    "x2goclient binary not found on host.\n\n\
+                     Install it first:\n\
+                     - Fedora/RHEL: sudo dnf install x2goclient\n\
+                     - Debian/Ubuntu: sudo apt install x2goclient\n\
+                     - Arch Linux: sudo pacman -S x2goclient\n\n\
+                     Or use Waypipe instead (default protocol)."
+                        .into(),
+                )
+            }
+            Err(e) => Err(format!("Failed to execute x2goclient: {}", e).into()),
+        }
+    }
+
     pub fn remove_desktop_files(&self) -> Result<(), Box<dyn Error>> {
         let home = std::env::var("HOME")?;
         let desktop_dir = format!("{}/.local/share/applications/vm-provisioner", home);
@@ -147,6 +166,8 @@ Keywords=vm;isolated;sandbox;{package};
 
 impl DisplayBridge for X2GoManager {
     fn new(config: &AppVMConfig) -> Result<Self, Box<dyn Error>> {
+        Self::ensure_x2goclient_available()?;
+
         Ok(Self {
             config: config.clone(),
         })
@@ -162,41 +183,45 @@ impl DisplayBridge for X2GoManager {
             Err(_) => return String::from("echo 'Error: SSH key not found'"),
         };
 
-        let session_dir = Path::new("/tmp/vm-provisioner/sessions");
-        fs::create_dir_all(session_dir).unwrap_or_default();
+        // Store session in x2go's config directory
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return String::from("echo 'Error: HOME not set'"),
+        };
+        let session_dir = Path::new(&home).join(".x2go").join("sessions");
+        fs::create_dir_all(&session_dir).unwrap_or_default();
 
-        let app_name = app_command.split_whitespace().next().unwrap_or("app");
-        let session_file_path = session_dir.join(format!("{}-{}.x2go", self.config.name, app_name));
+        let app_name = app_command
+            .split_whitespace()
+            .next()
+            .unwrap_or("app")
+            .replace('/', "-")
+            .replace(' ', "-");
+        let session_name = format!("{}-{}", self.config.name, app_name);
+        let session_file_path = session_dir.join(format!("{}", session_name));
 
         let session_content = format!(
-            r#"[Session]
-host={}
+            r#"[{0}]
+host={1}
 user=user
 sshport=22
 useproxy=false
 autologin=true
-key={}
-command={}
-name={}-{}
+key={2}
+command={3}
+name={0}
 rootless=true
 sound=true
 soundsystem=pulse
 startsoundsystem=true
 clipboard=both
 "#,
-            vm_ip,
-            ssh_key_path,
-            app_command,
-            self.config.name,
-            app_name
+            session_name, vm_ip, ssh_key_path, app_command
         );
 
         fs::write(&session_file_path, session_content).unwrap_or_default();
 
-        format!(
-            "x2goclient --session-conf {}",
-            session_file_path.to_string_lossy()
-        )
+        format!("x2goclient --session={}", session_name)
     }
 
     fn generate_desktop_files(&self) -> Result<(), Box<dyn Error>> {

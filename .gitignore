@@ -1,8 +1,8 @@
 *.env
-CLAUDE.md
 vm.env
 debug
 target
-TODO.md
 *.md
 !README.md
+# keep AGENTS.md ignored even though it consolidates other docs
+AGENTS.md
