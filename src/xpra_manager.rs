@@ -7,77 +7,27 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-/// Waypipe manager handles desktop integration and per-app launching.
-pub struct WaypipeManager {
+/// Xpra manager handles desktop integration with Xpra display + SSH PulseAudio forwarding.
+pub struct XpraManager {
     config: AppVMConfig,
     host_pulse_socket: String,
     remote_pulse_socket: String,
     vm_ip_cache: RefCell<Option<String>>,
 }
 
-impl WaypipeManager {
-    pub fn get_ssh_public_key() -> Result<String, Box<dyn Error>> {
-        let home_dir = std::env::var("HOME")?;
-        let ssh_dir = Path::new(&home_dir).join(".ssh");
-
-        let key_files = vec![
-            ssh_dir.join("id_ed25519.pub"),
-            ssh_dir.join("id_rsa.pub"),
-            ssh_dir.join("id_ecdsa.pub"),
-        ];
-
-        for key_file in &key_files {
-            if key_file.exists() {
-                let public_key = fs::read_to_string(key_file)?.trim().to_string();
-                println!("   Using existing SSH key: {}", key_file.display());
-                return Ok(public_key);
-            }
-        }
-
-        println!("   No SSH key found, generating new ed25519 key...");
-        fs::create_dir_all(&ssh_dir)?;
-
-        let key_path = ssh_dir.join("id_ed25519");
-        let output = Command::new("ssh-keygen")
-            .args(&[
-                "-t",
-                "ed25519",
-                "-f",
-                key_path.to_str().unwrap(),
-                "-N",
-                "",
-                "-C",
-                "vm-provisioner-key",
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to generate SSH key: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        let pub_key_path = ssh_dir.join("id_ed25519.pub");
-        let public_key = fs::read_to_string(pub_key_path)?.trim().to_string();
-
-        println!("   ✅ Generated new SSH key: {}", key_path.display());
-        Ok(public_key)
-    }
-
-    fn ensure_waypipe_available() -> Result<(), Box<dyn Error>> {
-        match Command::new("waypipe").arg("--version").output() {
+impl XpraManager {
+    fn ensure_xpra_available() -> Result<(), Box<dyn Error>> {
+        match Command::new("xpra").arg("--version").output() {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(
-                "waypipe binary not found on host. Install it (e.g., `sudo dnf install waypipe` or `sudo apt install waypipe`)".into(),
+                "xpra binary not found on host. Install it (e.g., `sudo dnf install xpra` or `sudo apt install xpra`)".into(),
             ),
-            Err(e) => Err(format!("failed to execute waypipe: {}", e).into()),
+            Err(e) => Err(format!("failed to execute xpra: {}", e).into()),
         }
     }
 
     fn detect_host_pulse_socket() -> String {
-        if let Ok(socket) = std::env::var("WAYPIPE_PULSE_SOCKET") {
+        if let Ok(socket) = std::env::var("XPRA_PULSE_SOCKET") {
             if !socket.is_empty() {
                 return socket;
             }
@@ -136,13 +86,43 @@ impl WaypipeManager {
         Ok(ip)
     }
 
+    fn detect_source_ip(destination: &str) -> Option<String> {
+        let output = Command::new("ip")
+            .args(&["route", "get", destination])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut tokens = stdout.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == "src" {
+                return tokens.next().map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+    fn build_ssh_invocation(&self, vm_ip: &str) -> String {
+        let mut ssh_cmd = format!(
+            "ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o TCPKeepAlive=yes -o StrictHostKeyChecking=no -R {remote}:{host}",
+            remote = self.remote_pulse_socket,
+            host = self.host_pulse_socket
+        );
+
+        if let Some(src_ip) = Self::detect_source_ip(vm_ip) {
+            ssh_cmd.push_str(&format!(" -b {}", src_ip));
+        }
+
+        ssh_cmd
+    }
+
     fn is_application_package(&self, package: &str) -> bool {
         let skip_patterns = [
-            "weston",
-            "waypipe",
-            "wl-clipboard",
-            "pipewire",
-            "kitty",
+            "xpra",
+            "xorg-x11-server-Xvfb",
+            "pulseaudio-libs",
             "git",
             "openssh-server",
             "-devel",
@@ -154,7 +134,11 @@ impl WaypipeManager {
 
     fn guess_categories(&self, package: &str) -> &'static str {
         let lower = package.to_lowercase();
-        if lower.contains("firefox") || lower.contains("chrome") || lower.contains("browser") {
+        if lower.contains("firefox")
+            || lower.contains("chrome")
+            || lower.contains("browser")
+            || lower.contains("librewolf")
+        {
             "Network;WebBrowser;"
         } else if lower.contains("code") || lower.contains("editor") || lower.contains("ide") {
             "Development;IDE;"
@@ -197,7 +181,7 @@ impl WaypipeManager {
 Version=1.0
 Type=Application
 Name={app_name} (VM: {vm_name})
-Comment=Run in isolated VM via Waypipe
+Comment=Run in isolated VM via Xpra
 Icon={icon}
 Exec={exec_line}
 Terminal=false
@@ -225,9 +209,9 @@ Keywords=vm;isolated;sandbox;{package};
     }
 }
 
-impl DisplayBridge for WaypipeManager {
+impl DisplayBridge for XpraManager {
     fn new(config: &AppVMConfig) -> Result<Self, Box<dyn Error>> {
-        Self::ensure_waypipe_available()?;
+        Self::ensure_xpra_available()?;
 
         Ok(Self {
             config: config.clone(),
@@ -239,20 +223,21 @@ impl DisplayBridge for WaypipeManager {
 
     fn generate_exec_command(&self, app_command: &str) -> String {
         match self.resolve_vm_ip() {
-            Ok(ip) => format!(
-                "waypipe --compress zstd ssh -R {remote}:{host} user@{ip} {cmd}",
-                remote = self.remote_pulse_socket,
-                host = self.host_pulse_socket,
-                ip = ip,
-                cmd = app_command
-            ),
+            Ok(vm_ip) => {
+                let ssh_cmd = self.build_ssh_invocation(&vm_ip);
+                format!(
+                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --start-child=\"{cmd}\" --exit-with-children",
+                    ip = vm_ip,
+                    ssh = ssh_cmd,
+                    cmd = app_command
+                )
+            }
             Err(err) => {
                 eprintln!(
                     "⚠️  Unable to resolve VM IP for {}: {}",
                     self.config.name, err
                 );
-                "echo 'Waypipe launch failed: VM IP not available; ensure the VM is running'"
-                    .to_string()
+                "echo 'Error: VM IP not found; start the VM before launching apps'".to_string()
             }
         }
     }
@@ -260,11 +245,18 @@ impl DisplayBridge for WaypipeManager {
     fn launch_app(&self, app_command: &str) -> Result<(), Box<dyn Error>> {
         let exec_command = self.generate_exec_command(app_command);
         println!(
-            "🚀 Launching {} in VM {} via Waypipe",
+            "🚀 Launching {} in VM {} via Xpra",
             app_command, self.config.name
         );
+        println!("   Command: {}", exec_command);
+
+        if exec_command.trim().is_empty() {
+            return Err("Empty command".into());
+        }
+
         Command::new("sh").arg("-c").arg(&exec_command).spawn()?;
-        println!("✅ Application launched via Waypipe");
+
+        println!("✅ Application launched via Xpra");
         Ok(())
     }
 
@@ -275,21 +267,20 @@ impl DisplayBridge for WaypipeManager {
 
         println!("📝 Generating .desktop files in: {}", desktop_dir);
 
+        let mut count = 0;
         for package in &self.config.system_packages {
             if self.is_application_package(package) {
                 self.create_desktop_file(package, &desktop_dir, false)?;
+                count += 1;
             }
         }
 
         for package in &self.config.flatpak_packages {
             self.create_desktop_file(package, &desktop_dir, true)?;
+            count += 1;
         }
 
-        println!(
-            "✅ Generated .desktop files for {} applications",
-            self.config.system_packages.len() + self.config.flatpak_packages.len()
-        );
-
+        println!("✅ Generated .desktop files for {} applications", count);
         Ok(())
     }
 
@@ -316,34 +307,37 @@ impl DisplayBridge for WaypipeManager {
 
     fn list_applications(&self) -> Vec<String> {
         let mut apps = Vec::new();
+
         for package in &self.config.system_packages {
             if self.is_application_package(package) {
                 apps.push(package.clone());
             }
         }
+
         for package in &self.config.flatpak_packages {
             apps.push(format!("flatpak run {}", package));
         }
+
         apps
     }
 
     fn guest_packages(&self) -> Vec<String> {
         vec![
-            "weston".to_string(),
-            "waypipe".to_string(),
-            "wl-clipboard".to_string(),
-            "pipewire".to_string(),
-            "kitty".to_string(),
-            "git".to_string(),
+            "xpra".to_string(),
+            "xorg-x11-server-Xvfb".to_string(),
+            "pulseaudio-libs".to_string(),
             "openssh-server".to_string(),
+            "git".to_string(),
         ]
     }
 
     fn kickstart_config(&self, ssh_public_key: &str) -> String {
         format!(
             r#"
-# Configure SSH, Weston, and Waypipe for seamless window mode
-echo "=== Configuring SSH, Weston, and Waypipe for seamless mode ==="
+# Configure SSH and Xpra for seamless window mode with SSH audio forwarding
+echo "=== Configuring SSH, Xpra, and audio forwarding ==="
+
+# SSH key for passwordless authentication
 mkdir -p /home/user/.ssh
 chmod 700 /home/user/.ssh
 cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
@@ -351,33 +345,42 @@ cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
 SSH_KEY_EOF
 chmod 600 /home/user/.ssh/authorized_keys
 chown -R user:user /home/user/.ssh
+
+# Configure SSH server for Unix socket forwarding
+cat >> /etc/ssh/sshd_config << 'SSHD_CONFIG_EOF'
+
+# Enable Unix socket forwarding for PulseAudio
+StreamLocalBindUnlink yes
+AllowStreamLocalForwarding yes
+SSHD_CONFIG_EOF
+
+# Enable and start SSH server
 systemctl enable sshd
 systemctl start sshd
+
+# Allow SSH through firewall
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
-mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat > /etc/systemd/system/getty@tty1.service.d/override.conf << 'AUTOLOGIN_EOF'
-[Service]
-ExecStart=
-ExecStart=-/usr/sbin/agetty --autologin user --noclear %I $TERM
-Type=idle
-Restart=always
-RestartSec=0
-TTYVTDisallocate=yes
-AUTOLOGIN_EOF
-systemctl enable getty@tty1.service
-cat >> /home/user/.bash_profile << 'WESTON_EOF'
-if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    export XDG_RUNTIME_DIR=/run/user/$(id -u)
-    if [ -x /home/user/.local/bin/start-pipewire.sh ]; then
-        /home/user/.local/bin/start-pipewire.sh
-    fi
-    exec weston --backend=headless-backend.so --width=1920 --height=1080 --idle-time=0 --socket=wayland-1
-fi
-WESTON_EOF
-mkdir -p /home/user/.config
-chown -R user:user /home/user/.config
+
+# Disable PipeWire/PulseAudio auto-start (use SSH-forwarded audio instead)
+cat > /usr/lib/systemd/user-preset/99-disable-audio.preset << 'AUDIO_PRESET_EOF'
+# Disable local audio services - using SSH socket forwarding instead
+disable pipewire.service
+disable pipewire.socket
+disable pipewire-pulse.service
+disable pipewire-pulse.socket
+disable wireplumber.service
+AUDIO_PRESET_EOF
+
+# Set PULSE_SERVER for explicit socket discovery
+cat >> /home/user/.bash_profile << 'PULSE_ENV_EOF'
+
+# Use SSH-forwarded PulseAudio socket
+export PULSE_SERVER=unix:/run/user/1000/pulse/native
+PULSE_ENV_EOF
 chown user:user /home/user/.bash_profile
+
+# No auto-login needed - Xpra starts its own X server on demand
 systemctl set-default multi-user.target
 "#,
             ssh_public_key

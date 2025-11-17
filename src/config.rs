@@ -14,7 +14,7 @@ pub struct PciDevice {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ValueEnum)]
 pub enum DisplayProtocol {
     Waypipe,
-    X2Go,
+    Xpra,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -97,33 +97,18 @@ impl AppVMConfig {
         } else {
             match display_protocol {
                 DisplayProtocol::Waypipe => vec![
-                    "sway".to_string(),
-                    "swaylock".to_string(),
-                    "swayidle".to_string(),
-                    "waybar".to_string(),
-                    "i3status".to_string(),
-                    "dmenu".to_string(),
-                    "rofi".to_string(),
+                    "weston".to_string(),
+                    "waypipe".to_string(),
                     "wl-clipboard".to_string(),
                     "pipewire".to_string(),
                     "kitty".to_string(),
                     "git".to_string(),
-                    "waypipe".to_string(),
                     "openssh-server".to_string(),
                 ],
-                DisplayProtocol::X2Go => vec![
-                    "xorg-x11-server-Xorg".to_string(),
-                    "xorg-x11-xinit".to_string(),
-                    "i3".to_string(),
-                    "i3status".to_string(),
-                    "dmenu".to_string(),
-                    "rofi".to_string(),
-                    "x2goserver".to_string(),
-                    "x2goserver-xsession".to_string(),
-                    "pulseaudio".to_string(),
-                    "pulseaudio-utils".to_string(),
-                    "xclip".to_string(),
-                    "kitty".to_string(),
+                DisplayProtocol::Xpra => vec![
+                    "xpra".to_string(),
+                    "xorg-x11-server-Xvfb".to_string(),
+                    "pulseaudio-libs".to_string(),
                     "git".to_string(),
                     "openssh-server".to_string(),
                 ],

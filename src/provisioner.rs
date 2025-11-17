@@ -1,7 +1,7 @@
 use crate::config::{AppVMConfig, DisplayProtocol, GraphicsBackend, PciDevice};
 use crate::display_bridge::DisplayBridge;
 use crate::waypipe_manager::WaypipeManager;
-use crate::x2go_manager::X2GoManager;
+use crate::xpra_manager::XpraManager;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -256,11 +256,10 @@ impl AppVMProvisioner {
 
         println!("🏗️  Generating kickstart configuration...");
 
-        let display_bridge: Box<dyn DisplayBridge> =
-            match self.config.display_protocol {
-                DisplayProtocol::Waypipe => Box::new(WaypipeManager::new(&self.config)?),
-                DisplayProtocol::X2Go => Box::new(X2GoManager::new(&self.config)?),
-            };
+        let display_bridge: Box<dyn DisplayBridge> = match self.config.display_protocol {
+            DisplayProtocol::Waypipe => Box::new(WaypipeManager::new(&self.config)?),
+            DisplayProtocol::Xpra => Box::new(XpraManager::new(&self.config)?),
+        };
 
         let mut base_packages = display_bridge.guest_packages();
         base_packages.extend(self.config.system_packages.clone());

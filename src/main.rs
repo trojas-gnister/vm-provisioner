@@ -1,8 +1,8 @@
 mod config;
+mod display_bridge;
 mod provisioner;
 mod waypipe_manager;
-mod display_bridge;
-mod x2go_manager;
+mod xpra_manager;
 
 use clap::{Parser, Subcommand};
 use dialoguer::Confirm;
@@ -12,10 +12,10 @@ use std::path::Path;
 use tokio;
 
 use config::{AppVMConfig, DisplayProtocol};
-use provisioner::AppVMProvisioner;
 use display_bridge::DisplayBridge;
+use provisioner::AppVMProvisioner;
 use waypipe_manager::WaypipeManager;
-use x2go_manager::X2GoManager;
+use xpra_manager::XpraManager;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct VMPasswords {
@@ -89,21 +89,40 @@ enum Commands {
         #[arg(long, value_enum, default_value = "waypipe")]
         display_protocol: DisplayProtocol,
     },
-    Start { name: String },
-    Stop { name: String },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
     List,
     Passwords,
-    Destroy { name: String, #[arg(short = 'y', long)] yes: bool },
-    Console { name: String },
-    GenerateShortcuts { name: String },
-    Launch { name: String, app: String },
-    Apps { name: String },
+    Destroy {
+        name: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    Console {
+        name: String,
+    },
+    GenerateShortcuts {
+        name: String,
+    },
+    Launch {
+        name: String,
+        app: String,
+    },
+    Apps {
+        name: String,
+    },
 }
 
-fn get_display_bridge(config: &AppVMConfig) -> Result<Box<dyn DisplayBridge>, Box<dyn std::error::Error>> {
+fn get_display_bridge(
+    config: &AppVMConfig,
+) -> Result<Box<dyn DisplayBridge>, Box<dyn std::error::Error>> {
     match config.display_protocol {
         DisplayProtocol::Waypipe => Ok(Box::new(WaypipeManager::new(config)?)),
-        DisplayProtocol::X2Go => Ok(Box::new(X2GoManager::new(config)?)),
+        DisplayProtocol::Xpra => Ok(Box::new(XpraManager::new(config)?)),
     }
 }
 
@@ -111,8 +130,35 @@ fn get_display_bridge(config: &AppVMConfig) -> Result<Box<dyn DisplayBridge>, Bo
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Create { name, system, flatpak, yes, config, memory, vcpus, disk, headless, pci, pci_hotplug, display_protocol } => {
-            create_vm(name, system, flatpak, yes, config, memory, vcpus, disk, headless, pci, pci_hotplug, display_protocol).await?;
+        Commands::Create {
+            name,
+            system,
+            flatpak,
+            yes,
+            config,
+            memory,
+            vcpus,
+            disk,
+            headless,
+            pci,
+            pci_hotplug,
+            display_protocol,
+        } => {
+            create_vm(
+                name,
+                system,
+                flatpak,
+                yes,
+                config,
+                memory,
+                vcpus,
+                disk,
+                headless,
+                pci,
+                pci_hotplug,
+                display_protocol,
+            )
+            .await?;
         }
         Commands::Start { name } => start_vm(name).await?,
         Commands::Stop { name } => stop_vm(name).await?,
@@ -153,23 +199,50 @@ async fn create_vm(
             } else if !system_packages.is_empty() {
                 format!("{}-vm", system_packages[0])
             } else {
-                format!("app-vm-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+                format!(
+                    "app-vm-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                )
             }
         });
 
         let pci_devices = if !pci_addresses.is_empty() {
             println!("\n🔍 Detecting PCI devices...");
-            pci_addresses.iter().map(|addr| provisioner::detect_pci_device(addr)).collect::<Result<Vec<_>, _>>()?
+            pci_addresses
+                .iter()
+                .map(|addr| provisioner::detect_pci_device(addr))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
 
-        AppVMConfig::new(vm_name, memory, vcpus, disk, system_packages, flatpak_packages, headless, pci_devices, pci_hotplug, display_protocol)
+        AppVMConfig::new(
+            vm_name,
+            memory,
+            vcpus,
+            disk,
+            system_packages,
+            flatpak_packages,
+            headless,
+            pci_devices,
+            pci_hotplug,
+            display_protocol,
+        )
     };
 
     println!("\n📋 VM Configuration:");
     println!("   Name: {}", config.name);
-    println!("   Mode: {}", if config.headless { "Headless (CLI only)" } else { "GUI" });
+    println!(
+        "   Mode: {}",
+        if config.headless {
+            "Headless (CLI only)"
+        } else {
+            "GUI"
+        }
+    );
     if !config.headless {
         println!("   Display Protocol: {:?}", config.display_protocol);
     }
@@ -179,7 +252,12 @@ async fn create_vm(
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
 
-    if !skip_confirm && !Confirm::new().with_prompt("Proceed with VM creation?").default(true).interact()? {
+    if !skip_confirm
+        && !Confirm::new()
+            .with_prompt("Proceed with VM creation?")
+            .default(true)
+            .interact()?
+    {
         println!("❌ VM creation cancelled");
         return Ok(());
     }
@@ -207,23 +285,40 @@ async fn create_vm(
 
 async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("▶️  Starting VM: {}", name);
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
-    
+
     AppVMProvisioner::new(config.clone()).start_vm()?;
 
     if config.headless {
-        println!("\n💡 Headless VM - connect via console: virsh console {}", name);
+        println!(
+            "\n💡 Headless VM - connect via console: virsh console {}",
+            name
+        );
     } else {
-        println!("\n🪟 Seamless window integration enabled via {:?}", config.display_protocol);
-        println!("   Use `vm-provisioner generate-shortcuts {}` to create .desktop files.", name);
+        println!(
+            "\n🪟 Seamless window integration enabled via {:?}",
+            config.display_protocol
+        );
+        println!(
+            "   Use `vm-provisioner generate-shortcuts {}` to create .desktop files.",
+            name
+        );
     }
     Ok(())
 }
 
 async fn stop_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("⏹️  Stopping VM: {}", name);
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
     AppVMProvisioner::new(config).stop_vm()?;
     println!("✅ VM stopped");
@@ -249,14 +344,26 @@ fn list_vms() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if !skip_confirm && !Confirm::new().with_prompt(format!("Permanently delete VM '{}' and all its data?", name)).default(false).interact()? {
+    if !skip_confirm
+        && !Confirm::new()
+            .with_prompt(format!(
+                "Permanently delete VM '{}' and all its data?",
+                name
+            ))
+            .default(false)
+            .interact()?
+    {
         println!("❌ Destruction cancelled");
         return Ok(());
     }
 
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(&config_file)?)?;
-    
+
     let bridge = get_display_bridge(&config)?;
     bridge.remove_desktop_files()?;
 
@@ -268,13 +375,20 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
 
 fn connect_console(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Connecting to VM console: {}", name);
-    std::process::Command::new("virsh").args(&["-c", "qemu:///system", "console", &name]).status()?;
+    std::process::Command::new("virsh")
+        .args(&["-c", "qemu:///system", "console", &name])
+        .status()?;
     Ok(())
 }
 
 fn get_vm_status(name: &str) -> String {
-    match std::process::Command::new("virsh").args(&["-c", "qemu:///system", "domstate", name]).output() {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    match std::process::Command::new("virsh")
+        .args(&["-c", "qemu:///system", "domstate", name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
         _ => "not created".to_string(),
     }
 }
@@ -295,11 +409,18 @@ fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔗 Generating application shortcuts for VM: {}", name);
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
-    
+
     if get_vm_status(&name) != "running" {
-        eprintln!("❌ VM is not running. Start it with: vm-provisioner start {}", name);
+        eprintln!(
+            "❌ VM is not running. Start it with: vm-provisioner start {}",
+            name
+        );
         std::process::exit(1);
     }
 
@@ -308,18 +429,25 @@ async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Erro
 
     let bridge = get_display_bridge(&config)?;
     bridge.generate_desktop_files()?;
-    
+
     println!("\n✅ Application shortcuts created!");
     Ok(())
 }
 
 async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Launching application in VM: {}", name);
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
 
     if get_vm_status(&name) != "running" {
-        eprintln!("❌ VM is not running. Start it with: vm-provisioner start {}", name);
+        eprintln!(
+            "❌ VM is not running. Start it with: vm-provisioner start {}",
+            name
+        );
         std::process::exit(1);
     }
 
@@ -330,7 +458,11 @@ async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error:
 
 async fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("📱 Applications available in VM: {}", name);
-    let config_file = format!("{}/.config/vm-provisioner/{}.toml", std::env::var("HOME")?, name);
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
 
     let bridge = get_display_bridge(&config)?;
