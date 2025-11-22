@@ -1,4 +1,3 @@
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -11,10 +10,54 @@ pub struct PciDevice {
     pub iommu_group: Option<u32>,        // IOMMU group number
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ValueEnum)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UsbDevice {
+    pub vendor_id: String,    // "1234" (hex)
+    pub product_id: String,   // "5678" (hex)
+    pub description: String,  // "Logitech USB Webcam"
+    pub bus: Option<u8>,      // USB bus number (for disambiguation)
+    pub device: Option<u8>,   // Device number on bus
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SharedFolder {
+    pub host_path: String,   // "/home/user/documents"
+    pub guest_path: String,  // "/mnt/shared/documents"
+    pub tag: String,         // virtiofs mount tag (auto-generated)
+    pub readonly: bool,      // default: false (read-write)
+}
+
+// Xpra is the only supported display protocol
+// Waypipe and Selkies have been deprecated
+#[derive(Debug, Serialize, Clone, PartialEq, Default)]
 pub enum DisplayProtocol {
-    Waypipe,
+    #[default]
     Xpra,
+}
+
+// Custom deserializer to handle migration from old configs
+impl<'de> Deserialize<'de> for DisplayProtocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "xpra" => Ok(DisplayProtocol::Xpra),
+            "waypipe" => {
+                eprintln!("⚠️  Warning: Waypipe protocol is deprecated. Migrating to Xpra.");
+                Ok(DisplayProtocol::Xpra)
+            }
+            "selkies" => {
+                eprintln!("⚠️  Warning: Selkies protocol is deprecated. Migrating to Xpra.");
+                Ok(DisplayProtocol::Xpra)
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown display protocol: {}. Only 'Xpra' is supported.",
+                s
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,8 +77,11 @@ pub struct AppVMConfig {
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
     pub display_protocol: DisplayProtocol,
+    pub xpra_html_port: Option<u16>, // Port for Xpra HTML5 web access (None = disabled)
+    pub xpra_html_lan: bool,         // true = bind to 0.0.0.0 (LAN accessible), false = 127.0.0.1 (localhost only)
     pub enable_clipboard: bool,
     pub enable_audio: bool,
+    pub enable_microphone: bool,
     pub enable_usb_passthrough: bool,
     pub enable_auto_login: bool,
     pub headless: bool, // CLI-only mode, no GUI
@@ -43,6 +89,13 @@ pub struct AppVMConfig {
     // PCI passthrough
     pub pci_devices: Vec<PciDevice>,
     pub pci_hotplug: bool, // true = hot-attach/detach, false = permanent XML
+
+    // USB passthrough
+    pub usb_devices: Vec<UsbDevice>,
+    pub usb_hotplug: bool, // true = hot-attach/detach, false = permanent XML
+
+    // Shared storage (virtiofs)
+    pub shared_folders: Vec<SharedFolder>,
 
     // Security settings
     pub network_mode: NetworkMode,
@@ -88,31 +141,27 @@ impl AppVMConfig {
         headless: bool,
         pci_devices: Vec<PciDevice>,
         pci_hotplug: bool,
-        display_protocol: DisplayProtocol,
+        xpra_html_port: Option<u16>,
+        xpra_html_lan: bool,
+        enable_microphone: bool,
+        usb_devices: Vec<UsbDevice>,
+        usb_hotplug: bool,
+        shared_folders: Vec<SharedFolder>,
+        network_bridge: Option<String>,
     ) -> Self {
         // Default system packages - different for headless vs GUI
         let mut default_system_packages = if headless {
             // Headless mode: minimal packages, no GUI/X11
             vec!["git".to_string()]
         } else {
-            match display_protocol {
-                DisplayProtocol::Waypipe => vec![
-                    "weston".to_string(),
-                    "waypipe".to_string(),
-                    "wl-clipboard".to_string(),
-                    "pipewire".to_string(),
-                    "kitty".to_string(),
-                    "git".to_string(),
-                    "openssh-server".to_string(),
-                ],
-                DisplayProtocol::Xpra => vec![
-                    "xpra".to_string(),
-                    "xorg-x11-server-Xvfb".to_string(),
-                    "pulseaudio-libs".to_string(),
-                    "git".to_string(),
-                    "openssh-server".to_string(),
-                ],
-            }
+            // Xpra packages for GUI mode
+            vec![
+                "xpra".to_string(),
+                "xorg-x11-server-Xvfb".to_string(),
+                "pulseaudio-libs".to_string(),
+                "git".to_string(),
+                "openssh-server".to_string(),
+            ]
         };
 
         // Add user-specified system packages
@@ -134,17 +183,28 @@ impl AppVMConfig {
             } else {
                 GraphicsBackend::VirtioGpu
             },
-            display_protocol,
+            display_protocol: DisplayProtocol::Xpra,
+            xpra_html_port,
+            xpra_html_lan,
             enable_clipboard: !headless,
             enable_audio: !headless,
-            enable_usb_passthrough: false,
+            enable_microphone: enable_microphone && !headless, // Only enable for GUI VMs
+            enable_usb_passthrough: !usb_devices.is_empty(),
             enable_auto_login: !headless,
             headless,
 
             pci_devices,
             pci_hotplug,
 
-            network_mode: NetworkMode::Nat,
+            usb_devices,
+            usb_hotplug,
+
+            shared_folders,
+
+            network_mode: match network_bridge {
+                Some(bridge) => NetworkMode::Bridge(bridge),
+                None => NetworkMode::Nat,
+            },
             firewall_rules: vec![
                 // Allow DNS
                 "OUTPUT -p udp --dport 53 -j ACCEPT".to_string(),
@@ -168,7 +228,7 @@ fn generate_password() -> String {
     let mut hasher = DefaultHasher::new();
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("System clock is set before UNIX epoch")
         .as_nanos()
         .hash(&mut hasher);
     format!("vm-{:x}", hasher.finish())

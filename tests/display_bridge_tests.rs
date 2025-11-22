@@ -2,64 +2,17 @@
 /// Tests for the display protocol abstraction layer
 use vm_provisioner::config::{AppVMConfig, DisplayProtocol};
 use vm_provisioner::display_bridge::DisplayBridge;
-use vm_provisioner::waypipe_manager::WaypipeManager;
 use vm_provisioner::xpra_manager::XpraManager;
 
 #[test]
 fn test_display_protocol_enum_serialization() {
-    let waypipe = DisplayProtocol::Waypipe;
     let xpra = DisplayProtocol::Xpra;
 
     // Test debug output
-    assert_eq!(format!("{:?}", waypipe), "Waypipe");
     assert_eq!(format!("{:?}", xpra), "Xpra");
 
     // Test equality
-    assert_eq!(waypipe, DisplayProtocol::Waypipe);
     assert_eq!(xpra, DisplayProtocol::Xpra);
-    assert_ne!(waypipe, xpra);
-}
-
-#[test]
-fn test_appvmconfig_with_waypipe() {
-    let config = AppVMConfig::new(
-        "test-waypipe-vm".to_string(),
-        2048,
-        2,
-        20,
-        vec!["firefox".to_string()],
-        vec!["io.gitlab.librewolf-community".to_string()],
-        false,
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
-    assert_eq!(config.name, "test-waypipe-vm");
-    assert_eq!(config.display_protocol, DisplayProtocol::Waypipe);
-    assert_eq!(config.memory_mb, 2048);
-
-    // Waypipe includes: weston (headless), waypipe, wl-clipboard, pipewire, kitty,
-    // git, openssh-server (7 default) + user package
-    assert!(
-        config.system_packages.len() >= 7,
-        "Should have default Waypipe packages + user package"
-    );
-    assert!(
-        config.system_packages.contains(&"weston".to_string()),
-        "Should have weston"
-    );
-    assert!(
-        config.system_packages.contains(&"waypipe".to_string()),
-        "Should have waypipe"
-    );
-    assert!(
-        config.system_packages.contains(&"firefox".to_string()),
-        "Should have user package"
-    );
-
-    assert_eq!(config.flatpak_packages.len(), 1);
-    assert_eq!(config.flatpak_packages[0], "io.gitlab.librewolf-community");
 }
 
 #[test]
@@ -74,7 +27,13 @@ fn test_appvmconfig_with_xpra() {
         false, // Not headless
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
     assert_eq!(config.name, "test-xpra-vm");
@@ -105,39 +64,6 @@ fn test_appvmconfig_with_xpra() {
 }
 
 #[test]
-fn test_waypipe_manager_creation() {
-    let config = AppVMConfig::new(
-        "waypipe-test".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec![],
-        false,
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
-    // WaypipeManager validates waypipe binary availability
-    // Test may fail if waypipe is not installed, which is expected
-    match WaypipeManager::new(&config) {
-        Ok(_) => {
-            // waypipe is installed, good
-        }
-        Err(e) => {
-            // waypipe not installed - verify error message
-            let error_msg = e.to_string();
-            assert!(
-                error_msg.contains("waypipe"),
-                "Expected waypipe-related error, got: {}",
-                error_msg
-            );
-        }
-    }
-}
-
-#[test]
 fn test_xpra_manager_creation() {
     let config = AppVMConfig::new(
         "xpra-test".to_string(),
@@ -149,7 +75,13 @@ fn test_xpra_manager_creation() {
         false,
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
     // XpraManager validates xpra binary availability
@@ -174,51 +106,6 @@ fn test_xpra_manager_creation() {
 }
 
 #[test]
-fn test_waypipe_guest_packages() {
-    let config = AppVMConfig::new(
-        "waypipe-pkg-test".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec![],
-        false,
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
-    match WaypipeManager::new(&config) {
-        Ok(manager) => {
-            let packages = manager.guest_packages();
-
-            // Verify Waypipe-specific packages are included
-            assert!(
-                packages.iter().any(|p| p.contains("weston")),
-                "Waypipe should include weston"
-            );
-            assert!(
-                packages.iter().any(|p| p.contains("waypipe")),
-                "Waypipe should include waypipe"
-            );
-            assert!(
-                packages.iter().any(|p| p.contains("wl-clipboard")),
-                "Waypipe should include wl-clipboard"
-            );
-
-            // Verify Xpra packages are NOT included
-            assert!(
-                !packages.iter().any(|p| p.contains("xpra")),
-                "Waypipe should NOT include xpra"
-            );
-        }
-        Err(_) => {
-            eprintln!("Skipping test_waypipe_guest_packages - waypipe binary not installed");
-        }
-    }
-}
-
-#[test]
 fn test_xpra_guest_packages() {
     let config = AppVMConfig::new(
         "xpra-pkg-test".to_string(),
@@ -230,7 +117,13 @@ fn test_xpra_guest_packages() {
         false,
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
     // Skip test if xpra not installed
@@ -259,32 +152,19 @@ fn test_xpra_guest_packages() {
         "Xpra should include pulseaudio libs"
     );
 
-    // Verify Waypipe packages are NOT included
+    // Verify deprecated protocol packages are NOT included
     assert!(
         !packages.iter().any(|p| p.contains("weston")),
-        "Xpra should NOT include weston"
+        "Xpra should NOT include weston (Waypipe deprecated)"
     );
     assert!(
         !packages.iter().any(|p| p.contains("waypipe")),
-        "Xpra should NOT include waypipe"
+        "Xpra should NOT include waypipe (deprecated)"
     );
 }
 
 #[test]
 fn test_display_bridge_trait_consistency() {
-    let config_waypipe = AppVMConfig::new(
-        "trait-test-waypipe".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec![],
-        false,
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
     let config_xpra = AppVMConfig::new(
         "trait-test-xpra".to_string(),
         2048,
@@ -295,42 +175,26 @@ fn test_display_bridge_trait_consistency() {
         false,
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
-    // Both managers should implement DisplayBridge
-    // Test behavior depends on which binaries are installed
-
-    let waypipe_result = WaypipeManager::new(&config_waypipe);
+    // XpraManager should implement DisplayBridge
     let xpra_result = XpraManager::new(&config_xpra);
 
-    match (waypipe_result, xpra_result) {
-        (Ok(waypipe_mgr), Ok(xpra_mgr)) => {
-            // Both managers are available
-            let waypipe_apps = waypipe_mgr.list_applications();
-            let xpra_apps = xpra_mgr.list_applications();
-
-            // Both should return vectors (even if empty)
-            assert!(
-                waypipe_apps.is_empty() || !waypipe_apps.is_empty(),
-                "Waypipe apps list ok"
-            );
-            assert!(
-                xpra_apps.is_empty() || !xpra_apps.is_empty(),
-                "Xpra apps list ok"
-            );
-        }
-        (Ok(waypipe_mgr), Err(_)) => {
-            let apps = waypipe_mgr.list_applications();
-            assert!(apps.is_empty() || !apps.is_empty(), "Waypipe apps list ok");
-        }
-        (Err(_), Ok(xpra_mgr)) => {
+    match xpra_result {
+        Ok(xpra_mgr) => {
             let apps = xpra_mgr.list_applications();
+            // Should return a vector (even if empty)
             assert!(apps.is_empty() || !apps.is_empty(), "Xpra apps list ok");
         }
-        (Err(_), Err(_)) => {
-            // Neither available - skip test
-            eprintln!("Skipping trait consistency test - no display protocol binaries installed");
+        Err(_) => {
+            eprintln!("Skipping trait consistency test - xpra binary not installed");
         }
     }
 }
@@ -348,43 +212,21 @@ fn test_config_serialization_display_protocol() {
         false,
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
     // Verify the config struct maintains display_protocol field
     assert_eq!(config.display_protocol, DisplayProtocol::Xpra);
-
-    let config2 = AppVMConfig::new(
-        "serialize-test2".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec!["io.test.App".to_string()],
-        false,
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
-    assert_eq!(config2.display_protocol, DisplayProtocol::Waypipe);
 }
 
 #[test]
-fn test_headless_mode_with_both_protocols() {
-    let waypipe_headless = AppVMConfig::new(
-        "headless-waypipe".to_string(),
-        1024,
-        1,
-        10,
-        vec!["git".to_string()],
-        vec![],
-        true, // headless = true
-        vec![],
-        false,
-        DisplayProtocol::Waypipe,
-    );
-
+fn test_headless_mode_with_xpra() {
     let xpra_headless = AppVMConfig::new(
         "headless-xpra".to_string(),
         1024,
@@ -395,14 +237,164 @@ fn test_headless_mode_with_both_protocols() {
         true, // headless = true
         vec![],
         false,
-        DisplayProtocol::Xpra,
+        None,  // xpra_html_port
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
     );
 
-    // Both headless configs should be valid
-    assert_eq!(waypipe_headless.headless, true);
+    // Headless config should be valid
     assert_eq!(xpra_headless.headless, true);
 
-    // Memory should be lower for headless
-    assert_eq!(waypipe_headless.memory_mb, 1024);
+    // Memory should be as requested
     assert_eq!(xpra_headless.memory_mb, 1024);
+}
+
+#[test]
+fn test_default_display_protocol() {
+    // DisplayProtocol should default to Xpra
+    let default_protocol = DisplayProtocol::default();
+    assert_eq!(default_protocol, DisplayProtocol::Xpra);
+}
+
+#[test]
+fn test_xpra_html_port_config() {
+    // Test config with HTML5 port enabled
+    let config_with_html = AppVMConfig::new(
+        "html-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        Some(8080), // xpra_html_port enabled
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
+    );
+    assert_eq!(config_with_html.xpra_html_port, Some(8080));
+
+    // Test config without HTML5 port
+    let config_without_html = AppVMConfig::new(
+        "no-html-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        None,  // xpra_html_port disabled
+        false, // xpra_html_lan
+        false, // enable_microphone
+        vec![], // usb_devices
+        false, // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge
+    );
+    assert_eq!(config_without_html.xpra_html_port, None);
+}
+
+#[test]
+fn test_xpra_html_lan_config() {
+    // Test config with LAN access enabled
+    let config_with_lan = AppVMConfig::new(
+        "lan-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        Some(8080), // xpra_html_port enabled
+        true,       // xpra_html_lan enabled
+        false,      // enable_microphone
+        vec![],     // usb_devices
+        false,      // usb_hotplug
+        vec![],     // shared_folders
+        None,       // network_bridge
+    );
+    assert_eq!(config_with_lan.xpra_html_port, Some(8080));
+    assert_eq!(config_with_lan.xpra_html_lan, true);
+
+    // Test config with localhost only (default)
+    let config_localhost = AppVMConfig::new(
+        "localhost-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        Some(9033), // xpra_html_port enabled
+        false,      // xpra_html_lan disabled (localhost only)
+        false,      // enable_microphone
+        vec![],     // usb_devices
+        false,      // usb_hotplug
+        vec![],     // shared_folders
+        None,       // network_bridge
+    );
+    assert_eq!(config_localhost.xpra_html_port, Some(9033));
+    assert_eq!(config_localhost.xpra_html_lan, false);
+}
+
+#[test]
+fn test_network_bridge_config() {
+    use vm_provisioner::config::NetworkMode;
+
+    // Test config with bridged networking
+    let config_bridged = AppVMConfig::new(
+        "bridge-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        None,       // xpra_html_port
+        false,      // xpra_html_lan
+        false,      // enable_microphone
+        vec![],     // usb_devices
+        false,      // usb_hotplug
+        vec![],     // shared_folders
+        Some("br0".to_string()), // network_bridge
+    );
+    assert!(matches!(config_bridged.network_mode, NetworkMode::Bridge(ref name) if name == "br0"));
+
+    // Test config with default NAT networking
+    let config_nat = AppVMConfig::new(
+        "nat-test".to_string(),
+        2048,
+        2,
+        20,
+        vec![],
+        vec![],
+        false,
+        vec![],
+        false,
+        None,       // xpra_html_port
+        false,      // xpra_html_lan
+        false,      // enable_microphone
+        vec![],     // usb_devices
+        false,      // usb_hotplug
+        vec![],     // shared_folders
+        None,       // network_bridge (uses NAT)
+    );
+    assert!(matches!(config_nat.network_mode, NetworkMode::Nat));
 }

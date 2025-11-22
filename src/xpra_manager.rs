@@ -56,6 +56,37 @@ impl XpraManager {
         "/run/user/1000/pulse/native".to_string()
     }
 
+    /// Get the user's SSH public key, generating one if necessary
+    pub fn get_ssh_public_key() -> Result<String, Box<dyn Error>> {
+        let home = std::env::var("HOME")?;
+        let ssh_dir = format!("{}/.ssh", home);
+
+        // Check for existing keys in priority order
+        let key_types = ["id_ed25519", "id_rsa", "id_ecdsa"];
+        for key_type in &key_types {
+            let pub_key_path = format!("{}/{}.pub", ssh_dir, key_type);
+            if Path::new(&pub_key_path).exists() {
+                return Ok(fs::read_to_string(&pub_key_path)?.trim().to_string());
+            }
+        }
+
+        // No key exists, generate a new ed25519 key
+        println!("🔑 No SSH key found, generating new ed25519 key...");
+        fs::create_dir_all(&ssh_dir)?;
+
+        let key_path = format!("{}/id_ed25519", ssh_dir);
+        let status = Command::new("ssh-keygen")
+            .args(&["-t", "ed25519", "-f", &key_path, "-N", "", "-q"])
+            .status()?;
+
+        if !status.success() {
+            return Err("Failed to generate SSH key".into());
+        }
+
+        let pub_key_path = format!("{}.pub", key_path);
+        Ok(fs::read_to_string(&pub_key_path)?.trim().to_string())
+    }
+
     fn get_vm_ip_static(vm_name: &str) -> Result<String, Box<dyn Error>> {
         let output = Command::new("sudo")
             .args(&["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
@@ -225,10 +256,16 @@ impl DisplayBridge for XpraManager {
         match self.resolve_vm_ip() {
             Ok(vm_ip) => {
                 let ssh_cmd = self.build_ssh_invocation(&vm_ip);
+                let microphone_flag = if self.config.enable_microphone {
+                    "--microphone=yes"
+                } else {
+                    "--microphone=disabled"
+                };
                 format!(
-                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --start-child=\"{cmd}\" --exit-with-children",
+                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled {mic} --start-child=\"{cmd}\" --exit-with-children",
                     ip = vm_ip,
                     ssh = ssh_cmd,
+                    mic = microphone_flag,
                     cmd = app_command
                 )
             }
@@ -332,16 +369,171 @@ impl DisplayBridge for XpraManager {
     }
 
     fn kickstart_config(&self, ssh_public_key: &str) -> String {
+        // Build virtiofs mount configuration if shared folders are configured
+        let virtiofs_config = if !self.config.shared_folders.is_empty() {
+            let mut config = String::from(r#"
+# ===== Virtiofs Shared Folders Configuration =====
+echo "=== Configuring virtiofs shared folders ==="
+"#);
+            for folder in &self.config.shared_folders {
+                let mount_options = if folder.readonly {
+                    "defaults,nofail,ro"
+                } else {
+                    "defaults,nofail"
+                };
+                config.push_str(&format!(
+                    r#"
+# Create mount point for shared folder: {host_path} -> {guest_path}
+mkdir -p {guest_path}
+chown user:user {guest_path}
+
+# Add fstab entry for virtiofs mount
+echo "{tag}  {guest_path}  virtiofs  {options}  0  0" >> /etc/fstab
+echo "   Configured: {tag} -> {guest_path}"
+"#,
+                    host_path = folder.host_path,
+                    guest_path = folder.guest_path,
+                    tag = folder.tag,
+                    options = mount_options
+                ));
+            }
+            config.push_str(r#"
+echo "Virtiofs shared folders will be available after reboot."
+"#);
+            config
+        } else {
+            String::new()
+        };
+
+        // Build HTML5 configuration if enabled
+        let html5_config = if let Some(port) = self.config.xpra_html_port {
+            // Determine bind address: 0.0.0.0 for LAN access, 127.0.0.1 for localhost only
+            let bind_addr = if self.config.xpra_html_lan {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            };
+            let access_note = if self.config.xpra_html_lan {
+                "echo \"HTML5 web access available at http://<vm-ip>:{port}/ (LAN accessible)\""
+            } else {
+                "echo \"HTML5 web access available at http://127.0.0.1:{port}/ (localhost only - use SSH tunnel for remote access)\""
+            };
+
+            // Build --start-child arguments for flatpak apps (auto-launch in HTML5 mode)
+            let start_children: String = self.config.flatpak_packages.iter()
+                .map(|pkg| format!(" --start-child=\"flatpak run {}\"", pkg))
+                .collect();
+
+            format!(
+                r#"
+# ===== Xpra HTML5 Web Access Configuration =====
+echo "=== Configuring Xpra HTML5 web access on port {port} ==="
+
+# Allow HTML5 port through firewall (use offline-cmd since firewalld isn't running in chroot)
+firewall-offline-cmd --add-port={port}/tcp || firewall-cmd --permanent --add-port={port}/tcp || true
+
+# Create systemd service for Xpra HTML5 server
+cat > /etc/systemd/system/xpra-html5.service << 'XPRA_SERVICE_EOF'
+[Unit]
+Description=Xpra HTML5 Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=user
+Environment=DISPLAY=:100
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+# Start Xpra server with HTML5 enabled
+# --start-new-commands=yes allows launching additional apps into this session later
+# Apps can be launched via: xpra control :100 start "command"
+ExecStart=/usr/bin/xpra start :100 --bind-tcp={bind_addr}:{port} --html=on --daemon=no --start-new-commands=yes --exit-with-children=no --speaker=yes --pulseaudio=yes{start_children}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+XPRA_SERVICE_EOF
+
+# Enable the HTML5 service to start on boot
+systemctl daemon-reload
+systemctl enable xpra-html5.service
+
+# Create helper script to launch apps into the HTML5 session
+cat > /usr/local/bin/xpra-launch << 'LAUNCH_SCRIPT_EOF'
+#!/bin/bash
+# Launch an application into the Xpra HTML5 session
+# Usage: xpra-launch "command"
+if [ -z "$1" ]; then
+    echo "Usage: xpra-launch <command>"
+    exit 1
+fi
+DISPLAY=:100 xpra control :100 start "$@"
+LAUNCH_SCRIPT_EOF
+chmod +x /usr/local/bin/xpra-launch
+
+{access_note}
+echo "Xpra client can attach via: xpra attach tcp://<vm-ip>:{port}/"
+"#,
+                port = port,
+                bind_addr = bind_addr,
+                access_note = access_note,
+                start_children = start_children
+            )
+        } else {
+            String::new()
+        };
+
+        // Audio configuration: disable local audio for native xpra (SSH forwarding), keep enabled for HTML5
+        let audio_config = if self.config.xpra_html_port.is_some() {
+            // HTML5 mode: keep PulseAudio enabled so xpra can capture audio locally
+            r#"# HTML5 mode: Keep PulseAudio/PipeWire enabled for local audio capture
+echo "=== Configuring audio for HTML5 mode (local PulseAudio) ==="
+# PulseAudio services remain enabled for xpra to capture audio
+# The xpra server will encode and stream audio to the browser"#.to_string()
+        } else {
+            // Native xpra (SSH): disable local audio, use SSH-forwarded socket
+            r#"# Disable PipeWire/PulseAudio auto-start (use SSH-forwarded audio instead)
+cat > /usr/lib/systemd/user-preset/99-disable-audio.preset << 'AUDIO_PRESET_EOF'
+# Disable local audio services - using SSH socket forwarding instead
+disable pipewire.service
+disable pipewire.socket
+disable pipewire-pulse.service
+disable pipewire-pulse.socket
+disable wireplumber.service
+AUDIO_PRESET_EOF
+
+# Set PULSE_SERVER for explicit socket discovery
+cat >> /home/user/.bash_profile << 'PULSE_ENV_EOF'
+
+# Use SSH-forwarded PulseAudio socket
+export PULSE_SERVER=unix:/run/user/1000/pulse/native
+PULSE_ENV_EOF
+chown user:user /home/user/.bash_profile"#.to_string()
+        };
+
         format!(
             r#"
 # Configure SSH and Xpra for seamless window mode with SSH audio forwarding
 echo "=== Configuring SSH, Xpra, and audio forwarding ==="
 
+# Install xpra from updates repo (not available during kickstart %packages phase)
+echo "Installing xpra from updates repository..."
+dnf install -y xpra xorg-x11-server-Xvfb git tar || echo "Warning: xpra installation failed"
+
+# Install xpra-html5 web client (required for browser access)
+if [ ! -d /usr/share/xpra/www ]; then
+    echo "Installing xpra-html5 web client..."
+    mkdir -p /usr/share/xpra/www
+    cd /tmp && git clone --depth 1 https://github.com/Xpra-org/xpra-html5.git
+    cp -r /tmp/xpra-html5/html5/* /usr/share/xpra/www/
+    rm -rf /tmp/xpra-html5
+fi
+
 # SSH key for passwordless authentication
 mkdir -p /home/user/.ssh
 chmod 700 /home/user/.ssh
 cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
-{0}
+{ssh_key}
 SSH_KEY_EOF
 chmod 600 /home/user/.ssh/authorized_keys
 chown -R user:user /home/user/.ssh
@@ -362,28 +554,17 @@ systemctl start sshd
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
 
-# Disable PipeWire/PulseAudio auto-start (use SSH-forwarded audio instead)
-cat > /usr/lib/systemd/user-preset/99-disable-audio.preset << 'AUDIO_PRESET_EOF'
-# Disable local audio services - using SSH socket forwarding instead
-disable pipewire.service
-disable pipewire.socket
-disable pipewire-pulse.service
-disable pipewire-pulse.socket
-disable wireplumber.service
-AUDIO_PRESET_EOF
-
-# Set PULSE_SERVER for explicit socket discovery
-cat >> /home/user/.bash_profile << 'PULSE_ENV_EOF'
-
-# Use SSH-forwarded PulseAudio socket
-export PULSE_SERVER=unix:/run/user/1000/pulse/native
-PULSE_ENV_EOF
-chown user:user /home/user/.bash_profile
+{audio_config}
 
 # No auto-login needed - Xpra starts its own X server on demand
 systemctl set-default multi-user.target
+{html5_config}
+{virtiofs_config}
 "#,
-            ssh_public_key
+            ssh_key = ssh_public_key,
+            audio_config = audio_config,
+            html5_config = html5_config,
+            virtiofs_config = virtiofs_config
         )
     }
 }

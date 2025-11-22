@@ -43,9 +43,6 @@ fn check_prerequisites() -> Result<(), Vec<&'static str>> {
     if !run_command("xpra", &["--version"]) {
         missing.push("xpra client binaries");
     }
-    if !run_command("waypipe", &["--version"]) {
-        missing.push("waypipe (for regression checks)");
-    }
     if !run_command("vm-provisioner", &["--version"])
         && !run_command("./target/release/vm-provisioner", &["--version"])
     {
@@ -65,7 +62,7 @@ fn test_01_prerequisites() {
     println!("\n=== TEST 01: Host prerequisites ===\n");
     match check_prerequisites() {
         Ok(_) => {
-            println!("✅ virsh, xpra, waypipe, and vm-provisioner detected");
+            println!("✅ virsh, xpra, and vm-provisioner detected");
             println!("   Tip: if Mullvad VPN is enabled, run `mullvad lan set allow on` once so 192.168.122.0/24 remains reachable.");
         }
         Err(missing) => {
@@ -102,20 +99,14 @@ fn test_03_xpra_launch_and_audio() {
         "1. Generate host shortcuts: vm-provisioner generate-shortcuts {name}\n",
         name = cfg.vm_name
     );
-    println!("2. Launch Firefox from CLI: vm-provisioner launch {name} firefox\n");
+    println!("2. Launch Firefox from CLI: vm-provisioner launch {} firefox\n", cfg.vm_name);
     println!("   - xpra should spawn a window attached to the running VM\n   - Mullvad/WireGuard toggles must **not** close the window (SSH binds to the libvirt source IP)\n");
     println!("3. Audio check:\n   - In the VM window, play audio (e.g., youtube.com test clip)\n   - Host PulseAudio meters should show activity because the guest uses the SSH-forwarded /run/user/<host>/pulse/native socket\n");
     println!("4. VPN flip: enable/disable Mullvad and verify the xpra session + audio stay up while firefox still resolves outbound via the VPN");
 }
 
-#[test]
-#[ignore]
-fn test_04_waypipe_regression() {
-    println!("\n=== TEST 04: Waypipe regression after XPRA changes ===\n");
-    println!("1. Create fresh VM (waypipe default) with a Flatpak payload\n   vm-provisioner create --flatpak io.gitlab.librewolf-community --name waypipe-reg-test\n");
-    println!("2. Start VM and run vm-provisioner launch waypipe-reg-test \"flatpak run io.gitlab.librewolf-community\"\n    - Ensure lazy IP lookup still works when VM was powered off during provisioning\n");
-    println!("3. Stop/destroy VM when done to reclaim disk space");
-}
+// NOTE: Waypipe has been deprecated. Only Xpra is supported.
+// The waypipe regression test has been removed.
 
 #[test]
 #[ignore]

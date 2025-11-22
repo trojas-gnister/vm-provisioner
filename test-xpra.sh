@@ -22,7 +22,7 @@ err()  { echo -e "${RED}✗${NC} $*"; }
 
 check_host_tools() {
     local missing=0
-    for tool in xpra waypipe virsh ssh vm-provisioner; do
+    for tool in xpra virsh ssh vm-provisioner; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             err "Missing $tool"
             missing=1

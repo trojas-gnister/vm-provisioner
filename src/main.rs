@@ -1,7 +1,6 @@
 mod config;
 mod display_bridge;
 mod provisioner;
-mod waypipe_manager;
 mod xpra_manager;
 
 use clap::{Parser, Subcommand};
@@ -11,10 +10,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio;
 
-use config::{AppVMConfig, DisplayProtocol};
+use config::{AppVMConfig, SharedFolder};
 use display_bridge::DisplayBridge;
 use provisioner::AppVMProvisioner;
-use waypipe_manager::WaypipeManager;
 use xpra_manager::XpraManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,8 +84,30 @@ enum Commands {
         pci: Vec<String>,
         #[arg(long)]
         pci_hotplug: bool,
-        #[arg(long, value_enum, default_value = "waypipe")]
-        display_protocol: DisplayProtocol,
+        /// Enable Xpra HTML5 web access on this port (access from any browser)
+        #[arg(long)]
+        xpra_html_port: Option<u16>,
+        /// Allow Xpra HTML5 access from LAN (binds to 0.0.0.0 instead of localhost)
+        #[arg(long)]
+        xpra_html_lan: bool,
+        /// Enable microphone input from host to VM
+        #[arg(long)]
+        microphone: bool,
+        /// USB device passthrough (format: "vendor:product" e.g. "046d:c52b")
+        #[arg(long, action = clap::ArgAction::Append)]
+        usb: Vec<String>,
+        /// Hot-attach USB devices only while VM runs (restore to host on stop)
+        #[arg(long)]
+        usb_hotplug: bool,
+        /// Share host folder with VM (format: "/host/path:/guest/mount/path")
+        #[arg(long, action = clap::ArgAction::Append)]
+        share: Vec<String>,
+        /// Mount shared folders as read-only
+        #[arg(long)]
+        share_readonly: bool,
+        /// Use bridged networking (VM gets LAN IP). Requires bridge interface to exist.
+        #[arg(long)]
+        network_bridge: Option<String>,
     },
     Start {
         name: String,
@@ -120,10 +140,8 @@ enum Commands {
 fn get_display_bridge(
     config: &AppVMConfig,
 ) -> Result<Box<dyn DisplayBridge>, Box<dyn std::error::Error>> {
-    match config.display_protocol {
-        DisplayProtocol::Waypipe => Ok(Box::new(WaypipeManager::new(config)?)),
-        DisplayProtocol::Xpra => Ok(Box::new(XpraManager::new(config)?)),
-    }
+    // Xpra is the only supported display protocol
+    Ok(Box::new(XpraManager::new(config)?))
 }
 
 #[tokio::main]
@@ -142,7 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             headless,
             pci,
             pci_hotplug,
-            display_protocol,
+            xpra_html_port,
+            xpra_html_lan,
+            microphone,
+            usb,
+            usb_hotplug,
+            share,
+            share_readonly,
+            network_bridge,
         } => {
             create_vm(
                 name,
@@ -156,7 +181,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 headless,
                 pci,
                 pci_hotplug,
-                display_protocol,
+                xpra_html_port,
+                xpra_html_lan,
+                microphone,
+                usb,
+                usb_hotplug,
+                share,
+                share_readonly,
+                network_bridge,
             )
             .await?;
         }
@@ -185,10 +217,33 @@ async fn create_vm(
     headless: bool,
     pci_addresses: Vec<String>,
     pci_hotplug: bool,
-    display_protocol: DisplayProtocol,
+    xpra_html_port: Option<u16>,
+    xpra_html_lan: bool,
+    enable_microphone: bool,
+    usb_addresses: Vec<String>,
+    usb_hotplug: bool,
+    share_paths: Vec<String>,
+    share_readonly: bool,
+    network_bridge: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
+
+    // Validate bridge interface exists if specified
+    if let Some(ref bridge) = network_bridge {
+        let bridge_path = format!("/sys/class/net/{}", bridge);
+        if !Path::new(&bridge_path).exists() {
+            eprintln!("\n❌ Error: Bridge interface '{}' not found.", bridge);
+            eprintln!("\nTo create a bridge (one-time setup):");
+            eprintln!("  1. Find your network interface: nmcli device status");
+            eprintln!("  2. Create bridge:");
+            eprintln!("     sudo nmcli connection add type bridge ifname {} con-name {}", bridge, bridge);
+            eprintln!("     sudo nmcli connection add type bridge-slave ifname <your-interface> master {}", bridge);
+            eprintln!("     sudo nmcli connection up {}", bridge);
+            return Err(format!("Bridge interface '{}' does not exist", bridge).into());
+        }
+        println!("\n🌐 Using bridged networking via '{}'", bridge);
+    }
 
     let config = if let Some(path) = config_path {
         toml::from_str::<AppVMConfig>(&std::fs::read_to_string(path)?)?
@@ -203,7 +258,7 @@ async fn create_vm(
                     "app-vm-{}",
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .expect("System clock is set before UNIX epoch")
                         .as_secs()
                 )
             }
@@ -219,6 +274,26 @@ async fn create_vm(
             Vec::new()
         };
 
+        let usb_devices = if !usb_addresses.is_empty() {
+            println!("\n🔍 Detecting USB devices...");
+            usb_addresses
+                .iter()
+                .map(|addr| provisioner::detect_usb_device(addr))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
+        let shared_folders = if !share_paths.is_empty() {
+            println!("\n📁 Configuring shared folders...");
+            share_paths
+                .iter()
+                .map(|path| parse_share_path(path, share_readonly))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
         AppVMConfig::new(
             vm_name,
             memory,
@@ -229,7 +304,13 @@ async fn create_vm(
             headless,
             pci_devices,
             pci_hotplug,
-            display_protocol,
+            xpra_html_port,
+            xpra_html_lan,
+            enable_microphone,
+            usb_devices,
+            usb_hotplug,
+            shared_folders,
+            network_bridge,
         )
     };
 
@@ -240,17 +321,39 @@ async fn create_vm(
         if config.headless {
             "Headless (CLI only)"
         } else {
-            "GUI"
+            "GUI (Xpra)"
         }
     );
-    if !config.headless {
-        println!("   Display Protocol: {:?}", config.display_protocol);
+    if let Some(port) = config.xpra_html_port {
+        println!("   HTML5 Web Access: http://<vm-ip>:{}/", port);
     }
     println!("   System Packages: {:?}", config.system_packages);
     println!("   Flatpak Packages: {:?}", config.flatpak_packages);
     println!("   Memory: {} MB", config.memory_mb);
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
+    if config.enable_microphone {
+        println!("   Microphone: enabled");
+    }
+    if !config.usb_devices.is_empty() {
+        println!("   USB Devices: {} device(s){}",
+            config.usb_devices.len(),
+            if config.usb_hotplug { " (hot-plug)" } else { " (permanent)" }
+        );
+        for usb in &config.usb_devices {
+            println!("     - {} ({}:{})", usb.description, usb.vendor_id, usb.product_id);
+        }
+    }
+    if !config.shared_folders.is_empty() {
+        println!("   Shared Folders: {} folder(s)", config.shared_folders.len());
+        for folder in &config.shared_folders {
+            println!("     - {} -> {} ({})",
+                folder.host_path,
+                folder.guest_path,
+                if folder.readonly { "read-only" } else { "read-write" }
+            );
+        }
+    }
 
     if !skip_confirm
         && !Confirm::new()
@@ -300,14 +403,17 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
             name
         );
     } else {
-        println!(
-            "\n🪟 Seamless window integration enabled via {:?}",
-            config.display_protocol
-        );
+        println!("\n🪟 Seamless window integration enabled via Xpra");
         println!(
             "   Use `vm-provisioner generate-shortcuts {}` to create .desktop files.",
             name
         );
+        if let Some(port) = config.xpra_html_port {
+            println!(
+                "   Or access via browser: http://<vm-ip>:{}/",
+                port
+            );
+        }
     }
     Ok(())
 }
@@ -391,6 +497,44 @@ fn get_vm_status(name: &str) -> String {
         }
         _ => "not created".to_string(),
     }
+}
+
+fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder, Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = path.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid share format '{}'. Expected format: '/host/path:/guest/path'",
+            path
+        ).into());
+    }
+
+    let host_path = parts[0];
+    let guest_path = parts[1];
+
+    // Validate host path exists
+    if !Path::new(host_path).exists() {
+        return Err(format!(
+            "Host path '{}' does not exist",
+            host_path
+        ).into());
+    }
+
+    // Generate a tag from guest path (replace / with _ and remove leading _)
+    let tag = guest_path
+        .trim_start_matches('/')
+        .replace('/', "_")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<String>();
+
+    println!("   {} -> {} ({})", host_path, guest_path, if readonly { "read-only" } else { "read-write" });
+
+    Ok(SharedFolder {
+        host_path: host_path.to_string(),
+        guest_path: guest_path.to_string(),
+        tag,
+        readonly,
+    })
 }
 
 fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,6 +1,5 @@
-use crate::config::{AppVMConfig, DisplayProtocol, GraphicsBackend, PciDevice};
+use crate::config::{AppVMConfig, GraphicsBackend, NetworkMode, PciDevice, UsbDevice};
 use crate::display_bridge::DisplayBridge;
-use crate::waypipe_manager::WaypipeManager;
 use crate::xpra_manager::XpraManager;
 use std::fs;
 use std::path::Path;
@@ -95,6 +94,121 @@ fn get_iommu_group(address: &str) -> Option<u32> {
     })
 }
 
+/// Public function to detect and validate a USB device
+/// Input format: "vendor:product" (e.g., "046d:c52b")
+pub fn detect_usb_device(address: &str) -> Result<UsbDevice, Box<dyn std::error::Error>> {
+    // Parse vendor:product format
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid USB address format '{}'. Expected 'vendor:product' (e.g., '046d:c52b')",
+            address
+        )
+        .into());
+    }
+
+    let vendor_id = parts[0].to_lowercase();
+    let product_id = parts[1].to_lowercase();
+
+    // Validate hex format
+    if vendor_id.len() != 4 || product_id.len() != 4 {
+        return Err(format!(
+            "Invalid USB vendor:product IDs '{}'. Both should be 4 hex digits (e.g., '046d:c52b')",
+            address
+        )
+        .into());
+    }
+
+    // Run lsusb to find the device
+    let lsusb_output = Command::new("lsusb")
+        .args(&["-d", address])
+        .output()?;
+
+    if !lsusb_output.status.success() {
+        return Err(format!(
+            "USB device {}:{} not found. Run 'lsusb' to see available devices.",
+            vendor_id, product_id
+        )
+        .into());
+    }
+
+    let output_str = String::from_utf8_lossy(&lsusb_output.stdout);
+    let first_line = output_str.lines().next().unwrap_or("");
+
+    if first_line.is_empty() {
+        return Err(format!(
+            "USB device {}:{} not found. Run 'lsusb' to see available devices.",
+            vendor_id, product_id
+        )
+        .into());
+    }
+
+    // Parse lsusb output: "Bus 001 Device 003: ID 046d:c52b Logitech, Inc. Unifying Receiver"
+    let (bus, device) = parse_usb_bus_device(first_line);
+    let description = parse_usb_description(first_line);
+
+    println!(
+        "   Found: {} (Bus {:03} Device {:03})",
+        description,
+        bus.unwrap_or(0),
+        device.unwrap_or(0)
+    );
+
+    Ok(UsbDevice {
+        vendor_id,
+        product_id,
+        description,
+        bus,
+        device,
+    })
+}
+
+fn parse_usb_bus_device(lsusb_line: &str) -> (Option<u8>, Option<u8>) {
+    // Format: "Bus 001 Device 003: ID 046d:c52b Logitech, Inc. Unifying Receiver"
+    let mut bus: Option<u8> = None;
+    let mut device: Option<u8> = None;
+
+    let parts: Vec<&str> = lsusb_line.split_whitespace().collect();
+    for i in 0..parts.len() {
+        if parts[i] == "Bus" && i + 1 < parts.len() {
+            bus = parts[i + 1].parse().ok();
+        }
+        if parts[i] == "Device" && i + 1 < parts.len() {
+            // Remove trailing colon
+            let dev_str = parts[i + 1].trim_end_matches(':');
+            device = dev_str.parse().ok();
+        }
+    }
+
+    (bus, device)
+}
+
+fn parse_usb_description(lsusb_line: &str) -> String {
+    // Format: "Bus 001 Device 003: ID 046d:c52b Logitech, Inc. Unifying Receiver"
+    // Extract everything after the ID xxxx:xxxx
+    if let Some(id_pos) = lsusb_line.find("ID ") {
+        let after_id = &lsusb_line[id_pos + 3..];
+        // Skip the vendor:product part
+        if let Some(space_pos) = after_id.find(' ') {
+            return after_id[space_pos + 1..].trim().to_string();
+        }
+    }
+    "Unknown USB device".to_string()
+}
+
+/// Generate libvirt XML for USB hostdev passthrough
+fn generate_usb_device_xml(device: &UsbDevice) -> String {
+    format!(
+        r#"<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='0x{}'/>
+    <product id='0x{}'/>
+  </source>
+</hostdev>"#,
+        device.vendor_id, device.product_id
+    )
+}
+
 impl AppVMProvisioner {
     pub fn new(config: AppVMConfig) -> Self {
         Self { config }
@@ -131,6 +245,11 @@ impl AppVMProvisioner {
         // Setup PCI passthrough if devices specified (permanent mode)
         if !self.config.pci_devices.is_empty() && !self.config.pci_hotplug {
             self.setup_pci_passthrough_permanent()?;
+        }
+
+        // Setup USB passthrough if devices specified (permanent mode)
+        if !self.config.usb_devices.is_empty() && !self.config.usb_hotplug {
+            self.setup_usb_passthrough_permanent()?;
         }
 
         println!("✅ Application VM provisioned successfully!");
@@ -256,16 +375,15 @@ impl AppVMProvisioner {
 
         println!("🏗️  Generating kickstart configuration...");
 
-        let display_bridge: Box<dyn DisplayBridge> = match self.config.display_protocol {
-            DisplayProtocol::Waypipe => Box::new(WaypipeManager::new(&self.config)?),
-            DisplayProtocol::Xpra => Box::new(XpraManager::new(&self.config)?),
-        };
+        // Xpra is the only supported display protocol
+        let display_bridge: Box<dyn DisplayBridge> = Box::new(XpraManager::new(&self.config)?);
 
         let mut base_packages = display_bridge.guest_packages();
         base_packages.extend(self.config.system_packages.clone());
         let packages = base_packages.join("\n");
 
-        let ssh_public_key = WaypipeManager::get_ssh_public_key()?;
+        // Get SSH public key
+        let ssh_public_key = XpraManager::get_ssh_public_key()?;
         let display_specific_config = display_bridge.kickstart_config(&ssh_public_key);
 
         // Build Flatpak configuration if flatpak packages specified (GUI mode only)
@@ -516,8 +634,6 @@ reboot"#,
             "inst.ks=file:/kickstart.cfg console=tty0 console=ttyS0,115200n8",
             "--osinfo",
             "fedora41",
-            "--network",
-            "network=default,model=virtio",
             "--noautoconsole",
             "--wait",
             "-1",
@@ -527,6 +643,15 @@ reboot"#,
         for arg in graphics_args {
             virt_install_args.push(arg);
         }
+
+        // Add network configuration
+        let network_arg = match &self.config.network_mode {
+            NetworkMode::Bridge(bridge_name) => format!("bridge={},model=virtio", bridge_name),
+            NetworkMode::Nat => "network=default,model=virtio".to_string(),
+            NetworkMode::None => "none".to_string(),
+            NetworkMode::VpnOnly => "network=default,model=virtio".to_string(), // VPN handled separately
+        };
+        virt_install_args.extend_from_slice(&["--network", &network_arg]);
 
         // Add sound if enabled
         if self.config.enable_audio {
@@ -542,6 +667,23 @@ reboot"#,
         // Add USB controller if needed
         if self.config.enable_usb_passthrough {
             virt_install_args.extend_from_slice(&["--controller", "usb,model=qemu-xhci"]);
+        }
+
+        // Add virtiofs shared folders
+        let mut filesystem_args: Vec<String> = Vec::new();
+        for folder in &self.config.shared_folders {
+            filesystem_args.push(format!(
+                "source={},target={},driver.type=virtiofs",
+                folder.host_path, folder.tag
+            ));
+        }
+        for fs_arg in &filesystem_args {
+            virt_install_args.extend_from_slice(&["--filesystem", fs_arg]);
+        }
+
+        // Add memory backing for virtiofs (required for virtiofs to work)
+        if !self.config.shared_folders.is_empty() {
+            virt_install_args.extend_from_slice(&["--memorybacking", "source.type=memfd,access.mode=shared"]);
         }
 
         println!("⏳ Running automated installation (15-20 minutes)...");
@@ -685,7 +827,7 @@ reboot"#,
             // VM is already running with correct memory, no restart needed
         }
 
-        // Accept SSH host key for seamless Waypipe connections
+        // Accept SSH host key for seamless Xpra connections
         self.accept_ssh_host_key()?;
 
         // Stop the VM (requires sudo)
@@ -844,6 +986,11 @@ reboot"#,
             self.attach_pci_devices_hotplug()?;
         }
 
+        // Hot-attach USB devices if in hot-plug mode
+        if self.config.usb_hotplug && !self.config.usb_devices.is_empty() {
+            self.attach_usb_devices_hotplug()?;
+        }
+
         // Handle display based on headless mode
         if self.config.headless {
             println!("🖥️  Headless VM started - use serial console to connect");
@@ -904,6 +1051,11 @@ reboot"#,
             // Wait a bit to ensure VM is responsive
             thread::sleep(Duration::from_secs(2));
             self.detach_pci_devices_hotplug()?;
+        }
+
+        // Hot-detach USB devices if in hot-plug mode (before shutdown)
+        if self.config.usb_hotplug && !self.config.usb_devices.is_empty() {
+            self.detach_usb_devices_hotplug()?;
         }
 
         Command::new("virsh")
@@ -1347,6 +1499,129 @@ reboot"#,
             Command::new("sudo")
                 .args(&["bash", "-c", &format!("echo '{}' > {}", address, bind_path)])
                 .status()?;
+        }
+
+        Ok(())
+    }
+
+    // ===== USB Passthrough Implementation =====
+
+    fn setup_usb_passthrough_permanent(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Setting up USB passthrough (permanent mode)...");
+
+        for device in &self.config.usb_devices {
+            println!(
+                "   Attaching {} ({}:{})",
+                device.description, device.vendor_id, device.product_id
+            );
+
+            // Generate and write XML
+            let xml = generate_usb_device_xml(device);
+            let xml_path = format!(
+                "/tmp/{}-usb-{}-{}.xml",
+                self.config.name, device.vendor_id, device.product_id
+            );
+            fs::write(&xml_path, &xml)?;
+
+            // Attach to VM config (permanent)
+            let result = Command::new("virsh")
+                .args(&[
+                    "-c",
+                    "qemu:///system",
+                    "attach-device",
+                    &self.config.name,
+                    &xml_path,
+                    "--config",
+                ])
+                .status();
+
+            fs::remove_file(&xml_path)?;
+
+            if result.is_err() || !result?.success() {
+                eprintln!("   ⚠️  Failed to attach USB device {}:{}", device.vendor_id, device.product_id);
+            } else {
+                println!("   ✓ USB device attached permanently");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn attach_usb_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Hot-attaching USB devices...");
+
+        for device in &self.config.usb_devices {
+            println!(
+                "   Attaching {} ({}:{})",
+                device.description, device.vendor_id, device.product_id
+            );
+
+            // Generate and write XML
+            let xml = generate_usb_device_xml(device);
+            let xml_path = format!(
+                "/tmp/{}-usb-{}-{}.xml",
+                self.config.name, device.vendor_id, device.product_id
+            );
+            fs::write(&xml_path, &xml)?;
+
+            // Attach to running VM
+            let result = Command::new("virsh")
+                .args(&[
+                    "-c",
+                    "qemu:///system",
+                    "attach-device",
+                    &self.config.name,
+                    &xml_path,
+                    "--live",
+                ])
+                .status();
+
+            fs::remove_file(&xml_path)?;
+
+            if result.is_err() || !result?.success() {
+                eprintln!("   ⚠️  Failed to hot-attach USB device {}:{}", device.vendor_id, device.product_id);
+            } else {
+                println!("   ✓ USB device hot-attached successfully");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn detach_usb_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("🔌 Hot-detaching USB devices...");
+
+        for device in &self.config.usb_devices {
+            println!(
+                "   Detaching {} ({}:{})",
+                device.description, device.vendor_id, device.product_id
+            );
+
+            // Generate and write XML
+            let xml = generate_usb_device_xml(device);
+            let xml_path = format!(
+                "/tmp/{}-usb-{}-{}.xml",
+                self.config.name, device.vendor_id, device.product_id
+            );
+            fs::write(&xml_path, &xml)?;
+
+            // Detach from running VM
+            let result = Command::new("virsh")
+                .args(&[
+                    "-c",
+                    "qemu:///system",
+                    "detach-device",
+                    &self.config.name,
+                    &xml_path,
+                    "--live",
+                ])
+                .status();
+
+            fs::remove_file(&xml_path)?;
+
+            if result.is_ok() && result?.success() {
+                println!("   ✓ USB device detached from VM");
+            }
         }
 
         Ok(())
