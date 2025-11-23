@@ -27,8 +27,7 @@ fn test_appvmconfig_with_xpra() {
         false, // Not headless
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -75,8 +74,7 @@ fn test_xpra_manager_creation() {
         false,
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -117,8 +115,7 @@ fn test_xpra_guest_packages() {
         false,
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -175,8 +172,7 @@ fn test_display_bridge_trait_consistency() {
         false,
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -212,8 +208,7 @@ fn test_config_serialization_display_protocol() {
         false,
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -237,8 +232,7 @@ fn test_headless_mode_with_xpra() {
         true, // headless = true
         vec![],
         false,
-        None,  // xpra_html_port
-        false, // xpra_html_lan
+        None,  // web_port
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
@@ -261,10 +255,10 @@ fn test_default_display_protocol() {
 }
 
 #[test]
-fn test_xpra_html_port_config() {
-    // Test config with HTML5 port enabled
-    let config_with_html = AppVMConfig::new(
-        "html-test".to_string(),
+fn test_web_port_config() {
+    // Test config with web streaming port enabled (Selkies-GStreamer)
+    let config_with_web = AppVMConfig::new(
+        "web-test".to_string(),
         2048,
         2,
         20,
@@ -273,19 +267,18 @@ fn test_xpra_html_port_config() {
         false,
         vec![],
         false,
-        Some(8080), // xpra_html_port enabled
-        false, // xpra_html_lan
+        Some(8080), // web_port enabled
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
     );
-    assert_eq!(config_with_html.xpra_html_port, Some(8080));
+    assert_eq!(config_with_web.web_port, Some(8080));
 
-    // Test config without HTML5 port
-    let config_without_html = AppVMConfig::new(
-        "no-html-test".to_string(),
+    // Test config without web streaming port
+    let config_without_web = AppVMConfig::new(
+        "no-web-test".to_string(),
         2048,
         2,
         20,
@@ -294,62 +287,14 @@ fn test_xpra_html_port_config() {
         false,
         vec![],
         false,
-        None,  // xpra_html_port disabled
-        false, // xpra_html_lan
+        None,  // web_port disabled
         false, // enable_microphone
         vec![], // usb_devices
         false, // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
     );
-    assert_eq!(config_without_html.xpra_html_port, None);
-}
-
-#[test]
-fn test_xpra_html_lan_config() {
-    // Test config with LAN access enabled
-    let config_with_lan = AppVMConfig::new(
-        "lan-test".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec![],
-        false,
-        vec![],
-        false,
-        Some(8080), // xpra_html_port enabled
-        true,       // xpra_html_lan enabled
-        false,      // enable_microphone
-        vec![],     // usb_devices
-        false,      // usb_hotplug
-        vec![],     // shared_folders
-        None,       // network_bridge
-    );
-    assert_eq!(config_with_lan.xpra_html_port, Some(8080));
-    assert_eq!(config_with_lan.xpra_html_lan, true);
-
-    // Test config with localhost only (default)
-    let config_localhost = AppVMConfig::new(
-        "localhost-test".to_string(),
-        2048,
-        2,
-        20,
-        vec![],
-        vec![],
-        false,
-        vec![],
-        false,
-        Some(9033), // xpra_html_port enabled
-        false,      // xpra_html_lan disabled (localhost only)
-        false,      // enable_microphone
-        vec![],     // usb_devices
-        false,      // usb_hotplug
-        vec![],     // shared_folders
-        None,       // network_bridge
-    );
-    assert_eq!(config_localhost.xpra_html_port, Some(9033));
-    assert_eq!(config_localhost.xpra_html_lan, false);
+    assert_eq!(config_without_web.web_port, None);
 }
 
 #[test]
@@ -367,8 +312,7 @@ fn test_network_bridge_config() {
         false,
         vec![],
         false,
-        None,       // xpra_html_port
-        false,      // xpra_html_lan
+        None,       // web_port
         false,      // enable_microphone
         vec![],     // usb_devices
         false,      // usb_hotplug
@@ -388,8 +332,7 @@ fn test_network_bridge_config() {
         false,
         vec![],
         false,
-        None,       // xpra_html_port
-        false,      // xpra_html_lan
+        None,       // web_port
         false,      // enable_microphone
         vec![],     // usb_devices
         false,      // usb_hotplug

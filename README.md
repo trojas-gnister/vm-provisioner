@@ -45,37 +45,25 @@ Rust CLI that provisions Fedora-based VMs per application, with seamless window 
 4. Sessions launch on demand and exit once the child process ends - no persistent xpra state to clean up.
 5. `test-xpra.sh` offers an automated smoke test (create VM -> shortcuts -> xpra launch/audio -> cleanup).
 
-### Xpra HTML5 browser access (optional)
+### Web streaming via Selkies-GStreamer (optional)
 
-For scenarios where you need browser-based access to VM applications (remote access, no xpra client installed, etc.), you can enable HTML5 mode:
+For scenarios where you need browser-based access to VM applications (remote access, no xpra client installed, etc.), you can enable Selkies-GStreamer WebRTC streaming:
 
 ```bash
-# Create VM with HTML5 web access on port 9033 (localhost only - default)
-vm-provisioner create --flatpak io.gitlab.librewolf-community --name browser-vm --xpra-html-port 9033
-
-# Create VM with HTML5 web access accessible from LAN devices
-vm-provisioner create --flatpak io.gitlab.librewolf-community --name browser-vm --xpra-html-port 9033 --xpra-html-lan
+# Create VM with web streaming on port 8080
+vm-provisioner create --flatpak io.gitlab.librewolf-community --name browser-vm --web-port 8080
 ```
 
-**Security note:** By default, HTML5 mode binds to `127.0.0.1` (localhost only). Use `--xpra-html-lan` to bind to `0.0.0.0` (all interfaces) for LAN access. Note that xpra HTML5 has no authentication, so only use `--xpra-html-lan` on trusted networks.
+**Access:** Open `http://<vm-ip>:8080/` in your browser. Login with username `user` and the VM password (run `vm-provisioner passwords` to see it).
 
-**Important considerations:**
+**Features:**
+- WebRTC-based streaming with low latency
+- Built-in audio support (no SSH forwarding needed)
+- Basic authentication (username/password)
+- Automatic application launch on connect
+- Works alongside native xpra (no session conflicts)
 
-1. **HTML5 mode creates a persistent xpra session** that runs on VM boot. Applications must be launched manually into this session.
-
-2. **Launching apps in HTML5 mode:** When you connect to `http://<vm-ip>:9033/` and see a blue/empty screen, you need to launch the application:
-   ```bash
-   # SSH into VM and use the xpra-launch helper
-   ssh user@<vm-ip> "xpra-launch 'flatpak run io.gitlab.librewolf-community'"
-
-   # Or directly via xpra control
-   ssh user@<vm-ip> "DISPLAY=:100 xpra control :100 start 'flatpak run io.gitlab.librewolf-community'"
-   ```
-   Then refresh your browser to see the application.
-
-3. **Conflict with native xpra client:** Single-instance applications (like LibreWolf, Firefox, Chrome) can only run in one xpra session at a time. If an app is running in the HTML5 session, the native xpra client (`vm-provisioner launch`) will fail to start it (and vice versa).
-
-4. **Recommendation:** Only use `--xpra-html-port` when you specifically need browser-based access. For normal desktop use, the native xpra client provides better performance and seamless window integration without the single-instance conflict.
+**Recommendation:** Use `--web-port` when you need browser-based access from any device. For normal desktop use on the host, the native xpra client provides better integration without the browser overhead.
 
 ### Installing the protocol tooling
 
@@ -238,12 +226,11 @@ sudo nmcli connection up br0
 # VM gets an IP directly from your LAN's DHCP server
 vm-provisioner create \
   --flatpak io.gitlab.librewolf-community \
-  --xpra-html-port 9033 \
-  --xpra-html-lan \
+  --web-port 8080 \
   --network-bridge br0 \
   --name lan-browser
 
-# Now accessible from any LAN device at http://<vm-lan-ip>:9033/
+# Now accessible from any LAN device at http://<vm-lan-ip>:8080/
 ```
 
 **Benefits:**
@@ -253,7 +240,7 @@ vm-provisioner create \
 - VM can be reached even if the host IP changes
 
 **When to use:**
-- HTML5 xpra access from phones, tablets, or other computers
+- Web streaming access from phones, tablets, or other computers
 - VMs that need to provide network services
 - Multi-machine development environments
 
@@ -281,8 +268,7 @@ vm_dir = "/var/lib/libvirt/images"
 system_packages = ["xpra", "xorg-x11-server-Xvfb", "pulseaudio-libs", "git", "openssh-server", "flatpak"]
 flatpak_packages = ["org.mozilla.firefox"]
 display_protocol = "Xpra"
-xpra_html_port = 9033       # Optional: port for HTML5 browser access (omit to disable)
-xpra_html_lan = false       # true = bind to 0.0.0.0 (LAN accessible), false = 127.0.0.1 (localhost only)
+web_port = 8080             # Optional: port for Selkies-GStreamer WebRTC web access (omit to disable)
 graphics_backend = "VirtioGpu"
 enable_clipboard = true
 enable_audio = true

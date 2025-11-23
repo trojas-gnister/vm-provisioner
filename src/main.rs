@@ -84,12 +84,9 @@ enum Commands {
         pci: Vec<String>,
         #[arg(long)]
         pci_hotplug: bool,
-        /// Enable Xpra HTML5 web access on this port (access from any browser)
+        /// Enable web-based streaming on this port (Selkies-GStreamer WebRTC)
         #[arg(long)]
-        xpra_html_port: Option<u16>,
-        /// Allow Xpra HTML5 access from LAN (binds to 0.0.0.0 instead of localhost)
-        #[arg(long)]
-        xpra_html_lan: bool,
+        web_port: Option<u16>,
         /// Enable microphone input from host to VM
         #[arg(long)]
         microphone: bool,
@@ -160,8 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             headless,
             pci,
             pci_hotplug,
-            xpra_html_port,
-            xpra_html_lan,
+            web_port,
             microphone,
             usb,
             usb_hotplug,
@@ -181,8 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 headless,
                 pci,
                 pci_hotplug,
-                xpra_html_port,
-                xpra_html_lan,
+                web_port,
                 microphone,
                 usb,
                 usb_hotplug,
@@ -217,8 +212,7 @@ async fn create_vm(
     headless: bool,
     pci_addresses: Vec<String>,
     pci_hotplug: bool,
-    xpra_html_port: Option<u16>,
-    xpra_html_lan: bool,
+    web_port: Option<u16>,
     enable_microphone: bool,
     usb_addresses: Vec<String>,
     usb_hotplug: bool,
@@ -304,8 +298,7 @@ async fn create_vm(
             headless,
             pci_devices,
             pci_hotplug,
-            xpra_html_port,
-            xpra_html_lan,
+            web_port,
             enable_microphone,
             usb_devices,
             usb_hotplug,
@@ -324,8 +317,8 @@ async fn create_vm(
             "GUI (Xpra)"
         }
     );
-    if let Some(port) = config.xpra_html_port {
-        println!("   HTML5 Web Access: http://<vm-ip>:{}/", port);
+    if let Some(port) = config.web_port {
+        println!("   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)", port);
     }
     println!("   System Packages: {:?}", config.system_packages);
     println!("   Flatpak Packages: {:?}", config.flatpak_packages);
@@ -408,9 +401,9 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
             "   Use `vm-provisioner generate-shortcuts {}` to create .desktop files.",
             name
         );
-        if let Some(port) = config.xpra_html_port {
+        if let Some(port) = config.web_port {
             println!(
-                "   Or access via browser: http://<vm-ip>:{}/",
+                "   Or access via browser: http://<vm-ip>:{}/ (Selkies WebRTC)",
                 port
             );
         }

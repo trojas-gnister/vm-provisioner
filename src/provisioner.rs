@@ -741,9 +741,15 @@ reboot"#,
                 .output()?;
 
             if !boot_test.status.success() {
-                eprintln!("❌ Installation failed: VM will not start");
-                eprintln!("   Error: {}", String::from_utf8_lossy(&boot_test.stderr));
-                return Err("Installation validation failed: VM won't boot".into());
+                let stderr = String::from_utf8_lossy(&boot_test.stderr);
+                // "Domain is already active" means VM is running - this is success, not failure
+                if stderr.contains("already active") {
+                    println!("   ✓ VM is already running");
+                } else {
+                    eprintln!("❌ Installation failed: VM will not start");
+                    eprintln!("   Error: {}", stderr);
+                    return Err("Installation validation failed: VM won't boot".into());
+                }
             }
 
             // Give it a moment to boot

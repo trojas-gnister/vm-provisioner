@@ -405,91 +405,121 @@ echo "Virtiofs shared folders will be available after reboot."
             String::new()
         };
 
-        // Build HTML5 configuration if enabled
-        let html5_config = if let Some(port) = self.config.xpra_html_port {
-            // Determine bind address: 0.0.0.0 for LAN access, 127.0.0.1 for localhost only
-            let bind_addr = if self.config.xpra_html_lan {
-                "0.0.0.0"
-            } else {
-                "127.0.0.1"
-            };
-            let access_note = if self.config.xpra_html_lan {
-                "echo \"HTML5 web access available at http://<vm-ip>:{port}/ (LAN accessible)\""
-            } else {
-                "echo \"HTML5 web access available at http://127.0.0.1:{port}/ (localhost only - use SSH tunnel for remote access)\""
-            };
-
-            // Build --start-child arguments for flatpak apps (auto-launch in HTML5 mode)
-            let start_children: String = self.config.flatpak_packages.iter()
-                .map(|pkg| format!(" --start-child=\"flatpak run {}\"", pkg))
-                .collect();
+        // Build Selkies-GStreamer web streaming configuration if enabled
+        let web_streaming_config = if let Some(port) = self.config.web_port {
+            // Build flatpak launch commands
+            let flatpak_commands: String = self.config.flatpak_packages.iter()
+                .map(|pkg| format!("flatpak run {} &", pkg))
+                .collect::<Vec<_>>()
+                .join("\n");
 
             format!(
                 r#"
-# ===== Xpra HTML5 Web Access Configuration =====
-echo "=== Configuring Xpra HTML5 web access on port {port} ==="
+# ===== Selkies-GStreamer WebRTC Streaming Configuration =====
+echo "=== Configuring Selkies-GStreamer web streaming on port {port} ==="
 
-# Allow HTML5 port through firewall (use offline-cmd since firewalld isn't running in chroot)
+# Install GStreamer dependencies
+dnf install -y gstreamer1-plugins-base gstreamer1-plugins-good \
+    gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
+    python3-pip python3-gobject libXtst libXdamage libXfixes \
+    xorg-x11-server-Xvfb xorg-x11-utils pipewire pipewire-pulseaudio || true
+
+# Install RPM Fusion for additional codecs
+dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-41.noarch.rpm || true
+dnf install -y gstreamer1-plugins-bad-freeworld x264 || true
+
+# Download and install Selkies-GStreamer portable distribution
+echo "Downloading Selkies-GStreamer..."
+SELKIES_VERSION="1.6.2"
+mkdir -p /opt/selkies-gstreamer
+curl -fsSL -o /tmp/selkies.tar.gz \
+    "https://github.com/selkies-project/selkies-gstreamer/releases/download/v${{SELKIES_VERSION}}/selkies-gstreamer-portable-v${{SELKIES_VERSION}}_amd64.tar.gz" || \
+curl -fsSL -o /tmp/selkies.tar.gz \
+    "https://github.com/selkies-project/selkies/releases/download/v${{SELKIES_VERSION}}/selkies-gstreamer-portable-v${{SELKIES_VERSION}}_amd64.tar.gz"
+tar -xzf /tmp/selkies.tar.gz -C /opt/selkies-gstreamer --strip-components=1 || true
+rm -f /tmp/selkies.tar.gz
+
+# Allow web port and WebRTC ports through firewall
 firewall-offline-cmd --add-port={port}/tcp || firewall-cmd --permanent --add-port={port}/tcp || true
+firewall-offline-cmd --add-port=49152-65535/udp || firewall-cmd --permanent --add-port=49152-65535/udp || true
+firewall-offline-cmd --add-port=49152-65535/tcp || firewall-cmd --permanent --add-port=49152-65535/tcp || true
 
-# Create systemd service for Xpra HTML5 server
-cat > /etc/systemd/system/xpra-html5.service << 'XPRA_SERVICE_EOF'
+# Create startup script for applications
+cat > /home/user/start-apps.sh << 'APPS_SCRIPT_EOF'
+#!/bin/bash
+# Wait for display to be ready
+sleep 2
+{flatpak_commands}
+APPS_SCRIPT_EOF
+chmod +x /home/user/start-apps.sh
+chown user:user /home/user/start-apps.sh
+
+# Create systemd service for Selkies-GStreamer
+cat > /etc/systemd/system/selkies-web.service << 'SELKIES_SERVICE_EOF'
 [Unit]
-Description=Xpra HTML5 Web Server
+Description=Selkies-GStreamer WebRTC Streaming
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=user
 Environment=DISPLAY=:100
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-# Start Xpra server with HTML5 enabled
-# --start-new-commands=yes allows launching additional apps into this session later
-# Apps can be launched via: xpra control :100 start "command"
-ExecStart=/usr/bin/xpra start :100 --bind-tcp={bind_addr}:{port} --html=on --daemon=no --start-new-commands=yes --exit-with-children=no --speaker=yes --pulseaudio=yes{start_children}
+Environment=SELKIES_ENCODER=x264enc
+Environment=SELKIES_BASIC_AUTH_USER=user
+Environment=SELKIES_BASIC_AUTH_PASSWORD={password}
+
+# Start Xvfb virtual display
+ExecStartPre=/usr/bin/Xvfb :100 -screen 0 1920x1080x24
+
+# Start applications after display is ready
+ExecStartPost=/bin/bash -c 'sleep 3 && /home/user/start-apps.sh'
+
+# Start Selkies-GStreamer
+ExecStart=/opt/selkies-gstreamer/selkies-gstreamer-run \
+    --addr=0.0.0.0 \
+    --port={port} \
+    --enable_resize=true \
+    --enable_clipboard=true \
+    --framerate=60 \
+    --video_bitrate=8000 \
+    --audio_bitrate=128000
+
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-XPRA_SERVICE_EOF
+SELKIES_SERVICE_EOF
 
-# Enable the HTML5 service to start on boot
+# Enable user lingering for PipeWire
+loginctl enable-linger user || true
+
+# Enable the Selkies service to start on boot
 systemctl daemon-reload
-systemctl enable xpra-html5.service
+systemctl enable selkies-web.service
 
-# Create helper script to launch apps into the HTML5 session
-cat > /usr/local/bin/xpra-launch << 'LAUNCH_SCRIPT_EOF'
-#!/bin/bash
-# Launch an application into the Xpra HTML5 session
-# Usage: xpra-launch "command"
-if [ -z "$1" ]; then
-    echo "Usage: xpra-launch <command>"
-    exit 1
-fi
-DISPLAY=:100 xpra control :100 start "$@"
-LAUNCH_SCRIPT_EOF
-chmod +x /usr/local/bin/xpra-launch
-
-{access_note}
-echo "Xpra client can attach via: xpra attach tcp://<vm-ip>:{port}/"
+echo "Selkies WebRTC streaming configured on port {port}"
+echo "Access via browser: http://<vm-ip>:{port}/"
+echo "Login: user / {password}"
 "#,
                 port = port,
-                bind_addr = bind_addr,
-                access_note = access_note,
-                start_children = start_children
+                password = self.config.user_password,
+                flatpak_commands = flatpak_commands
             )
         } else {
             String::new()
         };
 
-        // Audio configuration: disable local audio for native xpra (SSH forwarding), keep enabled for HTML5
-        let audio_config = if self.config.xpra_html_port.is_some() {
-            // HTML5 mode: keep PulseAudio enabled so xpra can capture audio locally
-            r#"# HTML5 mode: Keep PulseAudio/PipeWire enabled for local audio capture
-echo "=== Configuring audio for HTML5 mode (local PulseAudio) ==="
-# PulseAudio services remain enabled for xpra to capture audio
-# The xpra server will encode and stream audio to the browser"#.to_string()
+        // Audio configuration: disable local audio for native xpra (SSH forwarding), keep enabled for web streaming
+        let audio_config = if self.config.web_port.is_some() {
+            // Web streaming mode: keep PulseAudio enabled so Selkies can capture audio locally
+            r#"# Web streaming mode: Keep PulseAudio/PipeWire enabled for local audio capture
+echo "=== Configuring audio for web streaming mode (local PipeWire) ==="
+# PipeWire/PulseAudio services remain enabled for Selkies to capture audio
+# Selkies will encode and stream audio via WebRTC to the browser"#.to_string()
         } else {
             // Native xpra (SSH): disable local audio, use SSH-forwarded socket
             r#"# Disable PipeWire/PulseAudio auto-start (use SSH-forwarded audio instead)
@@ -558,12 +588,12 @@ firewall-cmd --reload
 
 # No auto-login needed - Xpra starts its own X server on demand
 systemctl set-default multi-user.target
-{html5_config}
+{web_streaming_config}
 {virtiofs_config}
 "#,
             ssh_key = ssh_public_key,
             audio_config = audio_config,
-            html5_config = html5_config,
+            web_streaming_config = web_streaming_config,
             virtiofs_config = virtiofs_config
         )
     }

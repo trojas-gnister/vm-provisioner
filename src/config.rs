@@ -77,8 +77,7 @@ pub struct AppVMConfig {
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
     pub display_protocol: DisplayProtocol,
-    pub xpra_html_port: Option<u16>, // Port for Xpra HTML5 web access (None = disabled)
-    pub xpra_html_lan: bool,         // true = bind to 0.0.0.0 (LAN accessible), false = 127.0.0.1 (localhost only)
+    pub web_port: Option<u16>, // Port for Selkies-GStreamer WebRTC web access (None = disabled)
     pub enable_clipboard: bool,
     pub enable_audio: bool,
     pub enable_microphone: bool,
@@ -141,8 +140,7 @@ impl AppVMConfig {
         headless: bool,
         pci_devices: Vec<PciDevice>,
         pci_hotplug: bool,
-        xpra_html_port: Option<u16>,
-        xpra_html_lan: bool,
+        web_port: Option<u16>,
         enable_microphone: bool,
         usb_devices: Vec<UsbDevice>,
         usb_hotplug: bool,
@@ -184,8 +182,7 @@ impl AppVMConfig {
                 GraphicsBackend::VirtioGpu
             },
             display_protocol: DisplayProtocol::Xpra,
-            xpra_html_port,
-            xpra_html_lan,
+            web_port,
             enable_clipboard: !headless,
             enable_audio: !headless,
             enable_microphone: enable_microphone && !headless, // Only enable for GUI VMs
