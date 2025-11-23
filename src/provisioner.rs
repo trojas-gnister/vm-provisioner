@@ -1074,6 +1074,24 @@ reboot"#,
     pub fn destroy_vm(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🗑️  Destroying VM: {}", self.config.name);
 
+        // Get VM IP before destroying (for SSH known_hosts cleanup)
+        let vm_ip = {
+            let output = Command::new("sudo")
+                .args(&["virsh", "-c", "qemu:///system", "domifaddr", &self.config.name])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let output_str = String::from_utf8_lossy(&out.stdout);
+                    output_str.lines()
+                        .find(|line| line.contains("ipv4"))
+                        .and_then(|line| line.split_whitespace().nth(3))
+                        .and_then(|ip_part| ip_part.split('/').next())
+                        .map(|s| s.to_string())
+                }
+                _ => None,
+            }
+        };
+
         // Check if VM exists first
         let list_output = Command::new("virsh")
             .args(&["-c", "qemu:///system", "list", "--all"])
@@ -1194,6 +1212,23 @@ reboot"#,
             );
         } else {
             println!("   ✅ VM successfully removed from libvirt");
+        }
+
+        // Clean up SSH known_hosts entry to prevent host key conflicts
+        if let Some(ip) = vm_ip {
+            println!("   Cleaning up SSH known_hosts for {}...", ip);
+            let cleanup_result = Command::new("ssh-keygen")
+                .args(&["-R", &ip])
+                .output();
+            match cleanup_result {
+                Ok(output) if output.status.success() => {
+                    println!("   ✅ SSH known_hosts entry removed");
+                }
+                _ => {
+                    // Not critical if this fails
+                    println!("   (No SSH entry found or cleanup skipped)");
+                }
+            }
         }
 
         println!("✅ VM destruction completed");
@@ -1555,81 +1590,93 @@ reboot"#,
 
     fn attach_usb_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🔌 Hot-attaching USB devices...");
-
         for device in &self.config.usb_devices {
-            println!(
-                "   Attaching {} ({}:{})",
-                device.description, device.vendor_id, device.product_id
-            );
-
-            // Generate and write XML
-            let xml = generate_usb_device_xml(device);
-            let xml_path = format!(
-                "/tmp/{}-usb-{}-{}.xml",
-                self.config.name, device.vendor_id, device.product_id
-            );
-            fs::write(&xml_path, &xml)?;
-
-            // Attach to running VM
-            let result = Command::new("virsh")
-                .args(&[
-                    "-c",
-                    "qemu:///system",
-                    "attach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--live",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            if result.is_err() || !result?.success() {
-                eprintln!("   ⚠️  Failed to hot-attach USB device {}:{}", device.vendor_id, device.product_id);
-            } else {
-                println!("   ✓ USB device hot-attached successfully");
-            }
+            self.attach_usb_device(device)?;
         }
-
         Ok(())
     }
 
     fn detach_usb_devices_hotplug(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🔌 Hot-detaching USB devices...");
-
         for device in &self.config.usb_devices {
-            println!(
-                "   Detaching {} ({}:{})",
-                device.description, device.vendor_id, device.product_id
-            );
-
-            // Generate and write XML
-            let xml = generate_usb_device_xml(device);
-            let xml_path = format!(
-                "/tmp/{}-usb-{}-{}.xml",
-                self.config.name, device.vendor_id, device.product_id
-            );
-            fs::write(&xml_path, &xml)?;
-
-            // Detach from running VM
-            let result = Command::new("virsh")
-                .args(&[
-                    "-c",
-                    "qemu:///system",
-                    "detach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--live",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            if result.is_ok() && result?.success() {
-                println!("   ✓ USB device detached from VM");
-            }
+            let _ = self.detach_usb_device(device); // Ignore errors on detach
         }
-
         Ok(())
+    }
+
+    /// Attach a single USB device to the running VM
+    pub fn attach_usb_device(&self, device: &UsbDevice) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "   Attaching {} ({}:{})",
+            device.description, device.vendor_id, device.product_id
+        );
+
+        // Generate and write XML
+        let xml = generate_usb_device_xml(device);
+        let xml_path = format!(
+            "/tmp/{}-usb-{}-{}.xml",
+            self.config.name, device.vendor_id, device.product_id
+        );
+        fs::write(&xml_path, &xml)?;
+
+        // Attach to running VM
+        let result = Command::new("virsh")
+            .args(&[
+                "-c",
+                "qemu:///system",
+                "attach-device",
+                &self.config.name,
+                &xml_path,
+                "--live",
+            ])
+            .output()?;
+
+        fs::remove_file(&xml_path)?;
+
+        if result.status.success() {
+            println!("   ✅ USB device attached successfully");
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            Err(format!("Failed to attach USB device: {}", stderr).into())
+        }
+    }
+
+    /// Detach a single USB device from the running VM
+    pub fn detach_usb_device(&self, device: &UsbDevice) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "   Detaching {} ({}:{})",
+            device.description, device.vendor_id, device.product_id
+        );
+
+        // Generate and write XML
+        let xml = generate_usb_device_xml(device);
+        let xml_path = format!(
+            "/tmp/{}-usb-{}-{}.xml",
+            self.config.name, device.vendor_id, device.product_id
+        );
+        fs::write(&xml_path, &xml)?;
+
+        // Detach from running VM
+        let result = Command::new("virsh")
+            .args(&[
+                "-c",
+                "qemu:///system",
+                "detach-device",
+                &self.config.name,
+                &xml_path,
+                "--live",
+            ])
+            .output()?;
+
+        fs::remove_file(&xml_path)?;
+
+        if result.status.success() {
+            println!("   ✅ USB device detached successfully");
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            Err(format!("Failed to detach USB device: {}", stderr).into())
+        }
     }
 }

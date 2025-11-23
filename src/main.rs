@@ -12,7 +12,7 @@ use tokio;
 
 use config::{AppVMConfig, SharedFolder};
 use display_bridge::DisplayBridge;
-use provisioner::AppVMProvisioner;
+use provisioner::{AppVMProvisioner, detect_usb_device};
 use xpra_manager::XpraManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,6 +132,20 @@ enum Commands {
     Apps {
         name: String,
     },
+    /// Attach a USB device to a running VM
+    UsbAttach {
+        /// VM name
+        name: String,
+        /// USB device in vendor:product format (e.g., "046d:c52b")
+        device: String,
+    },
+    /// Detach a USB device from a running VM
+    UsbDetach {
+        /// VM name
+        name: String,
+        /// USB device in vendor:product format (e.g., "046d:c52b")
+        device: String,
+    },
 }
 
 fn get_display_bridge(
@@ -196,6 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::GenerateShortcuts { name } => generate_shortcuts(name).await?,
         Commands::Launch { name, app } => launch_app(name, app).await?,
         Commands::Apps { name } => list_apps(name).await?,
+        Commands::UsbAttach { name, device } => usb_attach(name, device).await?,
+        Commands::UsbDetach { name, device } => usb_detach(name, device).await?,
     }
     Ok(())
 }
@@ -612,5 +628,64 @@ async fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
             println!("   - {}", app);
         }
     }
+    Ok(())
+}
+
+async fn usb_attach(name: String, device: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔌 Attaching USB device to VM: {}", name);
+
+    // Check VM is running
+    if get_vm_status(&name) != "running" {
+        eprintln!(
+            "❌ VM is not running. Start it with: vm-provisioner start {}",
+            name
+        );
+        std::process::exit(1);
+    }
+
+    // Detect USB device
+    let usb_device = detect_usb_device(&device)?;
+    println!("   Found: {} ({}:{})", usb_device.description, usb_device.vendor_id, usb_device.product_id);
+
+    // Load config to create provisioner
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
+    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let provisioner = AppVMProvisioner::new(config);
+
+    // Attach the device
+    provisioner.attach_usb_device(&usb_device)?;
+    Ok(())
+}
+
+async fn usb_detach(name: String, device: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔌 Detaching USB device from VM: {}", name);
+
+    // Check VM is running
+    if get_vm_status(&name) != "running" {
+        eprintln!(
+            "❌ VM is not running. Cannot detach device from stopped VM."
+        );
+        std::process::exit(1);
+    }
+
+    // Detect USB device
+    let usb_device = detect_usb_device(&device)?;
+    println!("   Found: {} ({}:{})", usb_device.description, usb_device.vendor_id, usb_device.product_id);
+
+    // Load config to create provisioner
+    let config_file = format!(
+        "{}/.config/vm-provisioner/{}.toml",
+        std::env::var("HOME")?,
+        name
+    );
+    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let provisioner = AppVMProvisioner::new(config);
+
+    // Detach the device
+    provisioner.detach_usb_device(&usb_device)?;
     Ok(())
 }

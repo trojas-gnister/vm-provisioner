@@ -262,7 +262,7 @@ impl DisplayBridge for XpraManager {
                     "--microphone=disabled"
                 };
                 format!(
-                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled {mic} --start-child=\"{cmd}\" --exit-with-children",
+                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled {mic} --min-quality=80 --start-child=\"{cmd}\" --exit-with-children",
                     ip = vm_ip,
                     ssh = ssh_cmd,
                     mic = microphone_flag,
@@ -454,6 +454,30 @@ APPS_SCRIPT_EOF
 chmod +x /home/user/start-apps.sh
 chown user:user /home/user/start-apps.sh
 
+# Create wrapper script that starts Xvfb and Selkies together
+cat > /home/user/selkies-wrapper.sh << 'WRAPPER_EOF'
+#!/bin/bash
+# Start Xvfb in background with max resolution and RANDR for dynamic resizing
+/usr/bin/Xvfb :100 -screen 0 3840x2160x24 +extension RANDR &
+XVFB_PID=$!
+sleep 2
+
+# Start apps in background
+/home/user/start-apps.sh &
+
+# Start Selkies (foreground) with resize support
+exec /opt/selkies-gstreamer/selkies-gstreamer-run \
+    --addr=0.0.0.0 \
+    --port={port} \
+    --enable_resize=true \
+    --enable_clipboard=true \
+    --framerate=60 \
+    --video_bitrate=8000 \
+    --audio_bitrate=128000
+WRAPPER_EOF
+chmod +x /home/user/selkies-wrapper.sh
+chown user:user /home/user/selkies-wrapper.sh
+
 # Create systemd service for Selkies-GStreamer
 cat > /etc/systemd/system/selkies-web.service << 'SELKIES_SERVICE_EOF'
 [Unit]
@@ -470,23 +494,7 @@ Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=SELKIES_ENCODER=x264enc
 Environment=SELKIES_BASIC_AUTH_USER=user
 Environment=SELKIES_BASIC_AUTH_PASSWORD={password}
-
-# Start Xvfb virtual display
-ExecStartPre=/usr/bin/Xvfb :100 -screen 0 1920x1080x24
-
-# Start applications after display is ready
-ExecStartPost=/bin/bash -c 'sleep 3 && /home/user/start-apps.sh'
-
-# Start Selkies-GStreamer
-ExecStart=/opt/selkies-gstreamer/selkies-gstreamer-run \
-    --addr=0.0.0.0 \
-    --port={port} \
-    --enable_resize=true \
-    --enable_clipboard=true \
-    --framerate=60 \
-    --video_bitrate=8000 \
-    --audio_bitrate=128000
-
+ExecStart=/home/user/selkies-wrapper.sh
 Restart=on-failure
 RestartSec=5
 
