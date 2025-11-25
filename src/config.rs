@@ -83,6 +83,7 @@ pub struct AppVMConfig {
     pub enable_usb_passthrough: bool,
     pub enable_auto_login: bool,
     pub headless: bool, // CLI-only mode, no GUI
+    pub grant_device_access: bool, // Grant flatpak apps access to all devices
 
     // PCI passthrough
     pub pci_devices: Vec<PciDevice>,
@@ -144,6 +145,7 @@ impl AppVMConfig {
         usb_hotplug: bool,
         shared_folders: Vec<SharedFolder>,
         network_bridge: Option<String>,
+        grant_device_access: bool,
     ) -> Self {
         // Default system packages - different for headless vs GUI
         let mut default_system_packages = if headless {
@@ -186,6 +188,7 @@ impl AppVMConfig {
             enable_usb_passthrough: !usb_devices.is_empty(),
             enable_auto_login: !headless,
             headless,
+            grant_device_access,
 
             pci_devices,
             pci_hotplug,

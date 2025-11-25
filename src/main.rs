@@ -102,6 +102,9 @@ enum Commands {
         /// Use bridged networking (VM gets LAN IP). Requires bridge interface to exist.
         #[arg(long)]
         network_bridge: Option<String>,
+        /// Grant flatpak apps access to all devices (webcams, audio, etc.)
+        #[arg(long)]
+        grant_device_access: bool,
     },
     Start {
         name: String,
@@ -174,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             share,
             share_readonly,
             network_bridge,
+            grant_device_access,
         } => {
             create_vm(
                 name,
@@ -193,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 share,
                 share_readonly,
                 network_bridge,
+                grant_device_access,
             )
             .await?;
         }
@@ -229,6 +234,7 @@ async fn create_vm(
     share_paths: Vec<String>,
     share_readonly: bool,
     network_bridge: Option<String>,
+    grant_device_access: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
@@ -313,6 +319,7 @@ async fn create_vm(
             usb_hotplug,
             shared_folders,
             network_bridge,
+            grant_device_access,
         )
     };
 

@@ -403,6 +403,17 @@ flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flat
                 config.push_str(&format!("flatpak install -y flathub {}\n", package));
             }
 
+            // Grant device permissions if requested
+            if self.config.grant_device_access {
+                config.push_str("\n# Grant device access to Flatpak apps\n");
+                for package in &self.config.flatpak_packages {
+                    config.push_str(&format!(
+                        "flatpak override --user --device=all {}\n",
+                        package
+                    ));
+                }
+            }
+
             config.push_str("\n# Verify installations\nflatpak list\n");
             config
         } else {
@@ -453,7 +464,7 @@ keyboard us
 timezone UTC
 network --bootproto=dhcp --device=link --activate
 rootpw --lock
-user --name=user --groups=wheel --password={user_password} --plaintext
+user --name=user --groups=wheel,video,audio,render,input --password={user_password} --plaintext
 
 # Disk configuration
 autopart --type=plain
@@ -505,6 +516,9 @@ echo "{vm_name}" > /etc/hostname
 echo ""
 echo "=== POST-INSTALL SCRIPT COMPLETED ==="
 echo "Check logs at /var/log/kickstart-post.log and /var/log/kickstart-post-detailed.log"
+
+# Ensure all home directory files are owned by user
+chown -R user:user /home/user
 
 # Final cleanup
 dnf clean all
