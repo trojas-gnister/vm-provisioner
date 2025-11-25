@@ -87,9 +87,6 @@ enum Commands {
         /// Enable web-based streaming on this port (Selkies-GStreamer WebRTC)
         #[arg(long)]
         web_port: Option<u16>,
-        /// Enable microphone input from host to VM
-        #[arg(long)]
-        microphone: bool,
         /// USB device passthrough (format: "vendor:product" e.g. "046d:c52b")
         #[arg(long, action = clap::ArgAction::Append)]
         usb: Vec<String>,
@@ -172,7 +169,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pci,
             pci_hotplug,
             web_port,
-            microphone,
             usb,
             usb_hotplug,
             share,
@@ -192,7 +188,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pci,
                 pci_hotplug,
                 web_port,
-                microphone,
                 usb,
                 usb_hotplug,
                 share,
@@ -229,7 +224,6 @@ async fn create_vm(
     pci_addresses: Vec<String>,
     pci_hotplug: bool,
     web_port: Option<u16>,
-    enable_microphone: bool,
     usb_addresses: Vec<String>,
     usb_hotplug: bool,
     share_paths: Vec<String>,
@@ -315,7 +309,6 @@ async fn create_vm(
             pci_devices,
             pci_hotplug,
             web_port,
-            enable_microphone,
             usb_devices,
             usb_hotplug,
             shared_folders,
@@ -341,9 +334,6 @@ async fn create_vm(
     println!("   Memory: {} MB", config.memory_mb);
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
-    if config.enable_microphone {
-        println!("   Microphone: enabled");
-    }
     if !config.usb_devices.is_empty() {
         println!("   USB Devices: {} device(s){}",
             config.usb_devices.len(),
@@ -481,6 +471,26 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
 
     let bridge = get_display_bridge(&config)?;
     bridge.remove_desktop_files()?;
+
+    // Clean up SSH known_hosts entry for this VM
+    let ip_output = std::process::Command::new("virsh")
+        .args(&["-c", "qemu:///system", "domifaddr", &name])
+        .output();
+
+    if let Ok(output) = ip_output {
+        let ip_str = String::from_utf8_lossy(&output.stdout);
+        if let Some(ip_line) = ip_str.lines().find(|l| l.contains("ipv4")) {
+            if let Some(ip) = ip_line.split_whitespace().nth(3) {
+                let ip = ip.trim_end_matches('/').split('/').next().unwrap_or("");
+                if !ip.is_empty() {
+                    println!("🔑 Cleaning up SSH key for {}", ip);
+                    let _ = std::process::Command::new("ssh-keygen")
+                        .args(&["-R", ip])
+                        .output();
+                }
+            }
+        }
+    }
 
     AppVMProvisioner::new(config).destroy_vm()?;
     std::fs::remove_file(&config_file)?;

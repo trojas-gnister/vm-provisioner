@@ -138,7 +138,7 @@ Enable IOMMU in firmware (`intel_iommu=on` or `amd_iommu=on`), check groupings w
 Use `--usb <vendor:product>` (repeatable) to pass USB devices to the VM. Find device IDs with `lsusb`.
 
 ```bash
-# Pass a webcam and USB microphone to the VM
+# Pass a webcam and audio device to the VM
 vm-provisioner create \
   --flatpak org.mozilla.firefox \
   --usb 046d:c52b \
@@ -153,20 +153,7 @@ vm-provisioner create \
   --name usb-hotplug-vm
 ```
 
-USB devices are specified in `vendor:product` format (e.g., `046d:c52b` for a Logitech Unifying Receiver).
-
-### Microphone support
-
-Enable microphone input from host to VM with `--microphone`:
-
-```bash
-vm-provisioner create \
-  --flatpak org.mozilla.firefox \
-  --microphone \
-  --name voice-vm
-```
-
-This enables the xpra `--microphone=yes` flag, forwarding audio input over SSH alongside the existing audio output.
+USB devices are specified in `vendor:product` format (e.g., `046d:c52b` for a Logitech Unifying Receiver). For audio input, pass through your USB headset or audio device directly to the VM.
 
 ### Shared storage (virtiofs)
 
@@ -272,7 +259,6 @@ web_port = 8080             # Optional: port for Selkies-GStreamer WebRTC web ac
 graphics_backend = "VirtioGpu"
 enable_clipboard = true
 enable_audio = true
-enable_microphone = false
 network_mode = "Nat"
 
 [[shared_folders]]

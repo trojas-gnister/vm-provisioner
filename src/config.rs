@@ -80,7 +80,6 @@ pub struct AppVMConfig {
     pub web_port: Option<u16>, // Port for Selkies-GStreamer WebRTC web access (None = disabled)
     pub enable_clipboard: bool,
     pub enable_audio: bool,
-    pub enable_microphone: bool,
     pub enable_usb_passthrough: bool,
     pub enable_auto_login: bool,
     pub headless: bool, // CLI-only mode, no GUI
@@ -141,7 +140,6 @@ impl AppVMConfig {
         pci_devices: Vec<PciDevice>,
         pci_hotplug: bool,
         web_port: Option<u16>,
-        enable_microphone: bool,
         usb_devices: Vec<UsbDevice>,
         usb_hotplug: bool,
         shared_folders: Vec<SharedFolder>,
@@ -185,7 +183,6 @@ impl AppVMConfig {
             web_port,
             enable_clipboard: !headless,
             enable_audio: !headless,
-            enable_microphone: enable_microphone && !headless, // Only enable for GUI VMs
             enable_usb_passthrough: !usb_devices.is_empty(),
             enable_auto_login: !headless,
             headless,

@@ -380,7 +380,7 @@ impl AppVMProvisioner {
 
         let mut base_packages = display_bridge.guest_packages();
         base_packages.extend(self.config.system_packages.clone());
-        let packages = base_packages.join("\n");
+        let packages = base_packages.join(" ");
 
         // Get SSH public key
         let ssh_public_key = XpraManager::get_ssh_public_key()?;
@@ -464,20 +464,23 @@ bootloader --location=mbr
 selinux --permissive
 firewall --enabled
 
-# Package selection
+# Package selection (minimal - additional packages installed in %post)
 %packages --ignoremissing
 @core
 @base-x
-{packages}
 %end
 
-# Post-installation script  
+# Post-installation script
 %post --log=/var/log/kickstart-post.log
 
 # Enable comprehensive logging for debugging
 set -x
 exec > >(tee -a /var/log/kickstart-post-detailed.log) 2>&1
 echo "=== Post-installation script started at $(date) ==="
+
+# Install additional packages from full repos (not available in Server ISO)
+echo "=== Installing additional packages ==="
+dnf install -y {packages}
 
 # Install flatpak packages if specified
 {flatpak_config}

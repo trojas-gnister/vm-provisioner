@@ -153,6 +153,8 @@ impl XpraManager {
         let skip_patterns = [
             "xpra",
             "xorg-x11-server-Xvfb",
+            "openbox",
+            "xterm",
             "pulseaudio-libs",
             "git",
             "openssh-server",
@@ -203,7 +205,27 @@ impl XpraManager {
             package.to_string()
         };
 
-        let exec_line = self.generate_exec_command(&exec_command);
+        let xpra_command = self.generate_exec_command(&exec_command);
+        let vm_ip = self.resolve_vm_ip().unwrap_or_else(|_| "UNKNOWN".to_string());
+
+        // Create a wrapper script instead of embedding complex command in .desktop file
+        let wrapper_script_path = format!("{}/{}-{}-launch.sh", desktop_dir, self.config.name, app_name.to_lowercase());
+        let wrapper_content = format!(
+            "#!/bin/bash\n# Auto-generated launch script for {} in {}\nssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \"xpra seamless\" 2>/dev/null || true'\n{}",
+            app_name, self.config.name, vm_ip, xpra_command
+        );
+        fs::write(&wrapper_script_path, wrapper_content)?;
+
+        // Make script executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&wrapper_script_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&wrapper_script_path, perms)?;
+        }
+
+        let exec_line = wrapper_script_path.clone();
         let icon = app_name.to_lowercase();
         let categories = self.guess_categories(package);
 
@@ -256,16 +278,10 @@ impl DisplayBridge for XpraManager {
         match self.resolve_vm_ip() {
             Ok(vm_ip) => {
                 let ssh_cmd = self.build_ssh_invocation(&vm_ip);
-                let microphone_flag = if self.config.enable_microphone {
-                    "--microphone=yes"
-                } else {
-                    "--microphone=disabled"
-                };
                 format!(
-                    "xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled {mic} --min-quality=80 --start-child=\"{cmd}\" --exit-with-children",
+                    "env GDK_BACKEND=x11 xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --min-quality=80 --modal-windows=yes --start-child=\"{cmd}\" --exit-with-children",
                     ip = vm_ip,
                     ssh = ssh_cmd,
-                    mic = microphone_flag,
                     cmd = app_command
                 )
             }
@@ -285,6 +301,16 @@ impl DisplayBridge for XpraManager {
             "🚀 Launching {} in VM {} via Xpra",
             app_command, self.config.name
         );
+
+        // Kill any stale xpra sessions before launching
+        let vm_ip = self.resolve_vm_ip()?;
+        println!("   Cleaning up stale xpra sessions...");
+        let cleanup_cmd = format!(
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \\\"xpra seamless\\\" 2>/dev/null || true'",
+            vm_ip
+        );
+        let _ = Command::new("bash").arg("-c").arg(&cleanup_cmd).output();
+
         println!("   Command: {}", exec_command);
 
         if exec_command.trim().is_empty() {
@@ -362,6 +388,8 @@ impl DisplayBridge for XpraManager {
         vec![
             "xpra".to_string(),
             "xorg-x11-server-Xvfb".to_string(),
+            "openbox".to_string(),
+            "xterm".to_string(),
             "pulseaudio-libs".to_string(),
             "openssh-server".to_string(),
             "git".to_string(),
@@ -407,9 +435,57 @@ echo "Virtiofs shared folders will be available after reboot."
 
         // Build Selkies-GStreamer web streaming configuration if enabled
         let web_streaming_config = if let Some(port) = self.config.web_port {
-            // Build flatpak launch commands
-            let flatpak_commands: String = self.config.flatpak_packages.iter()
-                .map(|pkg| format!("flatpak run {} &", pkg))
+            // Build systemd user services for each flatpak app
+            let systemd_services: String = self.config.flatpak_packages.iter()
+                .map(|pkg| {
+                    let app_name = pkg.split('.').last().unwrap_or(pkg).replace("-", "_");
+                    format!(
+                        r#"cat > /home/user/.config/systemd/user/{app_name}.service << 'SERVICE_EOF'
+[Unit]
+Description={pkg} Auto-Restart
+After=default.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:100
+ExecStart=/usr/bin/flatpak run {pkg}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+SERVICE_EOF
+"#,
+                        app_name = app_name,
+                        pkg = pkg
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Build commands to enable and start services
+            let systemd_enable_commands: String = self.config.flatpak_packages.iter()
+                .map(|pkg| {
+                    let app_name = pkg.split('.').last().unwrap_or(pkg).replace("-", "_");
+                    format!("runuser -u user -- systemctl --user daemon-reload\nrunuser -u user -- systemctl --user enable {}.service\nrunuser -u user -- systemctl --user start {}.service", app_name, app_name)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Build Openbox menu items for each flatpak app
+            let menu_items: String = self.config.flatpak_packages.iter()
+                .map(|pkg| {
+                    // Extract app name from flatpak ID (e.g., "org.torproject.torbrowser-launcher" -> "torbrowser-launcher")
+                    let app_name = pkg.split('.').last().unwrap_or(pkg);
+                    format!(
+                        r#"    <item label="{}">
+      <action name="Execute">
+        <execute>sh -c 'DISPLAY=:100 nohup flatpak run {} &amp;>/dev/null &amp;'</execute>
+      </action>
+    </item>"#,
+                        app_name, pkg
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -444,26 +520,35 @@ firewall-offline-cmd --add-port={port}/tcp || firewall-cmd --permanent --add-por
 firewall-offline-cmd --add-port=49152-65535/udp || firewall-cmd --permanent --add-port=49152-65535/udp || true
 firewall-offline-cmd --add-port=49152-65535/tcp || firewall-cmd --permanent --add-port=49152-65535/tcp || true
 
-# Create startup script for applications
-cat > /home/user/start-apps.sh << 'APPS_SCRIPT_EOF'
-#!/bin/bash
-# Wait for display to be ready
-sleep 2
-{flatpak_commands}
-APPS_SCRIPT_EOF
-chmod +x /home/user/start-apps.sh
-chown user:user /home/user/start-apps.sh
+# Create systemd user services for each flatpak app with auto-restart
+mkdir -p /home/user/.config/systemd/user
+
+# Fix ownership of .config directory (created as root during kickstart)
+chown -R user:user /home/user/.config
+
+{systemd_services}
+
+# Enable user lingering so services start on boot even without login
+loginctl enable-linger user || true
+
+# Enable and start all app services
+{systemd_enable_commands}
 
 # Create wrapper script that starts Xvfb and Selkies together
 cat > /home/user/selkies-wrapper.sh << 'WRAPPER_EOF'
 #!/bin/bash
-# Start Xvfb in background with max resolution and RANDR for dynamic resizing
-/usr/bin/Xvfb :100 -screen 0 3840x2160x24 +extension RANDR &
+# Start Xvfb in background with large resolution for dynamic resizing
+/usr/bin/Xvfb :100 -screen 0 8192x4096x24 +extension RANDR &
 XVFB_PID=$!
 sleep 2
 
-# Start apps in background
-/home/user/start-apps.sh &
+# Start Openbox window manager (auto-maximizes windows)
+export DISPLAY=:100
+openbox &
+sleep 1
+
+# Note: Apps are managed by systemd user services, not this script
+# They start automatically via 'loginctl enable-linger' and WantedBy=default.target
 
 # Start Selkies (foreground) with resize support
 exec /opt/selkies-gstreamer/selkies-gstreamer-run \
@@ -477,6 +562,48 @@ exec /opt/selkies-gstreamer/selkies-gstreamer-run \
 WRAPPER_EOF
 chmod +x /home/user/selkies-wrapper.sh
 chown user:user /home/user/selkies-wrapper.sh
+
+# Create Openbox config directory and configuration
+mkdir -p /home/user/.config/openbox
+
+# Openbox rc.xml with auto-maximize and right-click menu binding
+cat > /home/user/.config/openbox/rc.xml << 'OPENBOX_RC_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="*">
+      <maximized>yes</maximized>
+    </application>
+  </applications>
+  <mouse>
+    <context name="Root">
+      <mousebind button="Right" action="Press">
+        <action name="ShowMenu">
+          <menu>root-menu</menu>
+        </action>
+      </mousebind>
+    </context>
+  </mouse>
+</openbox_config>
+OPENBOX_RC_EOF
+
+# Openbox menu.xml with terminal option
+cat > /home/user/.config/openbox/menu.xml << 'OPENBOX_MENU_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/rc">
+  <menu id="root-menu" label="Applications">
+{menu_items}
+    <separator />
+    <item label="Terminal">
+      <action name="Execute">
+        <execute>xterm</execute>
+      </action>
+    </item>
+  </menu>
+</openbox_menu>
+OPENBOX_MENU_EOF
+
+chown -R user:user /home/user/.config/openbox
 
 # Create systemd service for Selkies-GStreamer
 cat > /etc/systemd/system/selkies-web.service << 'SELKIES_SERVICE_EOF'
@@ -515,7 +642,9 @@ echo "Login: user / {password}"
 "#,
                 port = port,
                 password = self.config.user_password,
-                flatpak_commands = flatpak_commands
+                systemd_services = systemd_services,
+                systemd_enable_commands = systemd_enable_commands,
+                menu_items = menu_items
             )
         } else {
             String::new()
@@ -529,10 +658,11 @@ echo "=== Configuring audio for web streaming mode (local PipeWire) ==="
 # PipeWire/PulseAudio services remain enabled for Selkies to capture audio
 # Selkies will encode and stream audio via WebRTC to the browser"#.to_string()
         } else {
-            // Native xpra (SSH): disable local audio, use SSH-forwarded socket
-            r#"# Disable PipeWire/PulseAudio auto-start (use SSH-forwarded audio instead)
+            // Native xpra (SSH): configure one-way PulseAudio tunnel for playback only
+            r#"# Configure one-way PulseAudio tunnel for playback only
+echo "=== Configuring audio for native xpra mode (one-way SSH tunnel) ==="
 cat > /usr/lib/systemd/user-preset/99-disable-audio.preset << 'AUDIO_PRESET_EOF'
-# Disable local audio services - using SSH socket forwarding instead
+# Disable local audio services - using SSH-forwarded audio instead
 disable pipewire.service
 disable pipewire.socket
 disable pipewire-pulse.service
@@ -540,13 +670,27 @@ disable pipewire-pulse.socket
 disable wireplumber.service
 AUDIO_PRESET_EOF
 
-# Set PULSE_SERVER for explicit socket discovery
-cat >> /home/user/.bash_profile << 'PULSE_ENV_EOF'
+# Configure PulseAudio to use SSH tunnel for playback only
+mkdir -p /home/user/.config/pulse
+cat > /home/user/.config/pulse/default.pa << 'PULSE_CONFIG_EOF'
+# Include system defaults
+.include /etc/pulse/default.pa
 
-# Use SSH-forwarded PulseAudio socket
-export PULSE_SERVER=unix:/run/user/1000/pulse/native
-PULSE_ENV_EOF
-chown user:user /home/user/.bash_profile"#.to_string()
+# Create a tunnel sink that sends audio to host via SSH socket
+# This is OUTPUT ONLY - VM apps play audio through this to host speakers
+# The SSH tunnel at /run/user/1000/pulse/native is forwarded by xpra
+load-module module-tunnel-sink-new server=unix:/run/user/1000/pulse/native sink_name=ssh_output
+
+# Set the SSH tunnel as the default output device
+set-default-sink ssh_output
+
+# IMPORTANT: Do NOT create a tunnel source (module-tunnel-source-new)
+# This is playback only - no audio input through SSH tunnel
+PULSE_CONFIG_EOF
+
+chown -R user:user /home/user/.config/pulse
+echo "Audio configured: VM output -> SSH tunnel -> host speakers (one-way)"
+"#.to_string()
         };
 
         format!(
