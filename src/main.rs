@@ -1,18 +1,21 @@
 mod config;
 mod display_bridge;
+mod error;
 mod provisioner;
 mod xpra_manager;
 
 use clap::{Parser, Subcommand};
 use dialoguer::Confirm;
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use tokio;
 
 use config::{AppVMConfig, SharedFolder};
 use display_bridge::DisplayBridge;
-use provisioner::{AppVMProvisioner, detect_usb_device};
+use error::{ConfigError, NetworkError, Result};
+use provisioner::{detect_usb_device, AppVMProvisioner, Installation, Lifecycle};
+use provisioner::usb::UsbPassthrough;
 use xpra_manager::XpraManager;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,7 +30,7 @@ impl VMPasswords {
         }
     }
 
-    fn load_or_create(config_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    fn load_or_create(config_dir: &str) -> Result<Self> {
         let password_file = format!("{}/vm-passwords.toml", config_dir);
 
         if Path::new(&password_file).exists() {
@@ -38,11 +41,11 @@ impl VMPasswords {
         }
     }
 
-    fn save(&self, config_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn save(&self, config_dir: &str) -> Result<()> {
         std::fs::create_dir_all(config_dir)?;
         let password_file = format!("{}/vm-passwords.toml", config_dir);
         std::fs::write(&password_file, toml::to_string_pretty(self)?)?;
-        println!("💾 Passwords saved to: {}", password_file);
+        info!("Passwords saved to: {}", password_file);
         Ok(())
     }
 
@@ -105,6 +108,9 @@ enum Commands {
         /// Grant flatpak apps access to all devices (webcams, audio, etc.)
         #[arg(long)]
         grant_device_access: bool,
+        /// Disable networking entirely (uses vsock for display forwarding)
+        #[arg(long)]
+        no_network: bool,
     },
     Start {
         name: String,
@@ -148,15 +154,30 @@ enum Commands {
     },
 }
 
-fn get_display_bridge(
-    config: &AppVMConfig,
-) -> Result<Box<dyn DisplayBridge>, Box<dyn std::error::Error>> {
+fn get_display_bridge(config: &AppVMConfig) -> Result<Box<dyn DisplayBridge>> {
     // Xpra is the only supported display protocol
     Ok(Box::new(XpraManager::new(config)?))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn init_logger() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            use std::io::Write;
+            let level_icon = match record.level() {
+                log::Level::Error => "❌",
+                log::Level::Warn => "⚠️ ",
+                log::Level::Info => "ℹ️ ",
+                log::Level::Debug => "🔍",
+                log::Level::Trace => "📋",
+            };
+            writeln!(buf, "{} {}", level_icon, record.args())
+        })
+        .init();
+}
+
+fn main() -> Result<()> {
+    init_logger();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Create {
@@ -178,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             share_readonly,
             network_bridge,
             grant_device_access,
+            no_network,
         } => {
             create_vm(
                 name,
@@ -198,25 +220,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 share_readonly,
                 network_bridge,
                 grant_device_access,
-            )
-            .await?;
+                no_network,
+            )?;
         }
-        Commands::Start { name } => start_vm(name).await?,
-        Commands::Stop { name } => stop_vm(name).await?,
+        Commands::Start { name } => start_vm(name)?,
+        Commands::Stop { name } => stop_vm(name)?,
         Commands::List => list_vms()?,
         Commands::Passwords => show_passwords()?,
-        Commands::Destroy { name, yes } => destroy_vm(name, yes).await?,
+        Commands::Destroy { name, yes } => destroy_vm(name, yes)?,
         Commands::Console { name } => connect_console(name)?,
-        Commands::GenerateShortcuts { name } => generate_shortcuts(name).await?,
-        Commands::Launch { name, app } => launch_app(name, app).await?,
-        Commands::Apps { name } => list_apps(name).await?,
-        Commands::UsbAttach { name, device } => usb_attach(name, device).await?,
-        Commands::UsbDetach { name, device } => usb_detach(name, device).await?,
+        Commands::GenerateShortcuts { name } => generate_shortcuts(name)?,
+        Commands::Launch { name, app } => launch_app(name, app)?,
+        Commands::Apps { name } => list_apps(name)?,
+        Commands::UsbAttach { name, device } => usb_attach(name, device)?,
+        Commands::UsbDetach { name, device } => usb_detach(name, device)?,
     }
     Ok(())
 }
 
-async fn create_vm(
+fn create_vm(
     name: Option<String>,
     system_packages: Vec<String>,
     flatpak_packages: Vec<String>,
@@ -235,24 +257,53 @@ async fn create_vm(
     share_readonly: bool,
     network_bridge: Option<String>,
     grant_device_access: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 VM Provisioner - Dynamic Package Installer");
+    no_network: bool,
+) -> Result<()> {
+    info!("VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
+
+    // Validate --no-network and --web-port are mutually exclusive
+    if no_network && web_port.is_some() {
+        return Err(NetworkError::ConflictingOptions(
+            "Cannot use --no-network with --web-port. Selkies web streaming requires networking."
+                .to_string(),
+        )
+        .into());
+    }
+
+    // Validate --no-network and --network-bridge are mutually exclusive
+    if no_network && network_bridge.is_some() {
+        return Err(NetworkError::ConflictingOptions(
+            "Cannot use --no-network with --network-bridge. These options are mutually exclusive."
+                .to_string(),
+        )
+        .into());
+    }
+
+    if no_network {
+        info!("Network-disabled mode: VM will use vsock for display forwarding");
+    }
 
     // Validate bridge interface exists if specified
     if let Some(ref bridge) = network_bridge {
         let bridge_path = format!("/sys/class/net/{}", bridge);
         if !Path::new(&bridge_path).exists() {
-            eprintln!("\n❌ Error: Bridge interface '{}' not found.", bridge);
-            eprintln!("\nTo create a bridge (one-time setup):");
-            eprintln!("  1. Find your network interface: nmcli device status");
-            eprintln!("  2. Create bridge:");
-            eprintln!("     sudo nmcli connection add type bridge ifname {} con-name {}", bridge, bridge);
-            eprintln!("     sudo nmcli connection add type bridge-slave ifname <your-interface> master {}", bridge);
-            eprintln!("     sudo nmcli connection up {}", bridge);
-            return Err(format!("Bridge interface '{}' does not exist", bridge).into());
+            error!("Bridge interface '{}' not found.", bridge);
+            println!("\nTo create a bridge (one-time setup):");
+            println!("  1. Find your network interface: nmcli device status");
+            println!("  2. Create bridge:");
+            println!(
+                "     sudo nmcli connection add type bridge ifname {} con-name {}",
+                bridge, bridge
+            );
+            println!(
+                "     sudo nmcli connection add type bridge-slave ifname <your-interface> master {}",
+                bridge
+            );
+            println!("     sudo nmcli connection up {}", bridge);
+            return Err(NetworkError::BridgeNotFound(bridge.clone()).into());
         }
-        println!("\n🌐 Using bridged networking via '{}'", bridge);
+        info!("Using bridged networking via '{}'", bridge);
     }
 
     let config = if let Some(path) = config_path {
@@ -275,31 +326,31 @@ async fn create_vm(
         });
 
         let pci_devices = if !pci_addresses.is_empty() {
-            println!("\n🔍 Detecting PCI devices...");
+            info!("Detecting PCI devices...");
             pci_addresses
                 .iter()
                 .map(|addr| provisioner::detect_pci_device(addr))
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
         };
 
         let usb_devices = if !usb_addresses.is_empty() {
-            println!("\n🔍 Detecting USB devices...");
+            info!("Detecting USB devices...");
             usb_addresses
                 .iter()
                 .map(|addr| provisioner::detect_usb_device(addr))
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
         };
 
         let shared_folders = if !share_paths.is_empty() {
-            println!("\n📁 Configuring shared folders...");
+            info!("Configuring shared folders...");
             share_paths
                 .iter()
                 .map(|path| parse_share_path(path, share_readonly))
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
         };
@@ -320,6 +371,7 @@ async fn create_vm(
             shared_folders,
             network_bridge,
             grant_device_access,
+            no_network,
         )
     };
 
@@ -334,7 +386,10 @@ async fn create_vm(
         }
     );
     if let Some(port) = config.web_port {
-        println!("   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)", port);
+        println!(
+            "   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)",
+            port
+        );
     }
     println!("   System Packages: {:?}", config.system_packages);
     println!("   Flatpak Packages: {:?}", config.flatpak_packages);
@@ -342,23 +397,42 @@ async fn create_vm(
     println!("   vCPUs: {}", config.vcpus);
     println!("   Disk: {} GB", config.disk_size_gb);
     if !config.usb_devices.is_empty() {
-        println!("   USB Devices: {} device(s){}",
+        println!(
+            "   USB Devices: {} device(s){}",
             config.usb_devices.len(),
-            if config.usb_hotplug { " (hot-plug)" } else { " (permanent)" }
+            if config.usb_hotplug {
+                " (hot-plug)"
+            } else {
+                " (permanent)"
+            }
         );
         for usb in &config.usb_devices {
-            println!("     - {} ({}:{})", usb.description, usb.vendor_id, usb.product_id);
+            println!(
+                "     - {} ({}:{})",
+                usb.description, usb.vendor_id, usb.product_id
+            );
         }
     }
     if !config.shared_folders.is_empty() {
         println!("   Shared Folders: {} folder(s)", config.shared_folders.len());
         for folder in &config.shared_folders {
-            println!("     - {} -> {} ({})",
+            println!(
+                "     - {} -> {} ({})",
                 folder.host_path,
                 folder.guest_path,
-                if folder.readonly { "read-only" } else { "read-write" }
+                if folder.readonly {
+                    "read-only"
+                } else {
+                    "read-write"
+                }
             );
         }
+    }
+    match &config.network_mode {
+        config::NetworkMode::None => println!("   Network: Disabled (vsock for display)"),
+        config::NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
+        config::NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
+        config::NetworkMode::VpnOnly => println!("   Network: VPN Only"),
     }
 
     if !skip_confirm
@@ -367,7 +441,7 @@ async fn create_vm(
             .default(true)
             .interact()?
     {
-        println!("❌ VM creation cancelled");
+        warn!("VM creation cancelled");
         return Ok(());
     }
 
@@ -375,25 +449,48 @@ async fn create_vm(
     std::fs::create_dir_all(&config_dir)?;
     let config_file = format!("{}/{}.toml", config_dir, config.name);
     std::fs::write(&config_file, toml::to_string_pretty(&config)?)?;
-    println!("💾 Configuration saved to: {}", config_file);
+    info!("Configuration saved to: {}", config_file);
 
     let mut passwords = VMPasswords::load_or_create(&config_dir)?;
     passwords.add_vm(&config.name, &config.user_password);
     passwords.save(&config_dir)?;
 
-    AppVMProvisioner::new(config.clone()).provision_vm().await?;
+    let mut config = config;
+    AppVMProvisioner::new(config.clone()).provision_vm()?;
+
+    // Retrieve and save vsock CID if enabled
+    if config.enable_vsock {
+        match provisioner::get_vsock_cid(&config.name) {
+            Ok(cid) => {
+                info!("Vsock CID assigned: {}", cid);
+                config.vsock_cid = Some(cid);
+                // Re-save config with CID
+                std::fs::write(&config_file, toml::to_string_pretty(&config)?)?;
+            }
+            Err(e) => {
+                warn!("Could not retrieve vsock CID: {}", e);
+                warn!(
+                    "Display forwarding may not work. Check 'virsh dumpxml {}'",
+                    config.name
+                );
+            }
+        }
+    }
 
     println!("\n✅ VM created successfully!");
     println!("   VM Name: {}", config.name);
     println!("   Username: user");
     println!("   Password: {}", config.user_password);
+    if config.enable_vsock {
+        println!("   Vsock CID: {}", config.vsock_cid.unwrap_or(0));
+    }
     println!("   Start with: vm-provisioner start {}", config.name);
 
     Ok(())
 }
 
-async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("▶️  Starting VM: {}", name);
+fn start_vm(name: String) -> Result<()> {
+    info!("Starting VM: {}", name);
     let config_file = format!(
         "{}/.config/vm-provisioner/{}.toml",
         std::env::var("HOME")?,
@@ -404,10 +501,7 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     AppVMProvisioner::new(config.clone()).start_vm()?;
 
     if config.headless {
-        println!(
-            "\n💡 Headless VM - connect via console: virsh console {}",
-            name
-        );
+        println!("\n💡 Headless VM - connect via console: virsh console {}", name);
     } else {
         println!("\n🪟 Seamless window integration enabled via Xpra");
         println!(
@@ -424,8 +518,8 @@ async fn start_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn stop_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("⏹️  Stopping VM: {}", name);
+fn stop_vm(name: String) -> Result<()> {
+    info!("Stopping VM: {}", name);
     let config_file = format!(
         "{}/.config/vm-provisioner/{}.toml",
         std::env::var("HOME")?,
@@ -433,11 +527,11 @@ async fn stop_vm(name: String) -> Result<(), Box<dyn std::error::Error>> {
     );
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
     AppVMProvisioner::new(config).stop_vm()?;
-    println!("✅ VM stopped");
+    info!("VM stopped");
     Ok(())
 }
 
-fn list_vms() -> Result<(), Box<dyn std::error::Error>> {
+fn list_vms() -> Result<()> {
     println!("📋 Available VMs:");
     let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
     if !Path::new(&config_dir).exists() {
@@ -455,7 +549,7 @@ fn list_vms() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn destroy_vm(name: String, skip_confirm: bool) -> Result<()> {
     if !skip_confirm
         && !Confirm::new()
             .with_prompt(format!(
@@ -465,7 +559,7 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
             .default(false)
             .interact()?
     {
-        println!("❌ Destruction cancelled");
+        warn!("Destruction cancelled");
         return Ok(());
     }
 
@@ -481,7 +575,7 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
 
     // Clean up SSH known_hosts entry for this VM
     let ip_output = std::process::Command::new("virsh")
-        .args(&["-c", "qemu:///system", "domifaddr", &name])
+        .args(["-c", "qemu:///system", "domifaddr", &name])
         .output();
 
     if let Ok(output) = ip_output {
@@ -490,9 +584,9 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
             if let Some(ip) = ip_line.split_whitespace().nth(3) {
                 let ip = ip.trim_end_matches('/').split('/').next().unwrap_or("");
                 if !ip.is_empty() {
-                    println!("🔑 Cleaning up SSH key for {}", ip);
+                    debug!("Cleaning up SSH key for {}", ip);
                     let _ = std::process::Command::new("ssh-keygen")
-                        .args(&["-R", ip])
+                        .args(["-R", ip])
                         .output();
                 }
             }
@@ -501,21 +595,21 @@ async fn destroy_vm(name: String, skip_confirm: bool) -> Result<(), Box<dyn std:
 
     AppVMProvisioner::new(config).destroy_vm()?;
     std::fs::remove_file(&config_file)?;
-    println!("✅ VM destroyed");
+    info!("VM destroyed");
     Ok(())
 }
 
-fn connect_console(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🖥️  Connecting to VM console: {}", name);
+fn connect_console(name: String) -> Result<()> {
+    info!("Connecting to VM console: {}", name);
     std::process::Command::new("virsh")
-        .args(&["-c", "qemu:///system", "console", &name])
+        .args(["-c", "qemu:///system", "console", &name])
         .status()?;
     Ok(())
 }
 
 fn get_vm_status(name: &str) -> String {
     match std::process::Command::new("virsh")
-        .args(&["-c", "qemu:///system", "domstate", name])
+        .args(["-c", "qemu:///system", "domstate", name])
         .output()
     {
         Ok(output) if output.status.success() => {
@@ -525,13 +619,14 @@ fn get_vm_status(name: &str) -> String {
     }
 }
 
-fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder, Box<dyn std::error::Error>> {
+fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
     let parts: Vec<&str> = path.split(':').collect();
     if parts.len() != 2 {
-        return Err(format!(
+        return Err(ConfigError::Invalid(format!(
             "Invalid share format '{}'. Expected format: '/host/path:/guest/path'",
             path
-        ).into());
+        ))
+        .into());
     }
 
     let host_path = parts[0];
@@ -539,10 +634,7 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder, Box<dyn 
 
     // Validate host path exists
     if !Path::new(host_path).exists() {
-        return Err(format!(
-            "Host path '{}' does not exist",
-            host_path
-        ).into());
+        return Err(ConfigError::Invalid(format!("Host path '{}' does not exist", host_path)).into());
     }
 
     // Generate a tag from guest path (replace / with _ and remove leading _)
@@ -553,7 +645,12 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder, Box<dyn 
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect::<String>();
 
-    println!("   {} -> {} ({})", host_path, guest_path, if readonly { "read-only" } else { "read-write" });
+    debug!(
+        "{} -> {} ({})",
+        host_path,
+        guest_path,
+        if readonly { "read-only" } else { "read-write" }
+    );
 
     Ok(SharedFolder {
         host_path: host_path.to_string(),
@@ -563,7 +660,7 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder, Box<dyn 
     })
 }
 
-fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {
+fn show_passwords() -> Result<()> {
     let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
     let passwords = VMPasswords::load_or_create(&config_dir)?;
     if passwords.vms.is_empty() {
@@ -577,8 +674,8 @@ fn show_passwords() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔗 Generating application shortcuts for VM: {}", name);
+fn generate_shortcuts(name: String) -> Result<()> {
+    info!("Generating application shortcuts for VM: {}", name);
     let config_file = format!(
         "{}/.config/vm-provisioner/{}.toml",
         std::env::var("HOME")?,
@@ -587,14 +684,14 @@ async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Erro
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
 
     if get_vm_status(&name) != "running" {
-        eprintln!(
-            "❌ VM is not running. Start it with: vm-provisioner start {}",
+        error!(
+            "VM is not running. Start it with: vm-provisioner start {}",
             name
         );
         std::process::exit(1);
     }
 
-    println!("⏳ Waiting for VM to be fully ready...");
+    debug!("Waiting for VM to be fully ready...");
     std::thread::sleep(std::time::Duration::from_secs(5));
 
     let bridge = get_display_bridge(&config)?;
@@ -604,8 +701,8 @@ async fn generate_shortcuts(name: String) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Launching application in VM: {}", name);
+fn launch_app(name: String, app: String) -> Result<()> {
+    info!("Launching application in VM: {}", name);
     let config_file = format!(
         "{}/.config/vm-provisioner/{}.toml",
         std::env::var("HOME")?,
@@ -614,8 +711,8 @@ async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error:
     let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
 
     if get_vm_status(&name) != "running" {
-        eprintln!(
-            "❌ VM is not running. Start it with: vm-provisioner start {}",
+        error!(
+            "VM is not running. Start it with: vm-provisioner start {}",
             name
         );
         std::process::exit(1);
@@ -626,7 +723,7 @@ async fn launch_app(name: String, app: String) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-async fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
+fn list_apps(name: String) -> Result<()> {
     println!("📱 Applications available in VM: {}", name);
     let config_file = format!(
         "{}/.config/vm-provisioner/{}.toml",
@@ -648,13 +745,13 @@ async fn list_apps(name: String) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn usb_attach(name: String, device: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔌 Attaching USB device to VM: {}", name);
+fn usb_attach(name: String, device: String) -> Result<()> {
+    info!("Attaching USB device to VM: {}", name);
 
     // Check VM is running
     if get_vm_status(&name) != "running" {
-        eprintln!(
-            "❌ VM is not running. Start it with: vm-provisioner start {}",
+        error!(
+            "VM is not running. Start it with: vm-provisioner start {}",
             name
         );
         std::process::exit(1);
@@ -662,7 +759,10 @@ async fn usb_attach(name: String, device: String) -> Result<(), Box<dyn std::err
 
     // Detect USB device
     let usb_device = detect_usb_device(&device)?;
-    println!("   Found: {} ({}:{})", usb_device.description, usb_device.vendor_id, usb_device.product_id);
+    debug!(
+        "Found: {} ({}:{})",
+        usb_device.description, usb_device.vendor_id, usb_device.product_id
+    );
 
     // Load config to create provisioner
     let config_file = format!(
@@ -678,20 +778,21 @@ async fn usb_attach(name: String, device: String) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-async fn usb_detach(name: String, device: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔌 Detaching USB device from VM: {}", name);
+fn usb_detach(name: String, device: String) -> Result<()> {
+    info!("Detaching USB device from VM: {}", name);
 
     // Check VM is running
     if get_vm_status(&name) != "running" {
-        eprintln!(
-            "❌ VM is not running. Cannot detach device from stopped VM."
-        );
+        error!("VM is not running. Cannot detach device from stopped VM.");
         std::process::exit(1);
     }
 
     // Detect USB device
     let usb_device = detect_usb_device(&device)?;
-    println!("   Found: {} ({}:{})", usb_device.description, usb_device.vendor_id, usb_device.product_id);
+    debug!(
+        "Found: {} ({}:{})",
+        usb_device.description, usb_device.vendor_id, usb_device.product_id
+    );
 
     // Load config to create provisioner
     let config_file = format!(

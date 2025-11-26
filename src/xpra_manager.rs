@@ -1,28 +1,43 @@
-use crate::config::AppVMConfig;
+//! Xpra display manager implementation
+//!
+//! This module provides the `XpraManager` struct which implements the `DisplayBridge`
+//! trait for Xpra-based display forwarding with SSH audio tunneling.
+
+use crate::config::{AppVMConfig, NetworkMode};
 use crate::display_bridge::DisplayBridge;
-use std::cell::RefCell;
-use std::error::Error;
+use crate::error::{DisplayError, Result};
+use log::{debug, info, warn};
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// Transport type for connecting to VMs
+#[derive(Debug, Clone)]
+enum TransportType {
+    /// SSH over TCP/IP (standard networking)
+    Ssh { ip: String },
+    /// SSH over vsock (for network-disabled VMs)
+    Vsock { cid: u32 },
+}
 
 /// Xpra manager handles desktop integration with Xpra display + SSH PulseAudio forwarding.
 pub struct XpraManager {
     config: AppVMConfig,
     host_pulse_socket: String,
     remote_pulse_socket: String,
-    vm_ip_cache: RefCell<Option<String>>,
+    vm_ip_cache: OnceLock<String>,
 }
 
 impl XpraManager {
-    fn ensure_xpra_available() -> Result<(), Box<dyn Error>> {
+    fn ensure_xpra_available() -> Result<()> {
         match Command::new("xpra").arg("--version").output() {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(
-                "xpra binary not found on host. Install it (e.g., `sudo dnf install xpra` or `sudo apt install xpra`)".into(),
-            ),
-            Err(e) => Err(format!("failed to execute xpra: {}", e).into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(DisplayError::XpraNotFound.into())
+            }
+            Err(e) => Err(DisplayError::XpraExecution(e.to_string()).into()),
         }
     }
 
@@ -48,6 +63,7 @@ impl XpraManager {
                     if Path::new(&candidate).exists() {
                         return candidate;
                     }
+                    // Return candidate even if it doesn't exist - caller handles missing socket
                     return candidate;
                 }
             }
@@ -57,7 +73,7 @@ impl XpraManager {
     }
 
     /// Get the user's SSH public key, generating one if necessary
-    pub fn get_ssh_public_key() -> Result<String, Box<dyn Error>> {
+    pub fn get_ssh_public_key() -> Result<String> {
         let home = std::env::var("HOME")?;
         let ssh_dir = format!("{}/.ssh", home);
 
@@ -71,25 +87,25 @@ impl XpraManager {
         }
 
         // No key exists, generate a new ed25519 key
-        println!("🔑 No SSH key found, generating new ed25519 key...");
+        info!("No SSH key found, generating new ed25519 key...");
         fs::create_dir_all(&ssh_dir)?;
 
         let key_path = format!("{}/id_ed25519", ssh_dir);
         let status = Command::new("ssh-keygen")
-            .args(&["-t", "ed25519", "-f", &key_path, "-N", "", "-q"])
+            .args(["-t", "ed25519", "-f", &key_path, "-N", "", "-q"])
             .status()?;
 
         if !status.success() {
-            return Err("Failed to generate SSH key".into());
+            return Err(DisplayError::ConnectionFailed("Failed to generate SSH key".to_string()).into());
         }
 
         let pub_key_path = format!("{}.pub", key_path);
         Ok(fs::read_to_string(&pub_key_path)?.trim().to_string())
     }
 
-    fn get_vm_ip_static(vm_name: &str) -> Result<String, Box<dyn Error>> {
+    fn get_vm_ip_static(vm_name: &str) -> Result<String> {
         let output = Command::new("sudo")
-            .args(&["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
+            .args(["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
             .output()?;
 
         if output.status.success() {
@@ -105,21 +121,41 @@ impl XpraManager {
             }
         }
 
-        Err("Could not determine VM IP address. VM may not be running.".into())
+        Err(DisplayError::ConnectionFailed(
+            "Could not determine VM IP address. VM may not be running.".to_string(),
+        )
+        .into())
     }
 
-    fn resolve_vm_ip(&self) -> Result<String, Box<dyn Error>> {
-        if let Some(ip) = self.vm_ip_cache.borrow().clone() {
-            return Ok(ip);
+    fn resolve_vm_ip(&self) -> Result<String> {
+        if let Some(ip) = self.vm_ip_cache.get() {
+            return Ok(ip.clone());
         }
         let ip = Self::get_vm_ip_static(&self.config.name)?;
-        *self.vm_ip_cache.borrow_mut() = Some(ip.clone());
+        let _ = self.vm_ip_cache.set(ip.clone());
         Ok(ip)
+    }
+
+    /// Determine transport type based on network configuration
+    fn resolve_transport(&self) -> Result<TransportType> {
+        match self.config.network_mode {
+            NetworkMode::None => {
+                let cid = self
+                    .config
+                    .vsock_cid
+                    .ok_or(DisplayError::VsockNotConfigured)?;
+                Ok(TransportType::Vsock { cid })
+            }
+            _ => {
+                let ip = self.resolve_vm_ip()?;
+                Ok(TransportType::Ssh { ip })
+            }
+        }
     }
 
     fn detect_source_ip(destination: &str) -> Option<String> {
         let output = Command::new("ip")
-            .args(&["route", "get", destination])
+            .args(["route", "get", destination])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -147,6 +183,60 @@ impl XpraManager {
         }
 
         ssh_cmd
+    }
+
+    /// Get path to the vsock SSH wrapper script
+    fn get_vsock_ssh_wrapper_path(&self) -> Result<String> {
+        let home = std::env::var("HOME")?;
+        Ok(format!(
+            "{}/.config/vm-provisioner/{}-vsock-ssh",
+            home, self.config.name
+        ))
+    }
+
+    /// Create an SSH wrapper script for vsock transport
+    /// This avoids complex quoting issues with xpra's --ssh option
+    fn create_vsock_ssh_wrapper(&self, cid: u32) -> Result<String> {
+        let wrapper_path = self.get_vsock_ssh_wrapper_path()?;
+        let script = format!(
+            r#"#!/bin/bash
+# Auto-generated vsock SSH wrapper for {} (CID: {})
+# Note: UserKnownHostsFile=/dev/null bypasses host key checking entirely
+# This is safe for vsock since the CID provides trust (only the specific VM can respond)
+exec ssh -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o "ProxyCommand=socat - VSOCK-CONNECT:{}:22" \
+    -R {}:{} \
+    "$@"
+"#,
+            self.config.name,
+            cid,
+            cid,
+            self.remote_pulse_socket,
+            self.host_pulse_socket
+        );
+
+        std::fs::write(&wrapper_path, &script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&wrapper_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&wrapper_path, perms)?;
+        }
+
+        Ok(wrapper_path)
+    }
+
+    /// Build SSH command for vsock transport (network-disabled VMs)
+    fn build_ssh_invocation_vsock(&self, cid: u32) -> Result<String> {
+        // Create a wrapper script to avoid complex quoting issues with xpra
+        let wrapper_path = self.create_vsock_ssh_wrapper(cid)?;
+        Ok(wrapper_path)
     }
 
     fn is_application_package(&self, package: &str) -> bool {
@@ -192,7 +282,7 @@ impl XpraManager {
         package: &str,
         desktop_dir: &str,
         is_flatpak: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<()> {
         let app_name = if is_flatpak {
             package.split('.').last().unwrap_or(package)
         } else {
@@ -209,7 +299,12 @@ impl XpraManager {
         let vm_ip = self.resolve_vm_ip().unwrap_or_else(|_| "UNKNOWN".to_string());
 
         // Create a wrapper script instead of embedding complex command in .desktop file
-        let wrapper_script_path = format!("{}/{}-{}-launch.sh", desktop_dir, self.config.name, app_name.to_lowercase());
+        let wrapper_script_path = format!(
+            "{}/vm-provisioner-{}-{}-launch.sh",
+            desktop_dir,
+            self.config.name,
+            app_name.to_lowercase()
+        );
         let wrapper_content = format!(
             "#!/bin/bash\n# Auto-generated launch script for {} in {}\nssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \"xpra seamless\" 2>/dev/null || true'\n{}",
             app_name, self.config.name, vm_ip, xpra_command
@@ -251,7 +346,7 @@ Keywords=vm;isolated;sandbox;{package};
         );
 
         let desktop_file = format!(
-            "{}/{}-{}.desktop",
+            "{}/vm-provisioner-{}-{}.desktop",
             desktop_dir,
             self.config.name,
             app_name.to_lowercase()
@@ -263,72 +358,100 @@ Keywords=vm;isolated;sandbox;{package};
 }
 
 impl DisplayBridge for XpraManager {
-    fn new(config: &AppVMConfig) -> Result<Self, Box<dyn Error>> {
+    fn new(config: &AppVMConfig) -> Result<Self> {
         Self::ensure_xpra_available()?;
 
         Ok(Self {
             config: config.clone(),
             host_pulse_socket: Self::detect_host_pulse_socket(),
             remote_pulse_socket: "/run/user/1000/pulse/native".to_string(),
-            vm_ip_cache: RefCell::new(None),
+            vm_ip_cache: OnceLock::new(),
         })
     }
 
     fn generate_exec_command(&self, app_command: &str) -> String {
-        match self.resolve_vm_ip() {
-            Ok(vm_ip) => {
-                let ssh_cmd = self.build_ssh_invocation(&vm_ip);
+        match self.resolve_transport() {
+            Ok(TransportType::Vsock { cid }) => {
+                // Network-disabled VM: use vsock transport with wrapper script
+                match self.build_ssh_invocation_vsock(cid) {
+                    Ok(ssh_wrapper) => {
+                        format!(
+                            "env GDK_BACKEND=x11 xpra start ssh://user@localhost/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --min-quality=80 --modal-windows=yes --start-child=\"{cmd}\" --exit-with-children",
+                            ssh = ssh_wrapper,
+                            cmd = app_command
+                        )
+                    }
+                    Err(e) => {
+                        warn!("Failed to create vsock SSH wrapper: {}", e);
+                        "echo 'Error: Could not create vsock SSH wrapper'".to_string()
+                    }
+                }
+            }
+            Ok(TransportType::Ssh { ip }) => {
+                // Standard networked VM: use SSH over TCP/IP
+                let ssh_cmd = self.build_ssh_invocation(&ip);
                 format!(
                     "env GDK_BACKEND=x11 xpra start ssh://user@{ip}/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --min-quality=80 --modal-windows=yes --start-child=\"{cmd}\" --exit-with-children",
-                    ip = vm_ip,
+                    ip = ip,
                     ssh = ssh_cmd,
                     cmd = app_command
                 )
             }
             Err(err) => {
-                eprintln!(
-                    "⚠️  Unable to resolve VM IP for {}: {}",
+                warn!(
+                    "Unable to resolve transport for {}: {}",
                     self.config.name, err
                 );
-                "echo 'Error: VM IP not found; start the VM before launching apps'".to_string()
+                "echo 'Error: Cannot connect to VM; check network mode and start the VM'".to_string()
             }
         }
     }
 
-    fn launch_app(&self, app_command: &str) -> Result<(), Box<dyn Error>> {
+    fn launch_app(&self, app_command: &str) -> Result<()> {
         let exec_command = self.generate_exec_command(app_command);
-        println!(
-            "🚀 Launching {} in VM {} via Xpra",
-            app_command, self.config.name
-        );
+        info!("Launching {} in VM {} via Xpra", app_command, self.config.name);
 
         // Kill any stale xpra sessions before launching
-        let vm_ip = self.resolve_vm_ip()?;
-        println!("   Cleaning up stale xpra sessions...");
-        let cleanup_cmd = format!(
-            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \\\"xpra seamless\\\" 2>/dev/null || true'",
-            vm_ip
-        );
-        let _ = Command::new("bash").arg("-c").arg(&cleanup_cmd).output();
+        debug!("Cleaning up stale xpra sessions...");
+        let cleanup_cmd = match self.resolve_transport() {
+            Ok(TransportType::Vsock { cid }) => {
+                // Vsock: use socat proxy for SSH
+                format!(
+                    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand='socat - VSOCK-CONNECT:{}:22' user@localhost 'pkill -f \\\"xpra seamless\\\" 2>/dev/null || true'",
+                    cid
+                )
+            }
+            Ok(TransportType::Ssh { ip }) => {
+                // Standard SSH cleanup
+                format!(
+                    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \\\"xpra seamless\\\" 2>/dev/null || true'",
+                    ip
+                )
+            }
+            Err(_) => String::new(), // Skip cleanup if transport resolution fails
+        };
+        if !cleanup_cmd.is_empty() {
+            let _ = Command::new("bash").arg("-c").arg(&cleanup_cmd).output();
+        }
 
-        println!("   Command: {}", exec_command);
+        debug!("Command: {}", exec_command);
 
         if exec_command.trim().is_empty() {
-            return Err("Empty command".into());
+            return Err(DisplayError::LaunchFailed("Empty command".to_string()).into());
         }
 
         Command::new("sh").arg("-c").arg(&exec_command).spawn()?;
 
-        println!("✅ Application launched via Xpra");
+        info!("Application launched via Xpra");
         Ok(())
     }
 
-    fn generate_desktop_files(&self) -> Result<(), Box<dyn Error>> {
+    fn generate_desktop_files(&self) -> Result<()> {
         let home = std::env::var("HOME")?;
-        let desktop_dir = format!("{}/.local/share/applications/vm-provisioner", home);
+        let desktop_dir = format!("{}/.local/share/applications", home);
         fs::create_dir_all(&desktop_dir)?;
 
-        println!("📝 Generating .desktop files in: {}", desktop_dir);
+        info!("Generating .desktop files in: {}", desktop_dir);
 
         let mut count = 0;
         for package in &self.config.system_packages {
@@ -343,28 +466,47 @@ impl DisplayBridge for XpraManager {
             count += 1;
         }
 
-        println!("✅ Generated .desktop files for {} applications", count);
+        // Update desktop database for app launchers to pick up new entries
+        let _ = Command::new("update-desktop-database")
+            .arg(&desktop_dir)
+            .output();
+
+        info!("Generated .desktop files for {} applications", count);
         Ok(())
     }
 
-    fn remove_desktop_files(&self) -> Result<(), Box<dyn Error>> {
+    fn remove_desktop_files(&self) -> Result<()> {
         let home = std::env::var("HOME")?;
-        let desktop_dir = format!("{}/.local/share/applications/vm-provisioner", home);
+        let desktop_dir = format!("{}/.local/share/applications", home);
 
         if !Path::new(&desktop_dir).exists() {
             return Ok(());
         }
 
+        let mut removed = false;
+        let prefix = format!("vm-provisioner-{}-", self.config.name);
         for entry in fs::read_dir(&desktop_dir)? {
             let entry = entry?;
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                if filename.starts_with(&format!("{}-", self.config.name)) {
+                // Remove both .desktop files and launch scripts
+                if filename.starts_with(&prefix)
+                    && (filename.ends_with(".desktop") || filename.ends_with("-launch.sh"))
+                {
                     fs::remove_file(&path)?;
-                    println!("   Removed {}", filename);
+                    debug!("Removed {}", filename);
+                    removed = true;
                 }
             }
         }
+
+        // Update desktop database after removing entries
+        if removed {
+            let _ = Command::new("update-desktop-database")
+                .arg(&desktop_dir)
+                .output();
+        }
+
         Ok(())
     }
 
@@ -397,6 +539,50 @@ impl DisplayBridge for XpraManager {
     }
 
     fn kickstart_config(&self, ssh_public_key: &str) -> String {
+        // Build vsock relay configuration for network-disabled VMs
+        let vsock_config = if self.config.enable_vsock {
+            r#"
+# ===== Vsock Configuration for Network-Disabled VM =====
+echo "=== Configuring vsock relay for host-guest communication ==="
+
+# Ensure vsock modules load at boot
+echo "vsock" >> /etc/modules-load.d/vsock.conf
+echo "virtio_vsockets" >> /etc/modules-load.d/vsock.conf
+
+# Load modules now
+modprobe vsock || true
+modprobe virtio_vsockets || true
+
+# Install socat (required for vsock SSH relay)
+dnf install -y socat || echo "Warning: socat installation failed"
+
+# Create systemd service to relay vsock:22 to sshd
+cat > /etc/systemd/system/vsock-ssh-relay.service << 'VSOCK_SERVICE_EOF'
+[Unit]
+Description=Vsock to SSH Relay
+After=sshd.service network.target
+Requires=sshd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat VSOCK-LISTEN:22,reuseaddr,fork TCP:127.0.0.1:22
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+VSOCK_SERVICE_EOF
+
+systemctl daemon-reload
+systemctl enable vsock-ssh-relay.service
+systemctl start vsock-ssh-relay.service
+
+echo "Vsock SSH relay configured on port 22"
+"#.to_string()
+        } else {
+            String::new()
+        };
+
         // Build virtiofs mount configuration if shared folders are configured
         let virtiofs_config = if !self.config.shared_folders.is_empty() {
             let mut config = String::from(r#"
@@ -475,7 +661,6 @@ SERVICE_EOF
             // Build Openbox menu items for each flatpak app
             let menu_items: String = self.config.flatpak_packages.iter()
                 .map(|pkg| {
-                    // Extract app name from flatpak ID (e.g., "org.torproject.torbrowser-launcher" -> "torbrowser-launcher")
                     let app_name = pkg.split('.').last().unwrap_or(pkg);
                     format!(
                         r#"    <item label="{}">
@@ -742,11 +927,13 @@ firewall-cmd --reload
 systemctl set-default multi-user.target
 {web_streaming_config}
 {virtiofs_config}
+{vsock_config}
 "#,
             ssh_key = ssh_public_key,
             audio_config = audio_config,
             web_streaming_config = web_streaming_config,
-            virtiofs_config = virtiofs_config
+            virtiofs_config = virtiofs_config,
+            vsock_config = vsock_config
         )
     }
 }

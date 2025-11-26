@@ -45,11 +45,11 @@ impl<'de> Deserialize<'de> for DisplayProtocol {
         match s.to_lowercase().as_str() {
             "xpra" => Ok(DisplayProtocol::Xpra),
             "waypipe" => {
-                eprintln!("⚠️  Warning: Waypipe protocol is deprecated. Migrating to Xpra.");
+                log::warn!("Waypipe protocol is deprecated. Migrating to Xpra.");
                 Ok(DisplayProtocol::Xpra)
             }
             "selkies" => {
-                eprintln!("⚠️  Warning: Selkies protocol is deprecated. Migrating to Xpra.");
+                log::warn!("Selkies protocol is deprecated. Migrating to Xpra.");
                 Ok(DisplayProtocol::Xpra)
             }
             _ => Err(serde::de::Error::custom(format!(
@@ -72,17 +72,20 @@ pub struct AppVMConfig {
     // Package installation
     pub system_packages: Vec<String>,
     pub flatpak_packages: Vec<String>,
+    #[serde(default)]
     pub auto_launch_apps: Vec<String>, // Commands to run on startup
 
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
     pub display_protocol: DisplayProtocol,
+    #[serde(default)]
     pub web_port: Option<u16>, // Port for Selkies-GStreamer WebRTC web access (None = disabled)
     pub enable_clipboard: bool,
     pub enable_audio: bool,
     pub enable_usb_passthrough: bool,
     pub enable_auto_login: bool,
     pub headless: bool, // CLI-only mode, no GUI
+    #[serde(default)]
     pub grant_device_access: bool, // Grant flatpak apps access to all devices
 
     // PCI passthrough
@@ -94,12 +97,20 @@ pub struct AppVMConfig {
     pub usb_hotplug: bool, // true = hot-attach/detach, false = permanent XML
 
     // Shared storage (virtiofs)
+    #[serde(default)]
     pub shared_folders: Vec<SharedFolder>,
 
     // Security settings
     pub network_mode: NetworkMode,
     pub firewall_rules: Vec<String>,
+    #[serde(default)]
     pub vpn_config: Option<VpnConfig>,
+
+    // Vsock (for network-disabled VMs)
+    #[serde(default)]
+    pub vsock_cid: Option<u32>,  // Auto-assigned by libvirt, stored post-creation
+    #[serde(default)]
+    pub enable_vsock: bool,      // Auto-enabled for NetworkMode::None
 
     // Authentication
     pub user_password: String,
@@ -146,6 +157,7 @@ impl AppVMConfig {
         shared_folders: Vec<SharedFolder>,
         network_bridge: Option<String>,
         grant_device_access: bool,
+        no_network: bool,
     ) -> Self {
         // Default system packages - different for headless vs GUI
         let mut default_system_packages = if headless {
@@ -198,9 +210,13 @@ impl AppVMConfig {
 
             shared_folders,
 
-            network_mode: match network_bridge {
-                Some(bridge) => NetworkMode::Bridge(bridge),
-                None => NetworkMode::Nat,
+            network_mode: if no_network {
+                NetworkMode::None
+            } else {
+                match network_bridge {
+                    Some(bridge) => NetworkMode::Bridge(bridge),
+                    None => NetworkMode::Nat,
+                }
             },
             firewall_rules: vec![
                 // Allow DNS
@@ -211,6 +227,10 @@ impl AppVMConfig {
                 "OUTPUT -p tcp --dport 443 -j ACCEPT".to_string(),
             ],
             vpn_config: None,
+
+            // Vsock is auto-enabled for network-disabled VMs
+            vsock_cid: None, // Will be populated after VM creation
+            enable_vsock: no_network,
 
             user_password: generate_password(),
         }

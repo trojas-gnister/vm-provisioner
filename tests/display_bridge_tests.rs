@@ -27,12 +27,13 @@ fn test_appvmconfig_with_xpra() {
         false, // Not headless
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     assert_eq!(config.name, "test-xpra-vm");
@@ -74,12 +75,13 @@ fn test_xpra_manager_creation() {
         false,
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     // XpraManager validates xpra binary availability
@@ -115,12 +117,13 @@ fn test_xpra_guest_packages() {
         false,
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     // Skip test if xpra not installed
@@ -172,12 +175,13 @@ fn test_display_bridge_trait_consistency() {
         false,
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     // XpraManager should implement DisplayBridge
@@ -208,12 +212,13 @@ fn test_config_serialization_display_protocol() {
         false,
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     // Verify the config struct maintains display_protocol field
@@ -232,12 +237,13 @@ fn test_headless_mode_with_xpra() {
         true, // headless = true
         vec![],
         false,
-        None,  // web_port
-        false, // enable_microphone
+        None,   // web_port
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
 
     // Headless config should be valid
@@ -268,11 +274,12 @@ fn test_web_port_config() {
         vec![],
         false,
         Some(8080), // web_port enabled
-        false, // enable_microphone
-        vec![], // usb_devices
-        false, // usb_hotplug
-        vec![], // shared_folders
-        None,   // network_bridge
+        vec![],     // usb_devices
+        false,      // usb_hotplug
+        vec![],     // shared_folders
+        None,       // network_bridge
+        false,      // grant_device_access
+        false,      // no_network
     );
     assert_eq!(config_with_web.web_port, Some(8080));
 
@@ -287,12 +294,13 @@ fn test_web_port_config() {
         false,
         vec![],
         false,
-        None,  // web_port disabled
-        false, // enable_microphone
+        None,   // web_port disabled
         vec![], // usb_devices
-        false, // usb_hotplug
+        false,  // usb_hotplug
         vec![], // shared_folders
         None,   // network_bridge
+        false,  // grant_device_access
+        false,  // no_network
     );
     assert_eq!(config_without_web.web_port, None);
 }
@@ -312,12 +320,13 @@ fn test_network_bridge_config() {
         false,
         vec![],
         false,
-        None,       // web_port
-        false,      // enable_microphone
-        vec![],     // usb_devices
-        false,      // usb_hotplug
-        vec![],     // shared_folders
+        None,                    // web_port
+        vec![],                  // usb_devices
+        false,                   // usb_hotplug
+        vec![],                  // shared_folders
         Some("br0".to_string()), // network_bridge
+        false,                   // grant_device_access
+        false,                   // no_network
     );
     assert!(matches!(config_bridged.network_mode, NetworkMode::Bridge(ref name) if name == "br0"));
 
@@ -332,12 +341,13 @@ fn test_network_bridge_config() {
         false,
         vec![],
         false,
-        None,       // web_port
-        false,      // enable_microphone
-        vec![],     // usb_devices
-        false,      // usb_hotplug
-        vec![],     // shared_folders
-        None,       // network_bridge (uses NAT)
+        None,   // web_port
+        vec![], // usb_devices
+        false,  // usb_hotplug
+        vec![], // shared_folders
+        None,   // network_bridge (uses NAT)
+        false,  // grant_device_access
+        false,  // no_network
     );
     assert!(matches!(config_nat.network_mode, NetworkMode::Nat));
 }
