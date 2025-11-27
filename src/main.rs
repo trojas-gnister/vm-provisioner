@@ -2,6 +2,7 @@ mod config;
 mod display_bridge;
 mod error;
 mod provisioner;
+mod templates;
 mod xpra_manager;
 
 use clap::{Parser, Subcommand};

@@ -1,8 +1,115 @@
 /// DisplayBridge Integration Tests
 /// Tests for the display protocol abstraction layer
-use vm_provisioner::config::{AppVMConfig, DisplayProtocol};
+use vm_provisioner::config::{AppVMConfig, DisplayProtocol, NetworkMode};
 use vm_provisioner::display_bridge::DisplayBridge;
 use vm_provisioner::xpra_manager::XpraManager;
+
+// ============ VM Name Validation Tests ============
+
+#[test]
+fn test_validate_vm_name_valid() {
+    assert!(AppVMConfig::validate_vm_name("my-vm").is_ok());
+    assert!(AppVMConfig::validate_vm_name("test_vm_123").is_ok());
+    assert!(AppVMConfig::validate_vm_name("VM1").is_ok());
+    assert!(AppVMConfig::validate_vm_name("a").is_ok());
+}
+
+#[test]
+fn test_validate_vm_name_empty() {
+    let result = AppVMConfig::validate_vm_name("");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("empty"));
+}
+
+#[test]
+fn test_validate_vm_name_too_long() {
+    let long_name = "a".repeat(65);
+    let result = AppVMConfig::validate_vm_name(&long_name);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("64 characters"));
+}
+
+#[test]
+fn test_validate_vm_name_invalid_chars() {
+    assert!(AppVMConfig::validate_vm_name("vm with spaces").is_err());
+    assert!(AppVMConfig::validate_vm_name("vm/path").is_err());
+    assert!(AppVMConfig::validate_vm_name("vm@host").is_err());
+    assert!(AppVMConfig::validate_vm_name("vm$var").is_err());
+}
+
+#[test]
+fn test_validate_vm_name_bad_prefix() {
+    // Names starting with '-' should fail the prefix check
+    let result_dash = AppVMConfig::validate_vm_name("-my-vm");
+    assert!(result_dash.is_err());
+    assert!(result_dash.unwrap_err().to_string().contains("cannot start"));
+
+    // Names with '.' fail the character validation first (. not in allowed chars)
+    let result_dot = AppVMConfig::validate_vm_name(".hidden-vm");
+    assert!(result_dot.is_err());
+    // This fails on character validation, not prefix check
+    assert!(result_dot.unwrap_err().to_string().contains("alphanumeric"));
+}
+
+// ============ Password Generation Tests ============
+
+#[test]
+fn test_password_length() {
+    let config = AppVMConfig::new(
+        "pwd-test".to_string(),
+        2048, 2, 20,
+        vec![], vec![],
+        false, vec![], false, None, vec![], false, vec![], None, false, false,
+    );
+    assert_eq!(config.user_password.len(), 16);
+}
+
+#[test]
+fn test_password_alphanumeric_only() {
+    let config = AppVMConfig::new(
+        "pwd-chars-test".to_string(),
+        2048, 2, 20,
+        vec![], vec![],
+        false, vec![], false, None, vec![], false, vec![], None, false, false,
+    );
+    assert!(config.user_password.chars().all(|c| c.is_alphanumeric()));
+}
+
+#[test]
+fn test_password_uniqueness() {
+    // Generate multiple configs and ensure passwords are different
+    let configs: Vec<AppVMConfig> = (0..10)
+        .map(|i| {
+            AppVMConfig::new(
+                format!("pwd-unique-{}", i),
+                2048, 2, 20,
+                vec![], vec![],
+                false, vec![], false, None, vec![], false, vec![], None, false, false,
+            )
+        })
+        .collect();
+
+    let passwords: Vec<&str> = configs.iter().map(|c| c.user_password.as_str()).collect();
+    let unique_count = passwords.iter().collect::<std::collections::HashSet<_>>().len();
+
+    // All 10 passwords should be unique (extremely unlikely to have duplicates)
+    assert_eq!(unique_count, 10, "All generated passwords should be unique");
+}
+
+// ============ Network Mode Tests ============
+
+#[test]
+fn test_no_network_enables_vsock() {
+    let config = AppVMConfig::new(
+        "no-net-test".to_string(),
+        2048, 2, 20,
+        vec![], vec![],
+        false, vec![], false, None, vec![], false, vec![], None, false,
+        true, // no_network = true
+    );
+    assert!(matches!(config.network_mode, NetworkMode::None));
+    assert!(config.enable_vsock, "Vsock should be enabled when network is disabled");
+}
 
 #[test]
 fn test_display_protocol_enum_serialization() {
@@ -307,8 +414,6 @@ fn test_web_port_config() {
 
 #[test]
 fn test_network_bridge_config() {
-    use vm_provisioner::config::NetworkMode;
-
     // Test config with bridged networking
     let config_bridged = AppVMConfig::new(
         "bridge-test".to_string(),

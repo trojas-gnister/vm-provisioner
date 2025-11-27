@@ -6,6 +6,7 @@
 use crate::config::{AppVMConfig, NetworkMode};
 use crate::display_bridge::DisplayBridge;
 use crate::error::{DisplayError, Result};
+use crate::templates;
 use log::{debug, info, warn};
 use std::fs;
 use std::io;
@@ -584,54 +585,14 @@ impl DisplayBridge for XpraManager {
     fn kickstart_config(&self, ssh_public_key: &str) -> String {
         // Build vsock relay configuration for network-disabled VMs
         let vsock_config = if self.config.enable_vsock {
-            r#"
-# ===== Vsock Configuration for Network-Disabled VM =====
-echo "=== Configuring vsock relay for host-guest communication ==="
-
-# Ensure vsock modules load at boot
-echo "vsock" >> /etc/modules-load.d/vsock.conf
-echo "virtio_vsockets" >> /etc/modules-load.d/vsock.conf
-
-# Load modules now
-modprobe vsock || true
-modprobe virtio_vsockets || true
-
-# Install socat (required for vsock SSH relay)
-dnf install -y socat || echo "Warning: socat installation failed"
-
-# Create systemd service to relay vsock:22 to sshd
-cat > /etc/systemd/system/vsock-ssh-relay.service << 'VSOCK_SERVICE_EOF'
-[Unit]
-Description=Vsock to SSH Relay
-After=sshd.service network.target
-Requires=sshd.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat VSOCK-LISTEN:22,reuseaddr,fork TCP:127.0.0.1:22
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-VSOCK_SERVICE_EOF
-
-systemctl daemon-reload
-systemctl enable vsock-ssh-relay.service
-systemctl start vsock-ssh-relay.service
-
-echo "Vsock SSH relay configured on port 22"
-"#.to_string()
+            templates::VSOCK_RELAY.to_string()
         } else {
             String::new()
         };
 
         // Build virtiofs mount configuration if shared folders are configured
         let virtiofs_config = if !self.config.shared_folders.is_empty() {
-            let mut config = String::from(r#"
-# ===== Virtiofs Shared Folders Configuration =====
-echo "=== Configuring virtiofs shared folders ==="
-"#);
+            let mut config = templates::VIRTIOFS_HEADER.to_string();
             for folder in &self.config.shared_folders {
                 let mount_options = if folder.readonly {
                     "defaults,nofail,ro"
@@ -654,9 +615,7 @@ echo "   Configured: {tag} -> {guest_path}"
                     options = mount_options
                 ));
             }
-            config.push_str(r#"
-echo "Virtiofs shared folders will be available after reboot."
-"#);
+            config.push_str(templates::VIRTIOFS_FOOTER);
             config
         } else {
             String::new()
@@ -717,163 +676,24 @@ SERVICE_EOF
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            format!(
-                r#"
-# ===== Selkies-GStreamer WebRTC Streaming Configuration =====
-echo "=== Configuring Selkies-GStreamer web streaming on port {port} ==="
+            // Build selkies config from templates
+            let port_str = port.to_string();
+            let header = templates::SELKIES_HEADER
+                .replace("{{PORT}}", &port_str)
+                .replace("{{SYSTEMD_SERVICES}}", &systemd_services)
+                .replace("{{SYSTEMD_ENABLE_COMMANDS}}", &systemd_enable_commands);
 
-# Install GStreamer dependencies
-dnf install -y gstreamer1-plugins-base gstreamer1-plugins-good \
-    gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
-    python3-pip python3-gobject libXtst libXdamage libXfixes \
-    xorg-x11-server-Xvfb xorg-x11-utils pipewire pipewire-pulseaudio || true
+            let wrapper = format!(
+                "\n# Create wrapper script that starts Xvfb and Selkies together\ncat > /home/user/selkies-wrapper.sh << 'WRAPPER_EOF'\n{}\nWRAPPER_EOF\nchmod +x /home/user/selkies-wrapper.sh\nchown user:user /home/user/selkies-wrapper.sh\n",
+                templates::SELKIES_WRAPPER.replace("{{PORT}}", &port_str)
+            );
 
-# Install RPM Fusion for additional codecs
-dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-41.noarch.rpm || true
-dnf install -y gstreamer1-plugins-bad-freeworld x264 || true
+            let service = templates::SELKIES_SERVICE
+                .replace("{{PORT}}", &port_str)
+                .replace("{{PASSWORD}}", &self.config.user_password)
+                .replace("{{MENU_ITEMS}}", &menu_items);
 
-# Download and install Selkies-GStreamer portable distribution
-echo "Downloading Selkies-GStreamer..."
-SELKIES_VERSION="1.6.2"
-mkdir -p /opt/selkies-gstreamer
-curl -fsSL -o /tmp/selkies.tar.gz \
-    "https://github.com/selkies-project/selkies-gstreamer/releases/download/v${{SELKIES_VERSION}}/selkies-gstreamer-portable-v${{SELKIES_VERSION}}_amd64.tar.gz" || \
-curl -fsSL -o /tmp/selkies.tar.gz \
-    "https://github.com/selkies-project/selkies/releases/download/v${{SELKIES_VERSION}}/selkies-gstreamer-portable-v${{SELKIES_VERSION}}_amd64.tar.gz"
-tar -xzf /tmp/selkies.tar.gz -C /opt/selkies-gstreamer --strip-components=1 || true
-rm -f /tmp/selkies.tar.gz
-
-# Allow web port and WebRTC ports through firewall
-firewall-offline-cmd --add-port={port}/tcp || firewall-cmd --permanent --add-port={port}/tcp || true
-firewall-offline-cmd --add-port=49152-65535/udp || firewall-cmd --permanent --add-port=49152-65535/udp || true
-firewall-offline-cmd --add-port=49152-65535/tcp || firewall-cmd --permanent --add-port=49152-65535/tcp || true
-
-# Create systemd user services for each flatpak app with auto-restart
-mkdir -p /home/user/.config/systemd/user
-
-# Fix ownership of .config directory (created as root during kickstart)
-chown -R user:user /home/user/.config
-
-{systemd_services}
-
-# Enable user lingering so services start on boot even without login
-loginctl enable-linger user || true
-
-# Enable and start all app services
-{systemd_enable_commands}
-
-# Create wrapper script that starts Xvfb and Selkies together
-cat > /home/user/selkies-wrapper.sh << 'WRAPPER_EOF'
-#!/bin/bash
-# Start Xvfb in background with large resolution for dynamic resizing
-/usr/bin/Xvfb :100 -screen 0 8192x4096x24 +extension RANDR &
-XVFB_PID=$!
-sleep 2
-
-# Start Openbox window manager (auto-maximizes windows)
-export DISPLAY=:100
-openbox &
-sleep 1
-
-# Note: Apps are managed by systemd user services, not this script
-# They start automatically via 'loginctl enable-linger' and WantedBy=default.target
-
-# Start Selkies (foreground) with resize support
-exec /opt/selkies-gstreamer/selkies-gstreamer-run \
-    --addr=0.0.0.0 \
-    --port={port} \
-    --enable_resize=true \
-    --enable_clipboard=true \
-    --framerate=60 \
-    --video_bitrate=8000 \
-    --audio_bitrate=128000
-WRAPPER_EOF
-chmod +x /home/user/selkies-wrapper.sh
-chown user:user /home/user/selkies-wrapper.sh
-
-# Create Openbox config directory and configuration
-mkdir -p /home/user/.config/openbox
-
-# Openbox rc.xml with auto-maximize and right-click menu binding
-cat > /home/user/.config/openbox/rc.xml << 'OPENBOX_RC_EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<openbox_config xmlns="http://openbox.org/3.4/rc">
-  <applications>
-    <application class="*">
-      <maximized>yes</maximized>
-    </application>
-  </applications>
-  <mouse>
-    <context name="Root">
-      <mousebind button="Right" action="Press">
-        <action name="ShowMenu">
-          <menu>root-menu</menu>
-        </action>
-      </mousebind>
-    </context>
-  </mouse>
-</openbox_config>
-OPENBOX_RC_EOF
-
-# Openbox menu.xml with terminal option
-cat > /home/user/.config/openbox/menu.xml << 'OPENBOX_MENU_EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<openbox_menu xmlns="http://openbox.org/3.4/rc">
-  <menu id="root-menu" label="Applications">
-{menu_items}
-    <separator />
-    <item label="Terminal">
-      <action name="Execute">
-        <execute>xterm</execute>
-      </action>
-    </item>
-  </menu>
-</openbox_menu>
-OPENBOX_MENU_EOF
-
-chown -R user:user /home/user/.config/openbox
-
-# Create systemd service for Selkies-GStreamer
-cat > /etc/systemd/system/selkies-web.service << 'SELKIES_SERVICE_EOF'
-[Unit]
-Description=Selkies-GStreamer WebRTC Streaming
-After=network.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=user
-Environment=DISPLAY=:100
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-Environment=SELKIES_ENCODER=x264enc
-Environment=SELKIES_BASIC_AUTH_USER=user
-Environment=SELKIES_BASIC_AUTH_PASSWORD={password}
-ExecStart=/home/user/selkies-wrapper.sh
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SELKIES_SERVICE_EOF
-
-# Enable user lingering for PipeWire
-loginctl enable-linger user || true
-
-# Enable the Selkies service to start on boot
-systemctl daemon-reload
-systemctl enable selkies-web.service
-
-echo "Selkies WebRTC streaming configured on port {port}"
-echo "Access via browser: http://<vm-ip>:{port}/"
-echo "Login: user / {password}"
-"#,
-                port = port,
-                password = self.config.user_password,
-                systemd_services = systemd_services,
-                systemd_enable_commands = systemd_enable_commands,
-                menu_items = menu_items
-            )
+            format!("{}{}{}", header, wrapper, service)
         } else {
             String::new()
         };
@@ -881,102 +701,17 @@ echo "Login: user / {password}"
         // Audio configuration: disable local audio for native xpra (SSH forwarding), keep enabled for web streaming
         let audio_config = if self.config.web_port.is_some() {
             // Web streaming mode: keep PulseAudio enabled so Selkies can capture audio locally
-            r#"# Web streaming mode: Keep PulseAudio/PipeWire enabled for local audio capture
-echo "=== Configuring audio for web streaming mode (local PipeWire) ==="
-# PipeWire/PulseAudio services remain enabled for Selkies to capture audio
-# Selkies will encode and stream audio via WebRTC to the browser"#.to_string()
+            templates::AUDIO_WEB.to_string()
         } else {
             // Native xpra (SSH): configure one-way PulseAudio tunnel for playback only
-            r#"# Configure one-way PulseAudio tunnel for playback only
-echo "=== Configuring audio for native xpra mode (one-way SSH tunnel) ==="
-cat > /usr/lib/systemd/user-preset/99-disable-audio.preset << 'AUDIO_PRESET_EOF'
-# Disable local audio services - using SSH-forwarded audio instead
-disable pipewire.service
-disable pipewire.socket
-disable pipewire-pulse.service
-disable pipewire-pulse.socket
-disable wireplumber.service
-AUDIO_PRESET_EOF
-
-# Configure PulseAudio to use SSH tunnel for playback only
-mkdir -p /home/user/.config/pulse
-cat > /home/user/.config/pulse/default.pa << 'PULSE_CONFIG_EOF'
-# Include system defaults
-.include /etc/pulse/default.pa
-
-# Create a tunnel sink that sends audio to host via SSH socket
-# This is OUTPUT ONLY - VM apps play audio through this to host speakers
-# The SSH tunnel at /run/user/1000/pulse/native is forwarded by xpra
-load-module module-tunnel-sink-new server=unix:/run/user/1000/pulse/native sink_name=ssh_output
-
-# Set the SSH tunnel as the default output device
-set-default-sink ssh_output
-
-# IMPORTANT: Do NOT create a tunnel source (module-tunnel-source-new)
-# This is playback only - no audio input through SSH tunnel
-PULSE_CONFIG_EOF
-
-chown -R user:user /home/user/.config/pulse
-echo "Audio configured: VM output -> SSH tunnel -> host speakers (one-way)"
-"#.to_string()
+            templates::AUDIO_SSH.to_string()
         };
 
-        format!(
-            r#"
-# Configure SSH and Xpra for seamless window mode with SSH audio forwarding
-echo "=== Configuring SSH, Xpra, and audio forwarding ==="
-
-# Install xpra from updates repo (not available during kickstart %packages phase)
-echo "Installing xpra from updates repository..."
-dnf install -y xpra xorg-x11-server-Xvfb git tar || echo "Warning: xpra installation failed"
-
-# Install xpra-html5 web client (required for browser access)
-if [ ! -d /usr/share/xpra/www ]; then
-    echo "Installing xpra-html5 web client..."
-    mkdir -p /usr/share/xpra/www
-    cd /tmp && git clone --depth 1 https://github.com/Xpra-org/xpra-html5.git
-    cp -r /tmp/xpra-html5/html5/* /usr/share/xpra/www/
-    rm -rf /tmp/xpra-html5
-fi
-
-# SSH key for passwordless authentication
-mkdir -p /home/user/.ssh
-chmod 700 /home/user/.ssh
-cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
-{ssh_key}
-SSH_KEY_EOF
-chmod 600 /home/user/.ssh/authorized_keys
-chown -R user:user /home/user/.ssh
-
-# Configure SSH server for Unix socket forwarding
-cat >> /etc/ssh/sshd_config << 'SSHD_CONFIG_EOF'
-
-# Enable Unix socket forwarding for PulseAudio
-StreamLocalBindUnlink yes
-AllowStreamLocalForwarding yes
-SSHD_CONFIG_EOF
-
-# Enable and start SSH server
-systemctl enable sshd
-systemctl start sshd
-
-# Allow SSH through firewall
-firewall-cmd --permanent --add-service=ssh
-firewall-cmd --reload
-
-{audio_config}
-
-# No auto-login needed - Xpra starts its own X server on demand
-systemctl set-default multi-user.target
-{web_streaming_config}
-{virtiofs_config}
-{vsock_config}
-"#,
-            ssh_key = ssh_public_key,
-            audio_config = audio_config,
-            web_streaming_config = web_streaming_config,
-            virtiofs_config = virtiofs_config,
-            vsock_config = vsock_config
-        )
+        templates::SSH_XPRA_BASE
+            .replace("{{SSH_KEY}}", ssh_public_key)
+            .replace("{{AUDIO_CONFIG}}", &audio_config)
+            .replace("{{WEB_STREAMING_CONFIG}}", &web_streaming_config)
+            .replace("{{VIRTIOFS_CONFIG}}", &virtiofs_config)
+            .replace("{{VSOCK_CONFIG}}", &vsock_config)
     }
 }

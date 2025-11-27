@@ -7,6 +7,7 @@ pub mod config;
 pub mod display_bridge;
 pub mod error;
 pub mod provisioner;
+pub mod templates;
 pub mod xpra_manager;
 
 // Re-export commonly used types
