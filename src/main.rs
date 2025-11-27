@@ -159,6 +159,269 @@ fn get_display_bridge(config: &AppVMConfig) -> Result<Box<dyn DisplayBridge>> {
     Ok(Box::new(XpraManager::new(config)?))
 }
 
+/// Options for VM creation
+struct CreateOptions {
+    name: Option<String>,
+    system_packages: Vec<String>,
+    flatpak_packages: Vec<String>,
+    skip_confirm: bool,
+    config_path: Option<String>,
+    memory: u64,
+    vcpus: u32,
+    disk: u64,
+    headless: bool,
+    pci_addresses: Vec<String>,
+    pci_hotplug: bool,
+    web_port: Option<u16>,
+    usb_addresses: Vec<String>,
+    usb_hotplug: bool,
+    share_paths: Vec<String>,
+    share_readonly: bool,
+    network_bridge: Option<String>,
+    grant_device_access: bool,
+    no_network: bool,
+}
+
+/// Validate create options for mutual exclusivity and prerequisites
+fn validate_create_options(opts: &CreateOptions) -> Result<()> {
+    // Validate --no-network and --web-port are mutually exclusive
+    if opts.no_network && opts.web_port.is_some() {
+        return Err(NetworkError::ConflictingOptions(
+            "Cannot use --no-network with --web-port. Selkies web streaming requires networking."
+                .to_string(),
+        )
+        .into());
+    }
+
+    // Validate --no-network and --network-bridge are mutually exclusive
+    if opts.no_network && opts.network_bridge.is_some() {
+        return Err(NetworkError::ConflictingOptions(
+            "Cannot use --no-network with --network-bridge. These options are mutually exclusive."
+                .to_string(),
+        )
+        .into());
+    }
+
+    if opts.no_network {
+        info!("Network-disabled mode: VM will use vsock for display forwarding");
+    }
+
+    // Validate bridge interface exists if specified
+    if let Some(ref bridge) = opts.network_bridge {
+        let bridge_path = format!("/sys/class/net/{}", bridge);
+        if !Path::new(&bridge_path).exists() {
+            error!("Bridge interface '{}' not found.", bridge);
+            println!("\nTo create a bridge (one-time setup):");
+            println!("  1. Find your network interface: nmcli device status");
+            println!("  2. Create bridge:");
+            println!(
+                "     sudo nmcli connection add type bridge ifname {} con-name {}",
+                bridge, bridge
+            );
+            println!(
+                "     sudo nmcli connection add type bridge-slave ifname <your-interface> master {}",
+                bridge
+            );
+            println!("     sudo nmcli connection up {}", bridge);
+            return Err(NetworkError::BridgeNotFound(bridge.clone()).into());
+        }
+        info!("Using bridged networking via '{}'", bridge);
+    }
+
+    Ok(())
+}
+
+/// Build VM config from options, detecting devices as needed
+fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
+    if let Some(path) = opts.config_path {
+        return Ok(toml::from_str::<AppVMConfig>(&std::fs::read_to_string(
+            path,
+        )?)?);
+    }
+
+    let vm_name = opts.name.unwrap_or_else(|| {
+        if !opts.flatpak_packages.is_empty() {
+            format!("{}-vm", opts.flatpak_packages[0].replace('.', "-"))
+        } else if !opts.system_packages.is_empty() {
+            format!("{}-vm", opts.system_packages[0])
+        } else {
+            format!(
+                "app-vm-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("System clock is set before UNIX epoch")
+                    .as_secs()
+            )
+        }
+    });
+
+    // Validate VM name
+    AppVMConfig::validate_vm_name(&vm_name)?;
+
+    let pci_devices = if !opts.pci_addresses.is_empty() {
+        info!("Detecting PCI devices...");
+        opts.pci_addresses
+            .iter()
+            .map(|addr| provisioner::detect_pci_device(addr))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    let usb_devices = if !opts.usb_addresses.is_empty() {
+        info!("Detecting USB devices...");
+        opts.usb_addresses
+            .iter()
+            .map(|addr| provisioner::detect_usb_device(addr))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    let shared_folders = if !opts.share_paths.is_empty() {
+        info!("Configuring shared folders...");
+        opts.share_paths
+            .iter()
+            .map(|path| parse_share_path(path, opts.share_readonly))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(AppVMConfig::new(
+        vm_name,
+        opts.memory,
+        opts.vcpus,
+        opts.disk,
+        opts.system_packages,
+        opts.flatpak_packages,
+        opts.headless,
+        pci_devices,
+        opts.pci_hotplug,
+        opts.web_port,
+        usb_devices,
+        opts.usb_hotplug,
+        shared_folders,
+        opts.network_bridge,
+        opts.grant_device_access,
+        opts.no_network,
+    ))
+}
+
+/// Display VM configuration summary
+fn display_config_summary(config: &AppVMConfig) {
+    println!("\n📋 VM Configuration:");
+    println!("   Name: {}", config.name);
+    println!(
+        "   Mode: {}",
+        if config.headless {
+            "Headless (CLI only)"
+        } else {
+            "GUI (Xpra)"
+        }
+    );
+    if let Some(port) = config.web_port {
+        println!(
+            "   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)",
+            port
+        );
+    }
+    println!("   System Packages: {:?}", config.system_packages);
+    println!("   Flatpak Packages: {:?}", config.flatpak_packages);
+    println!("   Memory: {} MB", config.memory_mb);
+    println!("   vCPUs: {}", config.vcpus);
+    println!("   Disk: {} GB", config.disk_size_gb);
+    if !config.usb_devices.is_empty() {
+        println!(
+            "   USB Devices: {} device(s){}",
+            config.usb_devices.len(),
+            if config.usb_hotplug {
+                " (hot-plug)"
+            } else {
+                " (permanent)"
+            }
+        );
+        for usb in &config.usb_devices {
+            println!(
+                "     - {} ({}:{})",
+                usb.description, usb.vendor_id, usb.product_id
+            );
+        }
+    }
+    if !config.shared_folders.is_empty() {
+        println!(
+            "   Shared Folders: {} folder(s)",
+            config.shared_folders.len()
+        );
+        for folder in &config.shared_folders {
+            println!(
+                "     - {} -> {} ({})",
+                folder.host_path,
+                folder.guest_path,
+                if folder.readonly {
+                    "read-only"
+                } else {
+                    "read-write"
+                }
+            );
+        }
+    }
+    match &config.network_mode {
+        config::NetworkMode::None => println!("   Network: Disabled (vsock for display)"),
+        config::NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
+        config::NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
+    }
+}
+
+/// Save VM config and password to disk
+fn save_config_and_passwords(config: &AppVMConfig) -> Result<String> {
+    let config_dir = AppVMConfig::config_dir()?;
+    std::fs::create_dir_all(&config_dir)?;
+    let config_file = AppVMConfig::config_path(&config.name)?;
+    std::fs::write(&config_file, toml::to_string_pretty(config)?)?;
+    info!("Configuration saved to: {}", config_file);
+
+    let mut passwords = VMPasswords::load_or_create(&config_dir)?;
+    passwords.add_vm(&config.name, &config.user_password);
+    passwords.save(&config_dir)?;
+
+    Ok(config_file)
+}
+
+/// Handle post-provisioning tasks like vsock CID retrieval
+fn handle_post_provisioning(config: &mut AppVMConfig, config_file: &str) -> Result<()> {
+    if config.enable_vsock {
+        match provisioner::get_vsock_cid(&config.name) {
+            Ok(cid) => {
+                info!("Vsock CID assigned: {}", cid);
+                config.vsock_cid = Some(cid);
+                // Re-save config with CID
+                std::fs::write(config_file, toml::to_string_pretty(config)?)?;
+            }
+            Err(e) => {
+                warn!("Could not retrieve vsock CID: {}", e);
+                warn!(
+                    "Display forwarding may not work. Check 'virsh dumpxml {}'",
+                    config.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Display success message after VM creation
+fn display_success_message(config: &AppVMConfig) {
+    println!("\n✅ VM created successfully!");
+    println!("   VM Name: {}", config.name);
+    println!("   Username: user");
+    println!("   Password: {}", config.user_password);
+    if config.enable_vsock {
+        println!("   Vsock CID: {}", config.vsock_cid.unwrap_or(0));
+    }
+    println!("   Start with: vm-provisioner start {}", config.name);
+}
+
 fn init_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
@@ -262,179 +525,39 @@ fn create_vm(
     info!("VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
 
-    // Validate --no-network and --web-port are mutually exclusive
-    if no_network && web_port.is_some() {
-        return Err(NetworkError::ConflictingOptions(
-            "Cannot use --no-network with --web-port. Selkies web streaming requires networking."
-                .to_string(),
-        )
-        .into());
-    }
-
-    // Validate --no-network and --network-bridge are mutually exclusive
-    if no_network && network_bridge.is_some() {
-        return Err(NetworkError::ConflictingOptions(
-            "Cannot use --no-network with --network-bridge. These options are mutually exclusive."
-                .to_string(),
-        )
-        .into());
-    }
-
-    if no_network {
-        info!("Network-disabled mode: VM will use vsock for display forwarding");
-    }
-
-    // Validate bridge interface exists if specified
-    if let Some(ref bridge) = network_bridge {
-        let bridge_path = format!("/sys/class/net/{}", bridge);
-        if !Path::new(&bridge_path).exists() {
-            error!("Bridge interface '{}' not found.", bridge);
-            println!("\nTo create a bridge (one-time setup):");
-            println!("  1. Find your network interface: nmcli device status");
-            println!("  2. Create bridge:");
-            println!(
-                "     sudo nmcli connection add type bridge ifname {} con-name {}",
-                bridge, bridge
-            );
-            println!(
-                "     sudo nmcli connection add type bridge-slave ifname <your-interface> master {}",
-                bridge
-            );
-            println!("     sudo nmcli connection up {}", bridge);
-            return Err(NetworkError::BridgeNotFound(bridge.clone()).into());
-        }
-        info!("Using bridged networking via '{}'", bridge);
-    }
-
-    let config = if let Some(path) = config_path {
-        toml::from_str::<AppVMConfig>(&std::fs::read_to_string(path)?)?
-    } else {
-        let vm_name = name.unwrap_or_else(|| {
-            if !flatpak_packages.is_empty() {
-                format!("{}-vm", flatpak_packages[0].replace('.', "-"))
-            } else if !system_packages.is_empty() {
-                format!("{}-vm", system_packages[0])
-            } else {
-                format!(
-                    "app-vm-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("System clock is set before UNIX epoch")
-                        .as_secs()
-                )
-            }
-        });
-
-        let pci_devices = if !pci_addresses.is_empty() {
-            info!("Detecting PCI devices...");
-            pci_addresses
-                .iter()
-                .map(|addr| provisioner::detect_pci_device(addr))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-
-        let usb_devices = if !usb_addresses.is_empty() {
-            info!("Detecting USB devices...");
-            usb_addresses
-                .iter()
-                .map(|addr| provisioner::detect_usb_device(addr))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-
-        let shared_folders = if !share_paths.is_empty() {
-            info!("Configuring shared folders...");
-            share_paths
-                .iter()
-                .map(|path| parse_share_path(path, share_readonly))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-
-        AppVMConfig::new(
-            vm_name,
-            memory,
-            vcpus,
-            disk,
-            system_packages,
-            flatpak_packages,
-            headless,
-            pci_devices,
-            pci_hotplug,
-            web_port,
-            usb_devices,
-            usb_hotplug,
-            shared_folders,
-            network_bridge,
-            grant_device_access,
-            no_network,
-        )
+    let opts = CreateOptions {
+        name,
+        system_packages,
+        flatpak_packages,
+        skip_confirm,
+        config_path,
+        memory,
+        vcpus,
+        disk,
+        headless,
+        pci_addresses,
+        pci_hotplug,
+        web_port,
+        usb_addresses,
+        usb_hotplug,
+        share_paths,
+        share_readonly,
+        network_bridge,
+        grant_device_access,
+        no_network,
     };
 
-    println!("\n📋 VM Configuration:");
-    println!("   Name: {}", config.name);
-    println!(
-        "   Mode: {}",
-        if config.headless {
-            "Headless (CLI only)"
-        } else {
-            "GUI (Xpra)"
-        }
-    );
-    if let Some(port) = config.web_port {
-        println!(
-            "   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)",
-            port
-        );
-    }
-    println!("   System Packages: {:?}", config.system_packages);
-    println!("   Flatpak Packages: {:?}", config.flatpak_packages);
-    println!("   Memory: {} MB", config.memory_mb);
-    println!("   vCPUs: {}", config.vcpus);
-    println!("   Disk: {} GB", config.disk_size_gb);
-    if !config.usb_devices.is_empty() {
-        println!(
-            "   USB Devices: {} device(s){}",
-            config.usb_devices.len(),
-            if config.usb_hotplug {
-                " (hot-plug)"
-            } else {
-                " (permanent)"
-            }
-        );
-        for usb in &config.usb_devices {
-            println!(
-                "     - {} ({}:{})",
-                usb.description, usb.vendor_id, usb.product_id
-            );
-        }
-    }
-    if !config.shared_folders.is_empty() {
-        println!("   Shared Folders: {} folder(s)", config.shared_folders.len());
-        for folder in &config.shared_folders {
-            println!(
-                "     - {} -> {} ({})",
-                folder.host_path,
-                folder.guest_path,
-                if folder.readonly {
-                    "read-only"
-                } else {
-                    "read-write"
-                }
-            );
-        }
-    }
-    match &config.network_mode {
-        config::NetworkMode::None => println!("   Network: Disabled (vsock for display)"),
-        config::NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
-        config::NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
-        config::NetworkMode::VpnOnly => println!("   Network: VPN Only"),
-    }
+    // Validate options
+    validate_create_options(&opts)?;
 
+    // Build configuration
+    let skip_confirm = opts.skip_confirm;
+    let config = build_config(opts)?;
+
+    // Display summary
+    display_config_summary(&config);
+
+    // Confirm with user
     if !skip_confirm
         && !Confirm::new()
             .with_prompt("Proceed with VM creation?")
@@ -445,58 +568,25 @@ fn create_vm(
         return Ok(());
     }
 
-    let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
-    std::fs::create_dir_all(&config_dir)?;
-    let config_file = format!("{}/{}.toml", config_dir, config.name);
-    std::fs::write(&config_file, toml::to_string_pretty(&config)?)?;
-    info!("Configuration saved to: {}", config_file);
+    // Save config and passwords
+    let config_file = save_config_and_passwords(&config)?;
 
-    let mut passwords = VMPasswords::load_or_create(&config_dir)?;
-    passwords.add_vm(&config.name, &config.user_password);
-    passwords.save(&config_dir)?;
-
+    // Provision VM
     let mut config = config;
     AppVMProvisioner::new(config.clone()).provision_vm()?;
 
-    // Retrieve and save vsock CID if enabled
-    if config.enable_vsock {
-        match provisioner::get_vsock_cid(&config.name) {
-            Ok(cid) => {
-                info!("Vsock CID assigned: {}", cid);
-                config.vsock_cid = Some(cid);
-                // Re-save config with CID
-                std::fs::write(&config_file, toml::to_string_pretty(&config)?)?;
-            }
-            Err(e) => {
-                warn!("Could not retrieve vsock CID: {}", e);
-                warn!(
-                    "Display forwarding may not work. Check 'virsh dumpxml {}'",
-                    config.name
-                );
-            }
-        }
-    }
+    // Handle post-provisioning tasks
+    handle_post_provisioning(&mut config, &config_file)?;
 
-    println!("\n✅ VM created successfully!");
-    println!("   VM Name: {}", config.name);
-    println!("   Username: user");
-    println!("   Password: {}", config.user_password);
-    if config.enable_vsock {
-        println!("   Vsock CID: {}", config.vsock_cid.unwrap_or(0));
-    }
-    println!("   Start with: vm-provisioner start {}", config.name);
+    // Display success message
+    display_success_message(&config);
 
     Ok(())
 }
 
 fn start_vm(name: String) -> Result<()> {
     info!("Starting VM: {}", name);
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
 
     AppVMProvisioner::new(config.clone()).start_vm()?;
 
@@ -520,12 +610,7 @@ fn start_vm(name: String) -> Result<()> {
 
 fn stop_vm(name: String) -> Result<()> {
     info!("Stopping VM: {}", name);
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
     AppVMProvisioner::new(config).stop_vm()?;
     info!("VM stopped");
     Ok(())
@@ -533,7 +618,7 @@ fn stop_vm(name: String) -> Result<()> {
 
 fn list_vms() -> Result<()> {
     println!("📋 Available VMs:");
-    let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
+    let config_dir = AppVMConfig::config_dir()?;
     if !Path::new(&config_dir).exists() {
         println!("No VMs configured yet.");
         return Ok(());
@@ -541,8 +626,14 @@ fn list_vms() -> Result<()> {
     for entry in std::fs::read_dir(&config_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|s| s.to_str()) == Some("toml") {
-            if let Ok(config) = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(&path)?) {
-                println!("  {} [{}]", config.name, get_vm_status(&config.name));
+            // Skip the password file
+            if path.file_stem().and_then(|s| s.to_str()) == Some("vm-passwords") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(config) = toml::from_str::<AppVMConfig>(&content) {
+                    println!("  {} [{}]", config.name, get_vm_status(&config.name));
+                }
             }
         }
     }
@@ -563,12 +654,8 @@ fn destroy_vm(name: String, skip_confirm: bool) -> Result<()> {
         return Ok(());
     }
 
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(&config_file)?)?;
+    let config_file = AppVMConfig::config_path(&name)?;
+    let config = AppVMConfig::load(&name)?;
 
     let bridge = get_display_bridge(&config)?;
     bridge.remove_desktop_files()?;
@@ -634,7 +721,27 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
 
     // Validate host path exists
     if !Path::new(host_path).exists() {
-        return Err(ConfigError::Invalid(format!("Host path '{}' does not exist", host_path)).into());
+        return Err(
+            ConfigError::Invalid(format!("Host path '{}' does not exist", host_path)).into(),
+        );
+    }
+
+    // Validate host path is a directory
+    if !Path::new(host_path).is_dir() {
+        return Err(ConfigError::Invalid(format!(
+            "Host path '{}' is not a directory",
+            host_path
+        ))
+        .into());
+    }
+
+    // Validate guest path is absolute
+    if !guest_path.starts_with('/') {
+        return Err(ConfigError::Invalid(format!(
+            "Guest path '{}' must be absolute (start with /)",
+            guest_path
+        ))
+        .into());
     }
 
     // Generate a tag from guest path (replace / with _ and remove leading _)
@@ -644,6 +751,13 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect::<String>();
+
+    if tag.is_empty() {
+        return Err(ConfigError::Invalid(
+            "Guest path must contain alphanumeric characters".to_string(),
+        )
+        .into());
+    }
 
     debug!(
         "{} -> {} ({})",
@@ -661,7 +775,7 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
 }
 
 fn show_passwords() -> Result<()> {
-    let config_dir = format!("{}/.config/vm-provisioner", std::env::var("HOME")?);
+    let config_dir = AppVMConfig::config_dir()?;
     let passwords = VMPasswords::load_or_create(&config_dir)?;
     if passwords.vms.is_empty() {
         println!("ℹ️  No VM passwords stored yet");
@@ -676,12 +790,7 @@ fn show_passwords() -> Result<()> {
 
 fn generate_shortcuts(name: String) -> Result<()> {
     info!("Generating application shortcuts for VM: {}", name);
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
 
     if get_vm_status(&name) != "running" {
         error!(
@@ -703,12 +812,7 @@ fn generate_shortcuts(name: String) -> Result<()> {
 
 fn launch_app(name: String, app: String) -> Result<()> {
     info!("Launching application in VM: {}", name);
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
 
     if get_vm_status(&name) != "running" {
         error!(
@@ -725,12 +829,7 @@ fn launch_app(name: String, app: String) -> Result<()> {
 
 fn list_apps(name: String) -> Result<()> {
     println!("📱 Applications available in VM: {}", name);
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
 
     let bridge = get_display_bridge(&config)?;
     let apps = bridge.list_applications();
@@ -765,12 +864,7 @@ fn usb_attach(name: String, device: String) -> Result<()> {
     );
 
     // Load config to create provisioner
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
     let provisioner = AppVMProvisioner::new(config);
 
     // Attach the device
@@ -795,12 +889,7 @@ fn usb_detach(name: String, device: String) -> Result<()> {
     );
 
     // Load config to create provisioner
-    let config_file = format!(
-        "{}/.config/vm-provisioner/{}.toml",
-        std::env::var("HOME")?,
-        name
-    );
-    let config = toml::from_str::<AppVMConfig>(&std::fs::read_to_string(config_file)?)?;
+    let config = AppVMConfig::load(&name)?;
     let provisioner = AppVMProvisioner::new(config);
 
     // Detach the device

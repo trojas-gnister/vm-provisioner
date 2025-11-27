@@ -103,8 +103,6 @@ pub struct AppVMConfig {
     // Security settings
     pub network_mode: NetworkMode,
     pub firewall_rules: Vec<String>,
-    #[serde(default)]
-    pub vpn_config: Option<VpnConfig>,
 
     // Vsock (for network-disabled VMs)
     #[serde(default)]
@@ -130,17 +128,70 @@ pub enum NetworkMode {
     Nat,
     None,
     Bridge(String),
-    VpnOnly,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VpnConfig {
-    pub provider: String,
-    pub config_path: String,
-    pub credentials_path: Option<String>,
 }
 
 impl AppVMConfig {
+    /// Validate a VM name
+    ///
+    /// VM names must be 1-64 characters, containing only alphanumeric chars,
+    /// hyphens, or underscores.
+    pub fn validate_vm_name(name: &str) -> crate::error::Result<()> {
+        if name.is_empty() {
+            return Err(crate::error::ConfigError::Invalid(
+                "VM name cannot be empty".to_string(),
+            )
+            .into());
+        }
+        if name.len() > 64 {
+            return Err(crate::error::ConfigError::Invalid(
+                "VM name must be 64 characters or less".to_string(),
+            )
+            .into());
+        }
+        let valid = name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+        if !valid {
+            return Err(crate::error::ConfigError::Invalid(
+                "VM name must contain only alphanumeric characters, hyphens, or underscores"
+                    .to_string(),
+            )
+            .into());
+        }
+        // Prevent names that could cause path traversal or shell issues
+        if name.starts_with('-') || name.starts_with('.') {
+            return Err(crate::error::ConfigError::Invalid(
+                "VM name cannot start with '-' or '.'".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Load a VM configuration from disk by name
+    pub fn load(vm_name: &str) -> crate::error::Result<Self> {
+        let config_path = Self::config_path(vm_name)?;
+        let content = std::fs::read_to_string(&config_path)?;
+        Ok(toml::from_str(&content)?)
+    }
+
+    /// Get the path to a VM's configuration file
+    pub fn config_path(vm_name: &str) -> crate::error::Result<String> {
+        Ok(format!(
+            "{}/.config/vm-provisioner/{}.toml",
+            std::env::var("HOME")?,
+            vm_name
+        ))
+    }
+
+    /// Get the directory containing all VM configurations
+    pub fn config_dir() -> crate::error::Result<String> {
+        Ok(format!(
+            "{}/.config/vm-provisioner",
+            std::env::var("HOME")?
+        ))
+    }
+
     pub fn new(
         name: String,
         memory_mb: u64,
@@ -226,7 +277,6 @@ impl AppVMConfig {
                 "OUTPUT -p tcp --dport 80 -j ACCEPT".to_string(),
                 "OUTPUT -p tcp --dport 443 -j ACCEPT".to_string(),
             ],
-            vpn_config: None,
 
             // Vsock is auto-enabled for network-disabled VMs
             vsock_cid: None, // Will be populated after VM creation
@@ -238,18 +288,13 @@ impl AppVMConfig {
 }
 
 fn generate_password() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("System clock is set before UNIX epoch")
-        .as_nanos()
-        .hash(&mut hasher);
-    format!("vm-{:x}", hasher.finish())
-        .chars()
-        .take(12)
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
         .collect()
 }

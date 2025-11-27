@@ -114,7 +114,12 @@ impl XpraManager {
                 if line.contains("ipv4") {
                     if let Some(ip_part) = line.split_whitespace().nth(3) {
                         if let Some(ip) = ip_part.split('/').next() {
-                            return Ok(ip.to_string());
+                            // Validate IP address format before returning
+                            if Self::validate_ip_address(ip) {
+                                return Ok(ip.to_string());
+                            } else {
+                                warn!("Invalid IP address format from virsh: {}", ip);
+                            }
                         }
                     }
                 }
@@ -125,6 +130,11 @@ impl XpraManager {
             "Could not determine VM IP address. VM may not be running.".to_string(),
         )
         .into())
+    }
+
+    /// Validate an IP address string
+    fn validate_ip_address(ip: &str) -> bool {
+        ip.parse::<std::net::Ipv4Addr>().is_ok()
     }
 
     fn resolve_vm_ip(&self) -> Result<String> {
@@ -440,7 +450,40 @@ impl DisplayBridge for XpraManager {
             return Err(DisplayError::LaunchFailed("Empty command".to_string()).into());
         }
 
-        Command::new("sh").arg("-c").arg(&exec_command).spawn()?;
+        // Ensure DISPLAY is set for Xpra to work on Wayland compositors (Sway, etc.)
+        // The sudo call for virsh can strip environment variables, so we need to
+        // explicitly pass DISPLAY to the spawned process
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| {
+            // Try to detect XWayland display from running process
+            if let Ok(output) = Command::new("pgrep").args(["-a", "Xwayland"]).output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().next() {
+                    // Extract :N from "Xwayland :0 -rootless..."
+                    if let Some(disp) = line.split_whitespace().find(|s| s.starts_with(':')) {
+                        debug!("Detected XWayland display: {}", disp);
+                        return disp.to_string();
+                    }
+                }
+            }
+            ":0".to_string()
+        });
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&exec_command);
+        cmd.env("DISPLAY", &display);
+
+        // Pass WAYLAND_DISPLAY if available (for native Wayland fallback)
+        if let Ok(wd) = std::env::var("WAYLAND_DISPLAY") {
+            cmd.env("WAYLAND_DISPLAY", &wd);
+        }
+
+        // Pass XDG_RUNTIME_DIR for Wayland socket access
+        if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            cmd.env("XDG_RUNTIME_DIR", &xdg_runtime);
+        }
+
+        debug!("Launching xpra with DISPLAY={}", display);
+        cmd.spawn()?;
 
         info!("Application launched via Xpra");
         Ok(())

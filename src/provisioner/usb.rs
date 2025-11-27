@@ -51,13 +51,22 @@ impl UsbPassthrough for super::AppVMProvisioner {
 
             fs::remove_file(&xml_path)?;
 
-            if result.is_err() || !result?.success() {
-                warn!(
-                    "Failed to attach USB device {}:{}",
-                    device.vendor_id, device.product_id
-                );
-            } else {
-                info!("USB device attached permanently");
+            match result {
+                Ok(status) if status.success() => {
+                    info!("USB device attached permanently");
+                }
+                Ok(status) => {
+                    warn!(
+                        "Failed to attach USB device {}:{} (exit code: {:?})",
+                        device.vendor_id, device.product_id, status.code()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to attach USB device {}:{}: {}",
+                        device.vendor_id, device.product_id, e
+                    );
+                }
             }
         }
 

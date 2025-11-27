@@ -143,10 +143,20 @@ impl PciPassthrough for super::AppVMProvisioner {
 
             fs::remove_file(&xml_path)?;
 
-            if result.is_err() || !result?.success() {
-                warn!("Failed to attach {} to VM XML", device.address);
-            } else {
-                info!("{} attached to VM (permanent)", device.address);
+            match result {
+                Ok(status) if status.success() => {
+                    info!("{} attached to VM (permanent)", device.address);
+                }
+                Ok(status) => {
+                    warn!(
+                        "Failed to attach {} to VM XML (exit code: {:?})",
+                        device.address,
+                        status.code()
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to attach {} to VM XML: {}", device.address, e);
+                }
             }
         }
 
@@ -193,10 +203,20 @@ impl PciPassthrough for super::AppVMProvisioner {
 
             fs::remove_file(&xml_path)?;
 
-            if result.is_err() || !result?.success() {
-                warn!("Failed to attach {}", device.address);
-            } else {
-                info!("{} attached successfully", device.address);
+            match result {
+                Ok(status) if status.success() => {
+                    info!("{} attached successfully", device.address);
+                }
+                Ok(status) => {
+                    warn!(
+                        "Failed to attach {} (exit code: {:?})",
+                        device.address,
+                        status.code()
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to attach {}: {}", device.address, e);
+                }
             }
         }
 
@@ -233,8 +253,20 @@ impl PciPassthrough for super::AppVMProvisioner {
 
             fs::remove_file(&xml_path)?;
 
-            if result.is_ok() && result?.success() {
-                info!("{} detached from VM", device.address);
+            match result {
+                Ok(status) if status.success() => {
+                    info!("{} detached from VM", device.address);
+                }
+                Ok(status) => {
+                    debug!(
+                        "Detach {} returned exit code: {:?}",
+                        device.address,
+                        status.code()
+                    );
+                }
+                Err(e) => {
+                    debug!("Detach {} failed: {}", device.address, e);
+                }
             }
 
             thread::sleep(Duration::from_millis(500));
@@ -267,9 +299,14 @@ impl PciPassthrough for super::AppVMProvisioner {
                 ])
                 .status();
 
-            if result.is_err() || !result?.success() {
-                // Device may already be unbound, not a fatal error
-                debug!("Device {} may already be unbound", address);
+            match result {
+                Ok(status) if status.success() => {
+                    debug!("Device {} unbound successfully", address);
+                }
+                Ok(_) | Err(_) => {
+                    // Device may already be unbound, not a fatal error
+                    debug!("Device {} may already be unbound", address);
+                }
             }
         }
 
@@ -291,8 +328,12 @@ impl PciPassthrough for super::AppVMProvisioner {
             .args(["bash", "-c", &format!("echo '{}' > {}", new_id, new_id_path)])
             .status();
 
-        if result.is_err() || !result?.success() {
-            // May already be bound, try manual bind
+        let needs_manual_bind = match result {
+            Ok(status) if status.success() => false,
+            _ => true, // May already be bound, try manual bind
+        };
+
+        if needs_manual_bind {
             let bind_path = "/sys/bus/pci/drivers/vfio-pci/bind";
             Command::new("sudo")
                 .args([

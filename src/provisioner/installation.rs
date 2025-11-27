@@ -314,7 +314,6 @@ impl Installation for super::AppVMProvisioner {
             NetworkMode::Bridge(bridge_name) => format!("bridge={},model=virtio", bridge_name),
             NetworkMode::Nat => "network=default,model=virtio".to_string(),
             NetworkMode::None => "network=default,model=virtio".to_string(), // Temporary for install
-            NetworkMode::VpnOnly => "network=default,model=virtio".to_string(),
         };
         virt_install_args.extend_from_slice(&["--network", &network_arg]);
 
