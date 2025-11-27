@@ -4,5 +4,6 @@ debug
 target
 *.md
 !README.md
+!CHANGELOG.md
 # keep AGENTS.md ignored even though it consolidates other docs
 AGENTS.md
