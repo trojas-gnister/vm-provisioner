@@ -1,112 +1,160 @@
 # VM Provisioner
 
-**Qubes-like application isolation using libvirt/KVM.** Run each application in its own Fedora VM with seamless window integration—apps appear as native windows on your desktop.
+**Run desktop applications in isolated Fedora VMs with seamless window integration.** Each app gets its own virtual machine, but windows appear natively on your desktop—no visible VM boundary.
 
-## Why?
+## Why Use This?
 
-- **Security through isolation:** Each app runs in a separate VM, preventing cross-application attacks
-- **Seamless UX:** Windows appear natively via Xpra—no visible VM boundary
-- **Dynamic provisioning:** Install any combination of dnf packages and Flatpaks on-demand
+| Traditional VMs | VM Provisioner |
+|-----------------|----------------|
+| Full desktop in a window | Individual app windows on your desktop |
+| Manual guest OS install | Automated Fedora provisioning |
+| Static configuration | Dynamic package installation |
+| Shared attack surface | One VM per app = isolation |
+
+**Use cases:**
+- Run untrusted software without risking your system
+- Isolate browsers for banking, social media, or sketchy websites
+- Test software in a clean environment
+- Separate work and personal applications
 
 ## Quick Start
 
-### Prerequisites
+### 1. Prerequisites
 
+**Fedora:**
 ```bash
-# Fedora
-sudo dnf install libvirt qemu-kvm virt-install virt-viewer xpra
+sudo dnf install libvirt qemu-kvm virt-install xpra
 sudo systemctl enable --now libvirtd
-
-# Debian/Ubuntu
-sudo apt install libvirt-daemon qemu-kvm virtinst virt-viewer xpra
-sudo systemctl enable --now libvirtd
+sudo usermod -aG libvirt $USER  # Log out and back in after this
 ```
 
-### Install
+**Debian/Ubuntu:**
+```bash
+sudo apt install libvirt-daemon-system qemu-kvm virtinst xpra
+sudo systemctl enable --now libvirtd
+sudo usermod -aG libvirt $USER  # Log out and back in after this
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S libvirt qemu-full virt-install xpra
+sudo systemctl enable --now libvirtd
+sudo usermod -aG libvirt $USER  # Log out and back in after this
+```
+
+### 2. Install VM Provisioner
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/trojas-gnister/vm-provisioner.git
 cd vm-provisioner
 cargo build --release
-sudo cp target/release/vm-provisioner /usr/local/bin/
+sudo install -m 755 target/release/vm-provisioner /usr/local/bin/
 ```
 
-### Your First VM
+### 3. Create Your First VM
 
 ```bash
-# Create a browser VM
+# Create a browser VM (first run downloads Fedora ISO, ~5-10 minutes)
 vm-provisioner create --flatpak io.gitlab.librewolf-community --name browser
 
-# Start it
+# Start the VM
 vm-provisioner start browser
 
-# Generate desktop shortcuts (run after VM boots)
+# Wait ~30 seconds for VM to boot, then generate shortcuts
 vm-provisioner generate-shortcuts browser
 
-# Launch the browser (or click the generated .desktop file)
+# Launch the browser
 vm-provisioner launch browser "flatpak run io.gitlab.librewolf-community"
 ```
 
-## Usage
+The browser window appears on your desktop just like a native app.
 
-### Creating VMs
+## Command Reference
 
-```bash
-# GUI VM with Flatpak
-vm-provisioner create --flatpak org.mozilla.firefox --name firefox-vm
-
-# GUI VM with system packages
-vm-provisioner create --system gimp inkscape --name graphics-vm
-
-# Mixed packages with custom resources
-vm-provisioner create \
-  --system git gcc nodejs \
-  --flatpak com.visualstudio.code \
-  --memory 8192 --disk 40 \
-  --name dev-vm
-
-# Headless/CLI-only VM
-vm-provisioner create --system python3 git --headless --name cli-vm
-```
-
-### Managing VMs
+### VM Lifecycle
 
 | Command | Description |
 |---------|-------------|
-| `vm-provisioner list` | Show all VMs and their status |
-| `vm-provisioner start <name>` | Boot a VM |
-| `vm-provisioner stop <name>` | Graceful shutdown |
-| `vm-provisioner destroy <name> -y` | Delete VM and all data |
-| `vm-provisioner console <name>` | Serial console access |
-| `vm-provisioner passwords` | Show VM credentials |
-| `vm-provisioner generate-shortcuts <name>` | Create .desktop files for installed apps |
-| `vm-provisioner launch <name> "<cmd>"` | Run a command in the VM |
-| `vm-provisioner apps <name>` | List installed applications |
+| `create` | Provision a new VM with specified packages |
+| `start <vm>` | Boot a stopped VM |
+| `stop <vm>` | Graceful shutdown (saves state) |
+| `destroy <vm> -y` | Permanently delete VM and disk image |
+| `list` | Show all VMs with status and IP addresses |
 
-### Desktop Integration
+### Application Management
 
-After running `generate-shortcuts`, applications appear in your system menu under the VM name. Shortcuts are stored in `~/.local/share/applications/` with a `vm-provisioner-` prefix.
+| Command | Description |
+|---------|-------------|
+| `launch <vm> "command"` | Run a command in the VM via Xpra |
+| `generate-shortcuts <vm>` | Create .desktop files in `~/.local/share/applications/` |
+| `apps <vm>` | List launchable applications |
 
-## Advanced Features
+### Utilities
 
-### USB Passthrough
+| Command | Description |
+|---------|-------------|
+| `passwords` | Display VM user credentials |
+| `console <vm>` | Attach to VM serial console (Ctrl+] to exit) |
 
-Pass USB devices directly to VMs for webcams, audio devices, etc.
+Run `vm-provisioner --help` or `vm-provisioner <command> --help` for all options.
+
+## Creating VMs
+
+### Basic Examples
 
 ```bash
-# Find device IDs
-lsusb
-# Example output: Bus 001 Device 003: ID 046d:c52b Logitech Unifying Receiver
+# Flatpak application (recommended for GUI apps)
+vm-provisioner create --flatpak org.mozilla.firefox --name firefox
 
-# Pass device to VM
-vm-provisioner create \
-  --flatpak org.mozilla.firefox \
-  --usb 046d:c52b \
-  --name webcam-vm
+# System packages
+vm-provisioner create --system gimp inkscape --name graphics
 
-# Hot-plug mode (device returns to host when VM stops)
-vm-provisioner create --flatpak ... --usb 046d:c52b --usb-hotplug --name vm
+# Mixed: system packages + Flatpaks
+vm-provisioner create --system git nodejs --flatpak com.visualstudio.code --name dev
+
+# Headless VM (no GUI, SSH/console access only)
+vm-provisioner create --system python3 git --headless --name cli-tools
 ```
+
+### Resource Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--memory` | 2048 | RAM in MB |
+| `--vcpus` | 2 | Virtual CPU cores |
+| `--disk` | 20 | Disk size in GB |
+
+```bash
+# High-resource VM for development
+vm-provisioner create \
+  --flatpak com.visualstudio.code \
+  --memory 8192 \
+  --vcpus 4 \
+  --disk 50 \
+  --name dev-workstation
+```
+
+## Hardware Passthrough
+
+### USB Devices
+
+Pass USB devices (webcams, audio interfaces, hardware keys) directly to VMs:
+
+```bash
+# Find your device
+lsusb
+# Bus 001 Device 005: ID 046d:0825 Logitech HD Webcam C270
+
+# Create VM with USB passthrough
+vm-provisioner create --flatpak org.mozilla.firefox --usb 046d:0825 --name webcam-vm
+```
+
+**Hot-plug mode** returns devices to the host when the VM stops:
+```bash
+vm-provisioner create --flatpak ... --usb 046d:0825 --usb-hotplug --name vm
+```
+
+> **Note:** For Flatpak apps to access USB devices, add `--grant-device-access`.
 
 ### Shared Folders
 
@@ -116,102 +164,167 @@ Share host directories with VMs using virtiofs:
 vm-provisioner create \
   --flatpak com.visualstudio.code \
   --share /home/user/projects:/mnt/projects \
-  --share /home/user/Documents:/mnt/Documents \
-  --name dev-vm
+  --name dev
 
-# Read-only sharing
+# Read-only mode (applies to all --share paths)
 vm-provisioner create ... --share /path:/mnt/path --share-readonly
 ```
 
-### PCI Passthrough (GPU, etc.)
+Inside the VM, shared folders mount automatically at the specified guest path (e.g., `/mnt/projects`).
 
-Requires IOMMU enabled in BIOS (`intel_iommu=on` or `amd_iommu=on` in kernel cmdline).
+### PCI/GPU Passthrough
+
+Pass entire PCI devices (GPUs, network cards, etc.) to VMs.
+
+**Requirements:**
+1. Enable IOMMU in BIOS
+2. Add kernel parameter: `intel_iommu=on` (Intel) or `amd_iommu=on` (AMD)
+3. Reboot
 
 ```bash
 # Find device address
-lspci -nn -D | grep -i nvidia
+lspci -nn -D | grep -i vga
+# 0000:01:00.0 VGA compatible controller [0300]: NVIDIA...
 
 vm-provisioner create \
   --flatpak org.mozilla.firefox \
-  --pci 0000:01:00.0 --pci 0000:01:00.1 \
+  --pci 0000:01:00.0 \
   --pci-hotplug \
   --name gpu-vm
 ```
 
-### Web-Based Access (Selkies-GStreamer)
+> **Warning:** Passing your only GPU will make the host display unusable. Use `--pci-hotplug` to return the device when the VM stops.
 
-Access VMs from any browser without installing xpra:
+## Networking Options
+
+### Default (NAT)
+
+VMs get IPs on a private network (192.168.122.x) and can access the internet. Find a VM's IP with:
+
+```bash
+vm-provisioner list
+# or
+virsh domifaddr <vm-name>
+```
+
+### Bridged Networking
+
+Give VMs an IP directly on your LAN (useful for accessing from other devices):
+
+```bash
+# One-time setup: create a network bridge
+# WARNING: This briefly disconnects your network
+nmcli device status  # Find your interface (e.g., enp0s31f6)
+sudo nmcli connection add type bridge ifname br0 con-name br0
+sudo nmcli connection add type bridge-slave ifname enp0s31f6 master br0
+sudo nmcli connection up br0
+
+# Create VM on the bridge
+vm-provisioner create --flatpak ... --network-bridge br0 --name lan-accessible
+```
+
+### Network-Disabled (Airgapped)
+
+Maximum isolation—VM has no network interface:
+
+```bash
+vm-provisioner create --flatpak ... --no-network --name airgapped
+```
+
+Display forwarding uses virtio-vsock (host-guest communication channel) instead of SSH over TCP. Requires `socat` on both host and guest.
+
+## Web-Based Remote Access
+
+Access VMs from any browser using Selkies-GStreamer (WebRTC streaming):
 
 ```bash
 vm-provisioner create \
   --flatpak io.gitlab.librewolf-community \
   --web-port 8080 \
   --name remote-browser
-
-# Access at http://<vm-ip>:8080/
-# Login: user / <password from vm-provisioner passwords>
 ```
 
-### Bridged Networking
+After booting, access at `http://<vm-ip>:8080/`. Login with:
+- Username: `user`
+- Password: from `vm-provisioner passwords`
 
-Give VMs a LAN IP (useful for accessing from other devices):
+Useful for accessing VMs from mobile devices or machines without Xpra installed.
 
-```bash
-# One-time bridge setup
-sudo nmcli connection add type bridge ifname br0 con-name br0
-sudo nmcli connection add type bridge-slave ifname <your-interface> master br0
-sudo nmcli connection up br0
+## Configuration Files
 
-# Create VM with bridge
-vm-provisioner create --flatpak ... --network-bridge br0 --name lan-vm
-```
+Configs are stored in `~/.config/vm-provisioner/`:
 
-### Network-Disabled VMs
+| File | Contents |
+|------|----------|
+| `<vm-name>.toml` | VM configuration (memory, packages, network mode, etc.) |
+| `vm-passwords.toml` | Credentials for all VMs |
 
-For maximum isolation, create airgapped VMs:
-
-```bash
-vm-provisioner create --flatpak ... --no-network --name airgapped-vm
-```
-
-Display forwarding uses vsock instead of SSH.
-
-## Configuration
-
-VM configs are stored in `~/.config/vm-provisioner/<vm-name>.toml`:
-
-```toml
-name = "browser-vm"
-memory_mb = 2048
-vcpus = 2
-disk_size_gb = 20
-system_packages = ["xpra", "xorg-x11-server-Xvfb", ...]
-flatpak_packages = ["org.mozilla.firefox"]
-display_protocol = "Xpra"
-network_mode = "Nat"
-```
-
-Passwords are stored separately in `~/.config/vm-provisioner/vm-passwords.toml`.
+You can edit `.toml` files directly, but changes only take effect after recreating the VM.
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Missing virtualization tools | Install `libvirt`, `qemu-kvm`, `virt-install`; ensure `libvirtd` is running |
-| Xpra drops when VPN connects | Allow LAN traffic (192.168.122.0/24) in VPN settings |
-| `generate-shortcuts` fails | VM must be running—wait a few seconds after boot |
-| No audio | Check host PulseAudio is running (`pactl info`) |
-| Old Waypipe config | Configs auto-migrate; recreate VMs for best results |
+### Common Issues
+
+**Permission denied / Cannot connect to libvirt**
+```bash
+# Add yourself to the libvirt group
+sudo usermod -aG libvirt $USER
+# Log out and back in, or run: newgrp libvirt
+```
+
+**VM won't start: "network 'default' is not active"**
+```bash
+sudo virsh net-start default
+sudo virsh net-autostart default
+```
+
+**Xpra drops when VPN connects**
+
+Your VPN may block local network traffic. Either:
+- Allow 192.168.122.0/24 in VPN split-tunnel settings, or
+- Use `--network-bridge` for LAN networking
+
+**No audio in VM**
+
+Check PulseAudio is running on the host:
+```bash
+pactl info
+```
+
+For low-latency audio input (microphones), use USB passthrough instead of network audio:
+```bash
+vm-provisioner create --usb <audio-device-id> --usb-hotplug ...
+```
+
+**generate-shortcuts says VM not found**
+
+The VM must be running. After `vm-provisioner start`, wait ~30 seconds for the network to come up.
+
+### Getting Help
+
+```bash
+vm-provisioner --help
+vm-provisioner create --help
+```
 
 ## Development
 
 ```bash
-cargo fmt
-cargo clippy --all-targets
-cargo test
+cargo build           # Debug build
+cargo build --release # Release build
+cargo test            # Run tests
+cargo fmt             # Format code
 ```
 
-New display protocols can be added by implementing the `DisplayBridge` trait in `src/display_bridge.rs`.
+### Architecture
+
+- `src/main.rs` — CLI interface and command routing
+- `src/config.rs` — VM configuration structures
+- `src/provisioner/` — VM lifecycle (create, start, stop, destroy)
+- `src/xpra_manager.rs` — Xpra display bridge implementation
+- `src/templates/` — Kickstart shell script templates
+
+To add a new display protocol, implement the `DisplayBridge` trait in `src/display_bridge.rs`.
 
 ## License
 
