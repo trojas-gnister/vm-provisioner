@@ -360,3 +360,82 @@ impl PciPassthrough for super::AppVMProvisioner {
         Ok(())
     }
 }
+
+// ============================================================================
+// Standalone IOMMU helper functions (for library consumers)
+// ============================================================================
+
+// These functions are library-only exports for external consumers building
+// tools like virt-isolation-usb. The CLI binary doesn't use them directly.
+
+/// Check if IOMMU is enabled on the system.
+///
+/// This checks kernel messages for IOMMU or DMAR (Intel VT-d) indicators.
+/// Note: This may require root privileges to read dmesg.
+///
+/// # Returns
+/// - `Ok(true)` if IOMMU appears to be enabled
+/// - `Ok(false)` if IOMMU does not appear to be enabled
+/// - `Err` if unable to check (e.g., dmesg not available)
+#[allow(dead_code)] // Library-only export
+pub fn check_iommu_enabled() -> Result<bool> {
+    let dmesg = Command::new("dmesg").output()?;
+    let dmesg_str = String::from_utf8_lossy(&dmesg.stdout);
+    Ok(dmesg_str.contains("IOMMU") || dmesg_str.contains("DMAR"))
+}
+
+/// Get the IOMMU group number for a PCI device.
+///
+/// # Arguments
+/// * `address` - PCI address in format "0000:00:14.0"
+///
+/// # Returns
+/// - `Some(group)` if the device has an IOMMU group
+/// - `None` if IOMMU is not enabled or device not found
+#[allow(dead_code)] // Library-only export
+pub fn get_iommu_group(address: &str) -> Option<u32> {
+    let path = format!("/sys/bus/pci/devices/{}/iommu_group", address);
+    fs::read_link(&path)
+        .ok()
+        .and_then(|p| p.file_name()?.to_str()?.parse().ok())
+}
+
+/// List all PCI device addresses in an IOMMU group.
+///
+/// # Arguments
+/// * `group` - IOMMU group number
+///
+/// # Returns
+/// Vector of PCI addresses (e.g., ["0000:00:14.0", "0000:00:14.2"])
+#[allow(dead_code)] // Library-only export
+pub fn list_iommu_group_devices(group: u32) -> Result<Vec<String>> {
+    let group_path = format!("/sys/kernel/iommu_groups/{}/devices", group);
+    let mut devices = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&group_path) {
+        for entry in entries.flatten() {
+            if let Some(device_name) = entry.file_name().to_str() {
+                devices.push(device_name.to_string());
+            }
+        }
+    }
+
+    Ok(devices)
+}
+
+/// Check if an IOMMU group contains only one device.
+///
+/// A "clean" IOMMU group with a single device is ideal for PCI passthrough
+/// as it can be passed through without affecting other devices.
+///
+/// # Arguments
+/// * `group` - IOMMU group number
+///
+/// # Returns
+/// - `Ok(true)` if the group contains exactly one device
+/// - `Ok(false)` if the group contains multiple devices
+#[allow(dead_code)] // Library-only export
+pub fn is_clean_iommu_group(group: u32) -> Result<bool> {
+    let devices = list_iommu_group_devices(group)?;
+    Ok(devices.len() == 1)
+}

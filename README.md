@@ -326,6 +326,82 @@ cargo fmt             # Format code
 
 To add a new display protocol, implement the `DisplayBridge` trait in `src/display_bridge.rs`.
 
+## Library Usage
+
+vm-provisioner can be used as a Rust library in your own projects:
+
+### Add Dependency
+
+```toml
+[dependencies]
+vm-provisioner = { git = "https://github.com/trojas-gnister/vm-provisioner" }
+```
+
+### Example
+
+```rust
+use vm_provisioner::{AppVMConfigBuilder, AppVMProvisioner, Installation};
+
+fn main() -> vm_provisioner::Result<()> {
+    let config = AppVMConfigBuilder::new("my-vm")
+        .memory_mb(2048)
+        .vcpus(2)
+        .add_system_package("nginx")
+        .headless(true)
+        .build()?;
+
+    let provisioner = AppVMProvisioner::new(config);
+    provisioner.provision_vm()?;
+
+    Ok(())
+}
+```
+
+### Custom Kickstart Scripts
+
+Inject custom setup scripts into the VM provisioning process:
+
+```rust
+let config = AppVMConfigBuilder::new("custom-vm")
+    .add_system_package("usbip")
+    .custom_kickstart(r#"
+        # Custom setup script
+        systemctl enable my-custom-service
+        echo "Custom setup complete"
+    "#)
+    .build()?;
+```
+
+### IOMMU Helpers
+
+Check IOMMU status for PCI passthrough:
+
+```rust
+use vm_provisioner::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group};
+
+if check_iommu_enabled()? {
+    if let Some(group) = get_iommu_group("0000:00:14.0") {
+        if is_clean_iommu_group(group)? {
+            println!("Device is safe for passthrough");
+        }
+    }
+}
+```
+
+### Available Exports
+
+| Type | Description |
+|------|-------------|
+| `AppVMConfigBuilder` | Builder pattern for VM configuration |
+| `AppVMProvisioner` | Main provisioner struct |
+| `Installation`, `Lifecycle` | Traits for VM operations |
+| `PciPassthrough`, `UsbPassthrough` | Traits for device passthrough |
+| `check_iommu_enabled()` | Check if IOMMU is enabled |
+| `get_iommu_group()` | Get IOMMU group for a PCI device |
+| `is_clean_iommu_group()` | Check if group has single device |
+| `detect_pci_device()` | Detect PCI device by address |
+| `detect_usb_device()` | Detect USB device by vendor:product |
+
 ## License
 
 MIT

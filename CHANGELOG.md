@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2025-11-29
+
+### Added
+- **Library support**: vm-provisioner can now be used as a Rust library dependency via GitHub
+  - Add to your project: `vm-provisioner = { git = "https://github.com/trojas-gnister/vm-provisioner" }`
+- **`AppVMConfigBuilder`**: Builder pattern for ergonomic VM configuration
+  - Fluent API with sensible defaults
+  - Methods: `memory_mb()`, `vcpus()`, `add_system_package()`, `headless()`, `no_network()`, etc.
+- **`custom_kickstart` field**: Inject custom setup scripts into VM provisioning
+  - Scripts inserted before the final cleanup/reboot in kickstart files
+  - Useful for custom service configuration, package setup, etc.
+- **IOMMU helper functions**: Standalone functions for PCI passthrough preparation
+  - `check_iommu_enabled()` - Check if IOMMU is enabled on the system
+  - `get_iommu_group(address)` - Get IOMMU group for a PCI device
+  - `list_iommu_group_devices(group)` - List all devices in an IOMMU group
+  - `is_clean_iommu_group(group)` - Check if group has single device (safe for passthrough)
+- **Re-exported traits**: `Installation`, `Lifecycle`, `PciPassthrough`, `UsbPassthrough` now available from crate root
+- **Cargo.toml metadata**: Added `repository`, `readme`, `keywords`, and `categories` fields
+
+### Changed
+- **`AppVMProvisioner.config` is now public**: Library consumers can access/modify VM configuration
+- **lib.rs documentation**: Added library usage example in module docs
+
 ## [1.2.0] - 2025-11-27
 
 ### Security

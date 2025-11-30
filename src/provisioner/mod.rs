@@ -20,6 +20,8 @@ use crate::config::AppVMConfig;
 
 // Re-export public functions for external use
 pub use device_detection::{detect_pci_device, detect_usb_device, get_vsock_cid};
+#[allow(unused_imports)] // Library-only exports: used by external consumers, not the CLI binary
+pub use pci::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group, list_iommu_group_devices};
 
 // Re-export traits for method access
 pub use installation::Installation;
@@ -27,7 +29,8 @@ pub use lifecycle::Lifecycle;
 
 /// Main provisioner struct that orchestrates VM creation and management
 pub struct AppVMProvisioner {
-    pub(crate) config: AppVMConfig,
+    /// The VM configuration. Public for library consumers to access/modify.
+    pub config: AppVMConfig,
 }
 
 impl AppVMProvisioner {

@@ -112,6 +112,12 @@ pub struct AppVMConfig {
 
     // Authentication
     pub user_password: String,
+
+    // Custom kickstart additions (for library consumers)
+    /// Custom kickstart script to inject before the final reboot command.
+    /// Used by library consumers to add custom setup steps.
+    #[serde(default)]
+    pub custom_kickstart: Option<String>,
 }
 
 // Remove AppType enum as we're now using dynamic packages
@@ -283,6 +289,9 @@ impl AppVMConfig {
             enable_vsock: no_network,
 
             user_password: generate_password(),
+
+            // No custom kickstart by default
+            custom_kickstart: None,
         }
     }
 }
@@ -297,4 +306,253 @@ fn generate_password() -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+// ============================================================================
+// Builder pattern for AppVMConfig (for library consumers)
+// ============================================================================
+
+/// Builder for creating AppVMConfig with sensible defaults.
+///
+/// This provides an ergonomic way to construct VM configurations
+/// when using vm-provisioner as a library.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use vm_provisioner::AppVMConfigBuilder;
+///
+/// let config = AppVMConfigBuilder::new("my-vm")
+///     .memory_mb(2048)
+///     .vcpus(2)
+///     .add_system_package("nginx")
+///     .build()?;
+/// ```
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
+pub struct AppVMConfigBuilder {
+    name: String,
+    memory_mb: u64,
+    vcpus: u32,
+    disk_size_gb: u64,
+    system_packages: Vec<String>,
+    flatpak_packages: Vec<String>,
+    headless: bool,
+    pci_devices: Vec<PciDevice>,
+    pci_hotplug: bool,
+    usb_devices: Vec<UsbDevice>,
+    usb_hotplug: bool,
+    shared_folders: Vec<SharedFolder>,
+    network_mode: NetworkMode,
+    web_port: Option<u16>,
+    grant_device_access: bool,
+    custom_kickstart: Option<String>,
+}
+
+#[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
+impl AppVMConfigBuilder {
+    /// Create a new builder with required name and sensible defaults.
+    ///
+    /// Default values:
+    /// - memory_mb: 2048
+    /// - vcpus: 2
+    /// - disk_size_gb: 20
+    /// - headless: false
+    /// - network_mode: Nat
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            memory_mb: 2048,
+            vcpus: 2,
+            disk_size_gb: 20,
+            system_packages: Vec::new(),
+            flatpak_packages: Vec::new(),
+            headless: false,
+            pci_devices: Vec::new(),
+            pci_hotplug: false,
+            usb_devices: Vec::new(),
+            usb_hotplug: false,
+            shared_folders: Vec::new(),
+            network_mode: NetworkMode::Nat,
+            web_port: None,
+            grant_device_access: false,
+            custom_kickstart: None,
+        }
+    }
+
+    /// Set the VM memory in megabytes.
+    pub fn memory_mb(mut self, mb: u64) -> Self {
+        self.memory_mb = mb;
+        self
+    }
+
+    /// Set the number of virtual CPUs.
+    pub fn vcpus(mut self, count: u32) -> Self {
+        self.vcpus = count;
+        self
+    }
+
+    /// Set the disk size in gigabytes.
+    pub fn disk_size_gb(mut self, gb: u64) -> Self {
+        self.disk_size_gb = gb;
+        self
+    }
+
+    /// Set the system packages to install.
+    pub fn system_packages(mut self, packages: Vec<String>) -> Self {
+        self.system_packages = packages;
+        self
+    }
+
+    /// Add a single system package to install.
+    pub fn add_system_package(mut self, package: impl Into<String>) -> Self {
+        self.system_packages.push(package.into());
+        self
+    }
+
+    /// Set the Flatpak packages to install.
+    pub fn flatpak_packages(mut self, packages: Vec<String>) -> Self {
+        self.flatpak_packages = packages;
+        self
+    }
+
+    /// Add a single Flatpak package to install.
+    pub fn add_flatpak_package(mut self, package: impl Into<String>) -> Self {
+        self.flatpak_packages.push(package.into());
+        self
+    }
+
+    /// Set whether the VM is headless (no GUI).
+    pub fn headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
+    }
+
+    /// Set the PCI devices to pass through.
+    pub fn pci_devices(mut self, devices: Vec<PciDevice>) -> Self {
+        self.pci_devices = devices;
+        self
+    }
+
+    /// Add a single PCI device to pass through.
+    pub fn add_pci_device(mut self, device: PciDevice) -> Self {
+        self.pci_devices.push(device);
+        self
+    }
+
+    /// Set whether to use PCI hotplug (attach/detach while VM running).
+    pub fn pci_hotplug(mut self, hotplug: bool) -> Self {
+        self.pci_hotplug = hotplug;
+        self
+    }
+
+    /// Set the USB devices to pass through.
+    pub fn usb_devices(mut self, devices: Vec<UsbDevice>) -> Self {
+        self.usb_devices = devices;
+        self
+    }
+
+    /// Add a single USB device to pass through.
+    pub fn add_usb_device(mut self, device: UsbDevice) -> Self {
+        self.usb_devices.push(device);
+        self
+    }
+
+    /// Set whether to use USB hotplug.
+    pub fn usb_hotplug(mut self, hotplug: bool) -> Self {
+        self.usb_hotplug = hotplug;
+        self
+    }
+
+    /// Set the shared folders (virtiofs).
+    pub fn shared_folders(mut self, folders: Vec<SharedFolder>) -> Self {
+        self.shared_folders = folders;
+        self
+    }
+
+    /// Add a single shared folder.
+    pub fn add_shared_folder(mut self, folder: SharedFolder) -> Self {
+        self.shared_folders.push(folder);
+        self
+    }
+
+    /// Set the network mode.
+    pub fn network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network_mode = mode;
+        self
+    }
+
+    /// Configure the VM with no network (airgapped).
+    pub fn no_network(mut self) -> Self {
+        self.network_mode = NetworkMode::None;
+        self
+    }
+
+    /// Configure the VM with bridged networking.
+    pub fn bridge(mut self, bridge_name: impl Into<String>) -> Self {
+        self.network_mode = NetworkMode::Bridge(bridge_name.into());
+        self
+    }
+
+    /// Set the web streaming port (for Selkies-GStreamer).
+    pub fn web_port(mut self, port: u16) -> Self {
+        self.web_port = Some(port);
+        self
+    }
+
+    /// Grant Flatpak apps access to all devices.
+    pub fn grant_device_access(mut self, grant: bool) -> Self {
+        self.grant_device_access = grant;
+        self
+    }
+
+    /// Set custom kickstart script additions.
+    ///
+    /// This script will be inserted into the kickstart file before
+    /// the final cleanup and reboot commands.
+    pub fn custom_kickstart(mut self, script: impl Into<String>) -> Self {
+        self.custom_kickstart = Some(script.into());
+        self
+    }
+
+    /// Build the final AppVMConfig.
+    ///
+    /// This validates the configuration and returns the built config.
+    pub fn build(self) -> crate::error::Result<AppVMConfig> {
+        // Validate VM name
+        AppVMConfig::validate_vm_name(&self.name)?;
+
+        // Determine network bridge if applicable
+        let network_bridge = match &self.network_mode {
+            NetworkMode::Bridge(name) => Some(name.clone()),
+            _ => None,
+        };
+
+        let no_network = matches!(self.network_mode, NetworkMode::None);
+
+        // Build config using existing constructor
+        let mut config = AppVMConfig::new(
+            self.name,
+            self.memory_mb,
+            self.vcpus,
+            self.disk_size_gb,
+            self.system_packages,
+            self.flatpak_packages,
+            self.headless,
+            self.pci_devices,
+            self.pci_hotplug,
+            self.web_port,
+            self.usb_devices,
+            self.usb_hotplug,
+            self.shared_folders,
+            network_bridge,
+            self.grant_device_access,
+            no_network,
+        );
+
+        // Apply custom kickstart if provided
+        config.custom_kickstart = self.custom_kickstart;
+
+        Ok(config)
+    }
 }

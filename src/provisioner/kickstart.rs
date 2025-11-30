@@ -53,6 +53,9 @@ impl KickstartGeneration for super::AppVMProvisioner {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Build custom kickstart section if provided
+        let custom_kickstart = self.build_custom_kickstart();
+
         // Generate the complete kickstart file
         let kickstart_content = format!(
             r#"# Kickstart file for Application VM
@@ -114,6 +117,8 @@ systemctl disable cups
 # Set hostname
 echo "{vm_name}" > /etc/hostname
 
+{custom_kickstart}
+
 echo ""
 echo "=== POST-INSTALL SCRIPT COMPLETED ==="
 echo "Check logs at /var/log/kickstart-post.log and /var/log/kickstart-post-detailed.log"
@@ -134,7 +139,8 @@ reboot"#,
             flatpak_config = flatpak_config,
             audio_config = audio_config,
             display_specific_config = display_specific_config,
-            firewall_rules = firewall_rules
+            firewall_rules = firewall_rules,
+            custom_kickstart = custom_kickstart
         );
 
         fs::write(&kickstart_path, kickstart_content)?;
@@ -202,5 +208,20 @@ EOF
 chmod +x /home/user/.local/bin/start-pipewire.sh
 chown -R user:user /home/user/.local/bin"#
             .to_string()
+    }
+
+    /// Build custom kickstart section if provided
+    fn build_custom_kickstart(&self) -> String {
+        match &self.config.custom_kickstart {
+            Some(script) => {
+                format!(
+                    r#"
+# Custom kickstart additions (injected by library consumer)
+{}"#,
+                    script
+                )
+            }
+            None => String::new(),
+        }
     }
 }
