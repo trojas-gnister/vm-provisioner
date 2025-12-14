@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use config::{AppVMConfig, SharedFolder};
+use config::{AppVMConfig, CpuMode, CpuPinning, CpuTopology, SharedFolder, VcpuPin};
 use display_bridge::DisplayBridge;
 use error::{ConfigError, NetworkError, Result};
 use provisioner::{detect_usb_device, AppVMProvisioner, Installation, Lifecycle};
@@ -112,6 +112,15 @@ enum Commands {
         /// Disable networking entirely (uses vsock for display forwarding)
         #[arg(long)]
         no_network: bool,
+        /// Pin vCPU to host CPU (format: "vcpu:cpuset" e.g., "0:8" or "0:8,9" or "0:8-11")
+        #[arg(long = "cpu-pin", action = clap::ArgAction::Append)]
+        cpu_pin: Vec<String>,
+        /// Pin QEMU emulator to host CPUs (format: "cpu,cpu,..." or "start-end")
+        #[arg(long = "emulator-pin")]
+        emulator_pin: Option<String>,
+        /// Set CPU topology for guest (format: "sockets:cores:threads" e.g., "1:4:2")
+        #[arg(long = "cpu-topology")]
+        cpu_topology: Option<String>,
     },
     Start {
         name: String,
@@ -181,6 +190,9 @@ struct CreateOptions {
     network_bridge: Option<String>,
     grant_device_access: bool,
     no_network: bool,
+    cpu_pins: Vec<String>,
+    emulator_pin: Option<String>,
+    cpu_topology: Option<String>,
 }
 
 /// Validate create options for mutual exclusivity and prerequisites
@@ -289,7 +301,43 @@ fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
         Vec::new()
     };
 
-    Ok(AppVMConfig::new(
+    // Parse CPU pinning configuration
+    let cpu_pinning = if !opts.cpu_pins.is_empty()
+        || opts.emulator_pin.is_some()
+        || opts.cpu_topology.is_some()
+    {
+        info!("Configuring CPU pinning...");
+
+        let vcpu_pins: Vec<VcpuPin> = opts
+            .cpu_pins
+            .iter()
+            .map(|spec| parse_cpu_pin(spec))
+            .collect::<Result<Vec<_>>>()?;
+
+        let emulator_pin = if let Some(ref spec) = opts.emulator_pin {
+            Some(parse_cpuset(spec)?)
+        } else {
+            None
+        };
+
+        let topology = if let Some(ref spec) = opts.cpu_topology {
+            Some(parse_cpu_topology(spec)?)
+        } else {
+            None
+        };
+
+        CpuPinning {
+            enabled: true,
+            vcpu_pins,
+            emulator_pin,
+            topology,
+            cpu_mode: CpuMode::HostPassthrough,
+        }
+    } else {
+        CpuPinning::default()
+    };
+
+    let mut config = AppVMConfig::new(
         vm_name,
         opts.memory,
         opts.vcpus,
@@ -306,7 +354,14 @@ fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
         opts.network_bridge,
         opts.grant_device_access,
         opts.no_network,
-    ))
+    );
+
+    // Apply CPU pinning if configured
+    if cpu_pinning.enabled {
+        config.cpu_pinning = cpu_pinning;
+    }
+
+    Ok(config)
 }
 
 /// Display VM configuration summary
@@ -371,6 +426,25 @@ fn display_config_summary(config: &AppVMConfig) {
         config::NetworkMode::None => println!("   Network: Disabled (vsock for display)"),
         config::NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
         config::NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
+    }
+    if config.cpu_pinning.enabled {
+        println!("   CPU Pinning: Enabled (host-passthrough)");
+        if !config.cpu_pinning.vcpu_pins.is_empty() {
+            for pin in &config.cpu_pinning.vcpu_pins {
+                let cpuset: Vec<String> = pin.cpuset.iter().map(|c| c.to_string()).collect();
+                println!("     - vCPU {} → host CPU(s) {}", pin.vcpu, cpuset.join(","));
+            }
+        }
+        if let Some(ref emulator) = config.cpu_pinning.emulator_pin {
+            let cpuset: Vec<String> = emulator.iter().map(|c| c.to_string()).collect();
+            println!("     - Emulator → host CPU(s) {}", cpuset.join(","));
+        }
+        if let Some(ref topo) = config.cpu_pinning.topology {
+            println!(
+                "     - Topology: {} socket(s), {} core(s), {} thread(s)",
+                topo.sockets, topo.cores, topo.threads
+            );
+        }
     }
 }
 
@@ -464,6 +538,9 @@ fn main() -> Result<()> {
             network_bridge,
             grant_device_access,
             no_network,
+            cpu_pin,
+            emulator_pin,
+            cpu_topology,
         } => {
             create_vm(
                 name,
@@ -485,6 +562,9 @@ fn main() -> Result<()> {
                 network_bridge,
                 grant_device_access,
                 no_network,
+                cpu_pin,
+                emulator_pin,
+                cpu_topology,
             )?;
         }
         Commands::Start { name } => start_vm(name)?,
@@ -522,6 +602,9 @@ fn create_vm(
     network_bridge: Option<String>,
     grant_device_access: bool,
     no_network: bool,
+    cpu_pins: Vec<String>,
+    emulator_pin: Option<String>,
+    cpu_topology: Option<String>,
 ) -> Result<()> {
     info!("VM Provisioner - Dynamic Package Installer");
     println!("==============================================");
@@ -546,6 +629,9 @@ fn create_vm(
         network_bridge,
         grant_device_access,
         no_network,
+        cpu_pins,
+        emulator_pin,
+        cpu_topology,
     };
 
     // Validate options
@@ -772,6 +858,82 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
         guest_path: guest_path.to_string(),
         tag,
         readonly,
+    })
+}
+
+/// Parse a CPU pin specification (e.g., "0:8" or "0:8,9" or "0:8-11")
+fn parse_cpu_pin(spec: &str) -> Result<VcpuPin> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ConfigError::Invalid(format!(
+            "Invalid CPU pin format '{}'. Expected 'vcpu:cpuset' (e.g., '0:8' or '0:8-9')",
+            spec
+        ))
+        .into());
+    }
+
+    let vcpu: u32 = parts[0].parse().map_err(|_| {
+        ConfigError::Invalid(format!("Invalid vCPU number: {}", parts[0]))
+    })?;
+
+    let cpuset = parse_cpuset(parts[1])?;
+
+    Ok(VcpuPin { vcpu, cpuset })
+}
+
+/// Parse a cpuset specification (e.g., "8" or "8,9" or "8-11" or "8,10-12")
+fn parse_cpuset(spec: &str) -> Result<Vec<u32>> {
+    let mut cpus = Vec::new();
+
+    for part in spec.split(',') {
+        if part.contains('-') {
+            let bounds: Vec<&str> = part.split('-').collect();
+            if bounds.len() != 2 {
+                return Err(
+                    ConfigError::Invalid(format!("Invalid CPU range: {}", part)).into(),
+                );
+            }
+            let start: u32 = bounds[0].parse().map_err(|_| {
+                ConfigError::Invalid(format!("Invalid CPU number: {}", bounds[0]))
+            })?;
+            let end: u32 = bounds[1].parse().map_err(|_| {
+                ConfigError::Invalid(format!("Invalid CPU number: {}", bounds[1]))
+            })?;
+            for cpu in start..=end {
+                cpus.push(cpu);
+            }
+        } else {
+            let cpu: u32 = part.parse().map_err(|_| {
+                ConfigError::Invalid(format!("Invalid CPU number: {}", part))
+            })?;
+            cpus.push(cpu);
+        }
+    }
+
+    Ok(cpus)
+}
+
+/// Parse CPU topology specification (e.g., "1:4:2" for 1 socket, 4 cores, 2 threads)
+fn parse_cpu_topology(spec: &str) -> Result<CpuTopology> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 3 {
+        return Err(ConfigError::Invalid(format!(
+            "Invalid CPU topology '{}'. Expected 'sockets:cores:threads' (e.g., '1:4:2')",
+            spec
+        ))
+        .into());
+    }
+
+    Ok(CpuTopology {
+        sockets: parts[0].parse().map_err(|_| {
+            ConfigError::Invalid(format!("Invalid sockets: {}", parts[0]))
+        })?,
+        cores: parts[1].parse().map_err(|_| {
+            ConfigError::Invalid(format!("Invalid cores: {}", parts[1]))
+        })?,
+        threads: parts[2].parse().map_err(|_| {
+            ConfigError::Invalid(format!("Invalid threads: {}", parts[2]))
+        })?,
     })
 }
 

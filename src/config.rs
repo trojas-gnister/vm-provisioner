@@ -27,6 +27,73 @@ pub struct SharedFolder {
     pub readonly: bool,      // default: false (read-write)
 }
 
+// ============================================================================
+// CPU Pinning Configuration
+// ============================================================================
+
+/// CPU pinning configuration for VM performance optimization.
+///
+/// Allows mapping VM vCPUs to specific host CPU cores for consistent
+/// performance in gaming and latency-sensitive workloads.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CpuPinning {
+    /// Enable CPU pinning (if false, all other fields are ignored)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Map each vCPU to specific host CPU core(s)
+    #[serde(default)]
+    pub vcpu_pins: Vec<VcpuPin>,
+
+    /// Host CPU cores for the QEMU emulator process.
+    /// Recommended: use different cores than vCPU pins to avoid contention.
+    #[serde(default)]
+    pub emulator_pin: Option<Vec<u32>>,
+
+    /// CPU topology visible to the guest OS.
+    /// Should match the vCPU count (sockets * cores * threads = vcpus).
+    #[serde(default)]
+    pub topology: Option<CpuTopology>,
+
+    /// CPU emulation mode
+    #[serde(default)]
+    pub cpu_mode: CpuMode,
+}
+
+/// Individual vCPU to host CPU mapping.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VcpuPin {
+    /// vCPU index (0-based)
+    pub vcpu: u32,
+    /// Host CPU core(s) to pin this vCPU to
+    pub cpuset: Vec<u32>,
+}
+
+/// CPU topology configuration for guest OS.
+///
+/// The total (sockets * cores * threads) should equal the VM's vcpu count.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CpuTopology {
+    /// Number of CPU sockets (usually 1)
+    pub sockets: u32,
+    /// Physical cores per socket
+    pub cores: u32,
+    /// Threads per core (2 for hyperthreading)
+    pub threads: u32,
+}
+
+/// CPU emulation mode for the VM.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub enum CpuMode {
+    /// Pass host CPU features directly to guest (best performance)
+    #[default]
+    HostPassthrough,
+    /// Copy host CPU model definition
+    HostModel,
+    /// Use a specific QEMU CPU model
+    Custom(String),
+}
+
 // Xpra is the only supported display protocol
 // Waypipe and Selkies have been deprecated
 #[derive(Debug, Serialize, Clone, PartialEq, Default)]
@@ -118,6 +185,11 @@ pub struct AppVMConfig {
     /// Used by library consumers to add custom setup steps.
     #[serde(default)]
     pub custom_kickstart: Option<String>,
+
+    // CPU pinning configuration
+    /// CPU pinning and topology for performance optimization.
+    #[serde(default)]
+    pub cpu_pinning: CpuPinning,
 }
 
 // Remove AppType enum as we're now using dynamic packages
@@ -292,6 +364,9 @@ impl AppVMConfig {
 
             // No custom kickstart by default
             custom_kickstart: None,
+
+            // CPU pinning disabled by default
+            cpu_pinning: CpuPinning::default(),
         }
     }
 }
@@ -347,6 +422,7 @@ pub struct AppVMConfigBuilder {
     web_port: Option<u16>,
     grant_device_access: bool,
     custom_kickstart: Option<String>,
+    cpu_pinning: CpuPinning,
 }
 
 #[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
@@ -377,6 +453,7 @@ impl AppVMConfigBuilder {
             web_port: None,
             grant_device_access: false,
             custom_kickstart: None,
+            cpu_pinning: CpuPinning::default(),
         }
     }
 
@@ -515,6 +592,45 @@ impl AppVMConfigBuilder {
         self
     }
 
+    /// Set the full CPU pinning configuration.
+    pub fn cpu_pinning(mut self, config: CpuPinning) -> Self {
+        self.cpu_pinning = config;
+        self
+    }
+
+    /// Enable CPU pinning with specific vCPU-to-host-CPU mappings.
+    pub fn pin_vcpus(mut self, pins: Vec<VcpuPin>) -> Self {
+        self.cpu_pinning.enabled = true;
+        self.cpu_pinning.vcpu_pins = pins;
+        self
+    }
+
+    /// Add a single vCPU pin mapping.
+    pub fn add_vcpu_pin(mut self, vcpu: u32, cpuset: Vec<u32>) -> Self {
+        self.cpu_pinning.enabled = true;
+        self.cpu_pinning.vcpu_pins.push(VcpuPin { vcpu, cpuset });
+        self
+    }
+
+    /// Set the host CPUs for the QEMU emulator process.
+    pub fn emulator_pin(mut self, cpuset: Vec<u32>) -> Self {
+        self.cpu_pinning.enabled = true;
+        self.cpu_pinning.emulator_pin = Some(cpuset);
+        self
+    }
+
+    /// Set CPU topology for the guest OS.
+    pub fn cpu_topology(mut self, sockets: u32, cores: u32, threads: u32) -> Self {
+        self.cpu_pinning.topology = Some(CpuTopology { sockets, cores, threads });
+        self
+    }
+
+    /// Set CPU emulation mode.
+    pub fn cpu_mode(mut self, mode: CpuMode) -> Self {
+        self.cpu_pinning.cpu_mode = mode;
+        self
+    }
+
     /// Build the final AppVMConfig.
     ///
     /// This validates the configuration and returns the built config.
@@ -552,6 +668,9 @@ impl AppVMConfigBuilder {
 
         // Apply custom kickstart if provided
         config.custom_kickstart = self.custom_kickstart;
+
+        // Apply CPU pinning configuration
+        config.cpu_pinning = self.cpu_pinning;
 
         Ok(config)
     }

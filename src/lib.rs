@@ -27,8 +27,8 @@ pub mod xpra_manager;
 
 // Re-export commonly used types
 pub use config::{
-    AppVMConfig, AppVMConfigBuilder, DisplayProtocol, GraphicsBackend, NetworkMode, PciDevice,
-    SharedFolder, UsbDevice,
+    AppVMConfig, AppVMConfigBuilder, CpuMode, CpuPinning, CpuTopology, DisplayProtocol,
+    GraphicsBackend, NetworkMode, PciDevice, SharedFolder, UsbDevice, VcpuPin,
 };
 pub use display_bridge::DisplayBridge;
 pub use error::{Result, VmProvisionerError};
@@ -36,13 +36,15 @@ pub use provisioner::AppVMProvisioner;
 pub use xpra_manager::XpraManager;
 
 // Re-export traits for library consumers
+pub use provisioner::cpu::CpuPinningOps;
 pub use provisioner::installation::{Installation, FEDORA_VERSION};
 pub use provisioner::lifecycle::Lifecycle;
 pub use provisioner::pci::PciPassthrough;
 pub use provisioner::usb::UsbPassthrough;
 
-// Re-export IOMMU helper functions
+// Re-export IOMMU and CPU helper functions
 pub use provisioner::{
-    check_iommu_enabled, detect_pci_device, detect_usb_device, get_iommu_group, get_vsock_cid,
-    is_clean_iommu_group, list_iommu_group_devices,
+    check_iommu_enabled, detect_host_cpu_topology, detect_pci_device, detect_usb_device,
+    get_host_cpu_count, get_iommu_group, get_vsock_cid, is_clean_iommu_group,
+    list_iommu_group_devices,
 };

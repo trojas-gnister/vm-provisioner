@@ -28,6 +28,9 @@ pub enum VmProvisionerError {
     #[error("Network error: {0}")]
     Network(#[from] NetworkError),
 
+    #[error("CPU pinning error: {0}")]
+    Cpu(#[from] CpuError),
+
     // Common error variants
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -156,6 +159,28 @@ pub enum NetworkError {
 
     #[error("Conflicting network options: {0}")]
     ConflictingOptions(String),
+}
+
+/// CPU pinning errors
+#[derive(Error, Debug)]
+pub enum CpuError {
+    #[error("Invalid CPU core: {requested} exceeds available cores ({available})")]
+    InvalidCpuCore { requested: u32, available: u32 },
+
+    #[error("Invalid vCPU index: {requested} (VM configured with {configured} vCPUs)")]
+    InvalidVcpu { requested: u32, configured: u32 },
+
+    #[error("CPU topology mismatch: topology total ({topology_total}) != vcpus ({vcpus})")]
+    TopologyMismatch { topology_total: u32, vcpus: u32 },
+
+    #[error("Failed to apply CPU pinning configuration: {0}")]
+    ConfigurationFailed(String),
+
+    #[error("Failed to read VM XML: {0}")]
+    XmlReadFailed(String),
+
+    #[error("Failed to write VM XML: {0}")]
+    XmlWriteFailed(String),
 }
 
 /// Type alias for Results using VmProvisionerError

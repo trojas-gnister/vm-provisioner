@@ -9,6 +9,7 @@
 
 use crate::config::{GraphicsBackend, NetworkMode};
 use crate::error::{ProvisioningError, Result};
+use crate::provisioner::cpu::CpuPinningOps;
 use crate::provisioner::kickstart::KickstartGeneration;
 use crate::provisioner::network::NetworkManagement;
 use crate::provisioner::pci::PciPassthrough;
@@ -74,6 +75,12 @@ impl Installation for super::AppVMProvisioner {
         // Setup USB passthrough if devices specified (permanent mode)
         if !self.config.usb_devices.is_empty() && !self.config.usb_hotplug {
             self.setup_usb_passthrough_permanent()?;
+        }
+
+        // Setup CPU pinning if enabled
+        if self.config.cpu_pinning.enabled {
+            self.validate_cpu_pinning()?;
+            self.setup_cpu_pinning_permanent()?;
         }
 
         // Remove network interface for NetworkMode::None VMs

@@ -5,9 +5,11 @@
 //! - Kickstart configuration generation
 //! - VM installation and provisioning
 //! - PCI/USB passthrough management
+//! - CPU pinning and topology
 //! - Network interface management
 //! - VM lifecycle (start/stop/destroy)
 
+pub mod cpu;
 pub mod device_detection;
 pub mod installation;
 pub mod kickstart;
@@ -22,8 +24,11 @@ use crate::config::AppVMConfig;
 pub use device_detection::{detect_pci_device, detect_usb_device, get_vsock_cid};
 #[allow(unused_imports)] // Library-only exports: used by external consumers, not the CLI binary
 pub use pci::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group, list_iommu_group_devices};
+#[allow(unused_imports)] // Library-only exports
+pub use cpu::{detect_host_cpu_topology, get_host_cpu_count};
 
 // Re-export traits for method access
+pub use cpu::CpuPinningOps;
 pub use installation::Installation;
 pub use lifecycle::Lifecycle;
 
