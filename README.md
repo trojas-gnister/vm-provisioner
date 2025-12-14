@@ -195,6 +195,55 @@ vm-provisioner create \
 
 > **Warning:** Passing your only GPU will make the host display unusable. Use `--pci-hotplug` to return the device when the VM stops.
 
+### CPU Pinning
+
+Pin VM vCPUs to specific host CPU cores for consistent performance in gaming and latency-sensitive workloads:
+
+```bash
+# Pin 8 vCPUs to host cores 8-15 (P-cores on hybrid CPU)
+vm-provisioner create \
+  --flatpak com.valvesoftware.Steam \
+  --vcpus 8 \
+  --cpu-pin "0:8" --cpu-pin "1:9" --cpu-pin "2:10" --cpu-pin "3:11" \
+  --cpu-pin "4:12" --cpu-pin "5:13" --cpu-pin "6:14" --cpu-pin "7:15" \
+  --emulator-pin "16,17" \
+  --cpu-topology "1:4:2" \
+  --name gaming
+```
+
+| Flag | Description |
+|------|-------------|
+| `--cpu-pin "vcpu:cpuset"` | Pin vCPU N to host CPU(s). Repeatable. |
+| `--emulator-pin "cpus"` | Host CPUs for QEMU emulator threads (I/O, USB handling) |
+| `--cpu-topology "s:c:t"` | Guest topology: sockets:cores:threads (must equal vcpus) |
+
+**Why pin emulator threads separately?**
+
+QEMU's emulator threads handle disk I/O, USB, and network emulation. Pinning them to different cores than vCPUs prevents hypervisor overhead from causing game stuttering. On hybrid CPUs (Intel 12th+ gen), use E-cores for emulator threads.
+
+**Library usage:**
+
+```rust
+use vm_provisioner::{AppVMConfigBuilder, CpuPinning, VcpuPin, CpuTopology, CpuMode};
+
+let cpu_pinning = CpuPinning {
+    enabled: true,
+    vcpu_pins: vec![
+        VcpuPin { vcpu: 0, cpuset: vec![8] },
+        VcpuPin { vcpu: 1, cpuset: vec![9] },
+        // ...
+    ],
+    emulator_pin: Some(vec![16, 17]),
+    topology: Some(CpuTopology { sockets: 1, cores: 4, threads: 2 }),
+    cpu_mode: CpuMode::HostPassthrough,
+};
+
+let config = AppVMConfigBuilder::new("gaming-vm")
+    .vcpus(8)
+    .cpu_pinning(cpu_pinning)
+    .build()?;
+```
+
 ## Networking Options
 
 ### Default (NAT)
@@ -328,7 +377,9 @@ To add a new display protocol, implement the `DisplayBridge` trait in `src/displ
 
 ## Library Usage
 
-vm-provisioner can be used as a Rust library in your own projects:
+vm-provisioner can be used as a Rust library in your own projects.
+
+**Integration with DistroForge:** If you use [DistroForge](https://github.com/trojas-gnister/distroforge) for declarative system configuration, vm-provisioner is integrated as the `[[vms]]` section. Define VMs in your config.toml and DistroForge handles provisioning automatically.
 
 ### Add Dependency
 
@@ -396,11 +447,15 @@ if check_iommu_enabled()? {
 | `AppVMProvisioner` | Main provisioner struct |
 | `Installation`, `Lifecycle` | Traits for VM operations |
 | `PciPassthrough`, `UsbPassthrough` | Traits for device passthrough |
+| `CpuPinningOps` | Trait for CPU pinning operations |
+| `CpuPinning`, `VcpuPin`, `CpuTopology`, `CpuMode` | CPU pinning configuration types |
 | `check_iommu_enabled()` | Check if IOMMU is enabled |
 | `get_iommu_group()` | Get IOMMU group for a PCI device |
 | `is_clean_iommu_group()` | Check if group has single device |
 | `detect_pci_device()` | Detect PCI device by address |
 | `detect_usb_device()` | Detect USB device by vendor:product |
+| `get_host_cpu_count()` | Get number of host CPU threads |
+| `detect_host_cpu_topology()` | Detect host CPU topology (cores, threads) |
 
 ## License
 

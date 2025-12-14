@@ -45,8 +45,10 @@ pub struct CpuPinning {
     #[serde(default)]
     pub vcpu_pins: Vec<VcpuPin>,
 
-    /// Host CPU cores for the QEMU emulator process.
-    /// Recommended: use different cores than vCPU pins to avoid contention.
+    /// Host CPU cores for the QEMU emulator threads (disk I/O, USB, network).
+    /// These handle hypervisor overhead and should be SEPARATE from vCPU pins
+    /// to prevent emulator work from interrupting game/VM threads.
+    /// On hybrid CPUs (Intel 12th+ gen), E-cores are ideal for emulator threads.
     #[serde(default)]
     pub emulator_pin: Option<Vec<u32>>,
 

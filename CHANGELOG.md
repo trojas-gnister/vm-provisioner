@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2025-12-14
+
+### Added
+- **CPU pinning support**: Pin VM vCPUs to specific host CPU cores for gaming and low-latency workloads
+  - `--cpu-pin "vcpu:cpuset"` - Pin individual vCPUs to host cores (e.g., `--cpu-pin "0:8"`)
+  - `--emulator-pin "cpus"` - Dedicate host cores for QEMU emulator threads (disk I/O, USB)
+  - `--cpu-topology "sockets:cores:threads"` - Set guest CPU topology
+- **`CpuPinning` configuration type**: Comprehensive CPU pinning configuration
+  - `vcpu_pins` - List of vCPU to host CPU mappings
+  - `emulator_pin` - Separate cores for QEMU overhead (recommended for hybrid CPUs)
+  - `topology` - Guest CPU topology (sockets, cores, threads)
+  - `cpu_mode` - CPU emulation mode (default: host-passthrough)
+- **`CpuPinningOps` trait**: Methods for CPU pinning validation and libvirt XML generation
+  - `validate_cpu_pinning()` - Validate pins against host CPU count
+  - `generate_cputune_xml()` - Generate libvirt `<cputune>` section
+  - `generate_cpu_xml()` - Generate libvirt `<cpu>` section
+- **CPU detection helpers**:
+  - `get_host_cpu_count()` - Get number of host CPU threads
+  - `detect_host_cpu_topology()` - Detect host cores and threads per core
+- **Builder methods**: `cpu_pinning()`, `pin_vcpus()`, `add_vcpu_pin()`, `emulator_pin()`, `cpu_topology()`, `cpu_mode()`
+
+### Changed
+- **Re-exports**: Added `CpuPinning`, `VcpuPin`, `CpuTopology`, `CpuMode`, `CpuPinningOps` to crate root
+
 ## [1.3.0] - 2025-11-29
 
 ### Added
