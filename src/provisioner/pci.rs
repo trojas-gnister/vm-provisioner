@@ -33,11 +33,15 @@ impl PciPassthrough for super::AppVMProvisioner {
     fn validate_pci_passthrough(&self) -> Result<()> {
         info!("Validating PCI passthrough setup...");
 
-        // Check IOMMU enabled
-        let dmesg = Command::new("dmesg").output()?;
-        let dmesg_str = String::from_utf8_lossy(&dmesg.stdout);
+        // Check IOMMU enabled by looking for IOMMU groups
+        // This is more reliable than dmesg which requires root privileges
+        let iommu_groups = Path::new("/sys/kernel/iommu_groups");
+        let has_iommu_groups = iommu_groups.exists()
+            && fs::read_dir(iommu_groups)
+                .map(|entries| entries.count() > 0)
+                .unwrap_or(false);
 
-        if !dmesg_str.contains("IOMMU") && !dmesg_str.contains("DMAR") {
+        if !has_iommu_groups {
             return Err(PciError::IommuNotEnabled.into());
         }
         debug!("IOMMU enabled");

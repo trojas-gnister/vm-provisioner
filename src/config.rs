@@ -33,22 +33,23 @@ pub struct SharedFolder {
 
 /// CPU pinning configuration for VM performance optimization.
 ///
-/// Allows mapping VM vCPUs to specific host CPU cores for consistent
-/// performance in gaming and latency-sensitive workloads.
+/// Simplified model: all vCPUs share a common CPU affinity set,
+/// letting the Linux scheduler handle fine-grained placement.
+///
+/// For hybrid CPUs (Intel 12th+ gen with P-cores/E-cores):
+/// - Use `cpu_affinity` to restrict vCPUs to P-cores for gaming
+/// - Use `emulator_pin` on P-cores for low-latency VFIO interrupt handling
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CpuPinning {
-    /// Enable CPU pinning (if false, all other fields are ignored)
+    /// Host CPUs that all vCPUs can run on.
+    /// Example: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15] for P-cores only
+    /// If not set, vCPUs can run on any host CPU.
     #[serde(default)]
-    pub enabled: bool,
+    pub cpu_affinity: Option<Vec<u32>>,
 
-    /// Map each vCPU to specific host CPU core(s)
-    #[serde(default)]
-    pub vcpu_pins: Vec<VcpuPin>,
-
-    /// Host CPU cores for the QEMU emulator threads (disk I/O, USB, network).
-    /// These handle hypervisor overhead and should be SEPARATE from vCPU pins
-    /// to prevent emulator work from interrupting game/VM threads.
-    /// On hybrid CPUs (Intel 12th+ gen), E-cores are ideal for emulator threads.
+    /// Host CPU cores for the QEMU emulator/VFIO threads.
+    /// Critical for GPU passthrough - use fast cores (P-cores) for low latency.
+    /// Example: [0, 1] for first P-core's hyperthreads
     #[serde(default)]
     pub emulator_pin: Option<Vec<u32>>,
 
@@ -60,15 +61,6 @@ pub struct CpuPinning {
     /// CPU emulation mode
     #[serde(default)]
     pub cpu_mode: CpuMode,
-}
-
-/// Individual vCPU to host CPU mapping.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VcpuPin {
-    /// vCPU index (0-based)
-    pub vcpu: u32,
-    /// Host CPU core(s) to pin this vCPU to
-    pub cpuset: Vec<u32>,
 }
 
 /// CPU topology configuration for guest OS.
@@ -192,6 +184,13 @@ pub struct AppVMConfig {
     /// CPU pinning and topology for performance optimization.
     #[serde(default)]
     pub cpu_pinning: CpuPinning,
+
+    // Boot mode
+    /// Use UEFI boot instead of legacy BIOS.
+    /// Required for GPU passthrough with modern GPUs.
+    /// Defaults to true when PCI devices are configured.
+    #[serde(default)]
+    pub use_uefi: bool,
 }
 
 // Remove AppType enum as we're now using dynamic packages
@@ -308,6 +307,9 @@ impl AppVMConfig {
         // Add user-specified system packages
         default_system_packages.extend(system_packages);
 
+        // Check for PCI passthrough before moving pci_devices
+        let has_pci_passthrough = !pci_devices.is_empty();
+
         Self {
             name,
             memory_mb,
@@ -369,6 +371,9 @@ impl AppVMConfig {
 
             // CPU pinning disabled by default
             cpu_pinning: CpuPinning::default(),
+
+            // Auto-enable UEFI for PCI passthrough (required for modern GPUs)
+            use_uefi: has_pci_passthrough,
         }
     }
 }
@@ -425,6 +430,7 @@ pub struct AppVMConfigBuilder {
     grant_device_access: bool,
     custom_kickstart: Option<String>,
     cpu_pinning: CpuPinning,
+    use_uefi: bool,
 }
 
 #[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
@@ -456,6 +462,7 @@ impl AppVMConfigBuilder {
             grant_device_access: false,
             custom_kickstart: None,
             cpu_pinning: CpuPinning::default(),
+            use_uefi: false,
         }
     }
 
@@ -600,23 +607,23 @@ impl AppVMConfigBuilder {
         self
     }
 
-    /// Enable CPU pinning with specific vCPU-to-host-CPU mappings.
-    pub fn pin_vcpus(mut self, pins: Vec<VcpuPin>) -> Self {
-        self.cpu_pinning.enabled = true;
-        self.cpu_pinning.vcpu_pins = pins;
+    /// Enable UEFI boot mode instead of legacy BIOS.
+    /// Required for GPU passthrough with modern GPUs that lack legacy VGA BIOS.
+    pub fn uefi(mut self, enabled: bool) -> Self {
+        self.use_uefi = enabled;
         self
     }
 
-    /// Add a single vCPU pin mapping.
-    pub fn add_vcpu_pin(mut self, vcpu: u32, cpuset: Vec<u32>) -> Self {
-        self.cpu_pinning.enabled = true;
-        self.cpu_pinning.vcpu_pins.push(VcpuPin { vcpu, cpuset });
+    /// Set the host CPUs that all vCPUs can run on.
+    /// For hybrid CPUs, use this to restrict vCPUs to P-cores.
+    pub fn cpu_affinity(mut self, cpuset: Vec<u32>) -> Self {
+        self.cpu_pinning.cpu_affinity = Some(cpuset);
         self
     }
 
-    /// Set the host CPUs for the QEMU emulator process.
+    /// Set the host CPUs for the QEMU emulator/VFIO threads.
+    /// Critical for GPU passthrough - use fast cores for low latency.
     pub fn emulator_pin(mut self, cpuset: Vec<u32>) -> Self {
-        self.cpu_pinning.enabled = true;
         self.cpu_pinning.emulator_pin = Some(cpuset);
         self
     }
@@ -673,6 +680,9 @@ impl AppVMConfigBuilder {
 
         // Apply CPU pinning configuration
         config.cpu_pinning = self.cpu_pinning;
+
+        // Apply UEFI setting - auto-enable for PCI passthrough if not explicitly set
+        config.use_uefi = self.use_uefi || !config.pci_devices.is_empty();
 
         Ok(config)
     }

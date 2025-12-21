@@ -28,6 +28,7 @@ pub use pci::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group, list_i
 pub use cpu::{detect_host_cpu_topology, get_host_cpu_count};
 
 // Re-export traits for method access
+#[allow(unused_imports)] // Library-only: used by external consumers, not the CLI binary
 pub use cpu::CpuPinningOps;
 pub use installation::Installation;
 pub use lifecycle::Lifecycle;

@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2025-12-21
+
+### Breaking Changes
+- **Simplified CPU pinning model**: Replaced per-vCPU pinning with shared CPU affinity
+  - `vcpu_pins` field replaced by `cpu_affinity` - all vCPUs share the same host CPU set
+  - Linux scheduler handles fine-grained placement within the affinity set
+  - CLI: `--cpu-pin "vcpu:cpuset"` replaced with `--cpu-affinity "cpuset"`
+  - Removed `VcpuPin` struct and `CpuPinning.enabled` field
+
+### Added
+- **UEFI boot support**: Required for GPU passthrough with modern GPUs
+  - `--uefi` CLI flag to enable UEFI boot mode
+  - `use_uefi` config field (auto-enabled when PCI devices are configured)
+  - Builder method: `uefi(bool)`
+- **ARP-based IP detection**: Fallback for bridge networking when `virsh domifaddr` fails
+  - Uses `ip neigh` to find VM by MAC address on bridge interface
+  - Falls back to `arp-scan` if available for more reliable detection
+- **Serial console**: All VMs now enable `serial-getty@ttyS0.service` for `virsh console` access
+
+### Changed
+- **IOMMU validation**: Now uses sysfs (`/sys/kernel/iommu_groups/`) instead of dmesg
+  - No longer requires root privileges for validation
+  - More reliable detection across different systems
+- **Headless VM provisioning**: Skip Xpra display bridge entirely for headless VMs
+  - Only user-specified system packages installed (no Xpra/X11 packages)
+  - SSH still configured for remote access
+- **Kickstart generation**: Always removes stale kickstart directory before generation
+- **SSH host key setup**: Skipped for passthrough VMs (they use direct display output, not Xpra)
+
+### Removed
+- `VcpuPin` struct (all vCPUs now share `cpu_affinity`)
+- `CpuPinning.enabled` field (presence of any CPU config determines enablement)
+- `--cpu-pin` CLI flag (replaced by `--cpu-affinity`)
+- `pin_vcpus()` and `add_vcpu_pin()` builder methods
+
 ## [1.4.0] - 2025-12-14
 
 ### Added

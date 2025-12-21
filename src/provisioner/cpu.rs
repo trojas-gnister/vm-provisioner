@@ -6,7 +6,7 @@
 //! - CPU topology configuration
 //! - CPU mode (host-passthrough for best performance)
 
-use crate::config::{CpuMode, CpuPinning, CpuTopology, VcpuPin};
+use crate::config::CpuMode;
 use crate::error::{CpuError, Result};
 use log::{debug, info, warn};
 use std::fs;
@@ -26,7 +26,12 @@ pub trait CpuPinningOps {
 
 impl CpuPinningOps for super::AppVMProvisioner {
     fn validate_cpu_pinning(&self) -> Result<()> {
-        if !self.config.cpu_pinning.enabled {
+        // Check if any CPU config is specified
+        let has_config = self.config.cpu_pinning.cpu_affinity.is_some()
+            || self.config.cpu_pinning.emulator_pin.is_some()
+            || self.config.cpu_pinning.topology.is_some();
+
+        if !has_config {
             return Ok(());
         }
 
@@ -36,9 +41,9 @@ impl CpuPinningOps for super::AppVMProvisioner {
         let host_cpus = get_host_cpu_count()?;
         debug!("Host has {} CPU threads", host_cpus);
 
-        // Validate vCPU pins don't exceed host CPUs
-        for pin in &self.config.cpu_pinning.vcpu_pins {
-            for &cpu in &pin.cpuset {
+        // Validate cpu_affinity doesn't reference non-existent host CPUs
+        if let Some(ref affinity) = self.config.cpu_pinning.cpu_affinity {
+            for &cpu in affinity {
                 if cpu >= host_cpus {
                     return Err(CpuError::InvalidCpuCore {
                         requested: cpu,
@@ -46,13 +51,6 @@ impl CpuPinningOps for super::AppVMProvisioner {
                     }
                     .into());
                 }
-            }
-            if pin.vcpu >= self.config.vcpus {
-                return Err(CpuError::InvalidVcpu {
-                    requested: pin.vcpu,
-                    configured: self.config.vcpus,
-                }
-                .into());
             }
         }
 
@@ -86,19 +84,25 @@ impl CpuPinningOps for super::AppVMProvisioner {
     }
 
     fn generate_cputune_xml(&self) -> Result<String> {
-        if !self.config.cpu_pinning.enabled {
+        // Check if we have any cputune settings
+        let has_affinity = self.config.cpu_pinning.cpu_affinity.is_some();
+        let has_emulator = self.config.cpu_pinning.emulator_pin.is_some();
+
+        if !has_affinity && !has_emulator {
             return Ok(String::new());
         }
 
         let mut xml = String::from("  <cputune>\n");
 
-        // Add vcpupin entries
-        for pin in &self.config.cpu_pinning.vcpu_pins {
-            let cpuset = format_cpuset(&pin.cpuset);
-            xml.push_str(&format!(
-                "    <vcpupin vcpu='{}' cpuset='{}'/>\n",
-                pin.vcpu, cpuset
-            ));
+        // Add vcpupin entries - each vCPU gets the same affinity set
+        if let Some(ref affinity) = self.config.cpu_pinning.cpu_affinity {
+            let cpuset = format_cpuset(affinity);
+            for vcpu in 0..self.config.vcpus {
+                xml.push_str(&format!(
+                    "    <vcpupin vcpu='{}' cpuset='{}'/>\n",
+                    vcpu, cpuset
+                ));
+            }
         }
 
         // Add emulatorpin if specified
@@ -112,7 +116,12 @@ impl CpuPinningOps for super::AppVMProvisioner {
     }
 
     fn generate_cpu_xml(&self) -> Result<String> {
-        if !self.config.cpu_pinning.enabled {
+        // Check if we need to generate a CPU section
+        let has_topology = self.config.cpu_pinning.topology.is_some();
+        let has_affinity = self.config.cpu_pinning.cpu_affinity.is_some();
+
+        // CPU section is needed for topology or if we have affinity (implies host-passthrough)
+        if !has_topology && !has_affinity {
             return Ok(String::new());
         }
 
@@ -136,7 +145,12 @@ impl CpuPinningOps for super::AppVMProvisioner {
     }
 
     fn setup_cpu_pinning_permanent(&self) -> Result<()> {
-        if !self.config.cpu_pinning.enabled {
+        // Check if any CPU config is specified
+        let has_config = self.config.cpu_pinning.cpu_affinity.is_some()
+            || self.config.cpu_pinning.emulator_pin.is_some()
+            || self.config.cpu_pinning.topology.is_some();
+
+        if !has_config {
             return Ok(());
         }
 

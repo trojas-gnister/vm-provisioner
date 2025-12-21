@@ -77,8 +77,11 @@ impl Installation for super::AppVMProvisioner {
             self.setup_usb_passthrough_permanent()?;
         }
 
-        // Setup CPU pinning if enabled
-        if self.config.cpu_pinning.enabled {
+        // Setup CPU pinning if configured
+        let has_cpu_config = self.config.cpu_pinning.cpu_affinity.is_some()
+            || self.config.cpu_pinning.emulator_pin.is_some()
+            || self.config.cpu_pinning.topology.is_some();
+        if has_cpu_config {
             self.validate_cpu_pinning()?;
             self.setup_cpu_pinning_permanent()?;
         }
@@ -316,6 +319,12 @@ impl Installation for super::AppVMProvisioner {
             virt_install_args.push(arg);
         }
 
+        // Add UEFI boot if enabled (required for GPU passthrough)
+        if self.config.use_uefi {
+            virt_install_args.extend_from_slice(&["--boot", "uefi"]);
+            info!("Using UEFI boot mode (required for GPU passthrough)");
+        }
+
         // Add network configuration
         let network_arg = match &self.config.network_mode {
             NetworkMode::Bridge(bridge_name) => format!("bridge={},model=virtio", bridge_name),
@@ -388,8 +397,15 @@ impl Installation for super::AppVMProvisioner {
             self.reduce_memory_after_install()?;
         }
 
-        // Accept SSH host key
-        self.accept_ssh_host_key()?;
+        // Accept SSH host key for Xpra connections (skip for passthrough VMs)
+        // VMs with GPU passthrough use direct display output, not Xpra
+        debug!("PCI devices count: {}", self.config.pci_devices.len());
+        debug!("Network mode: {:?}", self.config.network_mode);
+        if self.config.pci_devices.is_empty() && !matches!(self.config.network_mode, NetworkMode::None) {
+            self.accept_ssh_host_key()?;
+        } else {
+            info!("Skipping SSH host key setup (passthrough VM or no network)");
+        }
 
         // Stop the VM
         Command::new("sudo")
@@ -406,9 +422,16 @@ impl Installation for super::AppVMProvisioner {
         info!("Adding VM SSH host key...");
         debug!("Waiting for VM networking to be ready...");
 
+        // Get bridge name if using bridge networking
+        let bridge_name = match &self.config.network_mode {
+            NetworkMode::Bridge(name) => Some(name.clone()),
+            _ => None,
+        };
+
         // Retry getting VM IP address
         let mut vm_ip = None;
         for attempt in 1..=30 {
+            // Try virsh domifaddr first (works for NAT mode)
             let output = Command::new("sudo")
                 .args(["virsh", "-c", "qemu:///system", "domifaddr", &self.config.name])
                 .output()?;
@@ -425,9 +448,17 @@ impl Installation for super::AppVMProvisioner {
                         }
                     }
                 }
-                if vm_ip.is_some() {
-                    break;
+            }
+
+            // For bridge networking, try ARP-based detection if domifaddr failed
+            if vm_ip.is_none() {
+                if let Some(ref bridge) = bridge_name {
+                    vm_ip = self.get_vm_ip_from_arp(bridge);
                 }
+            }
+
+            if vm_ip.is_some() {
+                break;
             }
 
             if attempt < 30 {
@@ -436,9 +467,12 @@ impl Installation for super::AppVMProvisioner {
         }
 
         let vm_ip = vm_ip.ok_or_else(|| {
-            ProvisioningError::SshKeyAcceptance(
-                "Could not determine VM IP address after 60 seconds".to_string(),
-            )
+            let msg = if bridge_name.is_some() {
+                "Could not determine VM IP address after 60 seconds. For bridge networking, ensure the VM has booted and received a DHCP lease from your router.".to_string()
+            } else {
+                "Could not determine VM IP address after 60 seconds".to_string()
+            };
+            ProvisioningError::SshKeyAcceptance(msg)
         })?;
         debug!("VM IP: {}", vm_ip);
 
@@ -522,6 +556,98 @@ impl Installation for super::AppVMProvisioner {
 }
 
 impl super::AppVMProvisioner {
+    /// Get VM IP address from ARP table (for bridge networking)
+    ///
+    /// This is used when `virsh domifaddr` doesn't work (bridge mode without guest agent).
+    /// We get the VM's MAC address from libvirt and look it up in the ARP table.
+    fn get_vm_ip_from_arp(&self, bridge_name: &str) -> Option<String> {
+        // Get MAC address from virsh domiflist
+        let output = Command::new("sudo")
+            .args(["virsh", "-c", "qemu:///system", "domiflist", &self.config.name])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let mut vm_mac: Option<String> = None;
+
+        // Parse domiflist output to find MAC on the bridge
+        // Format: Interface  Type     Source   Model    MAC
+        //         vnet0      bridge   br0      virtio   52:54:00:xx:xx:xx
+        for line in output_str.lines().skip(2) {
+            // Skip header lines
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                let interface_type = parts.get(1)?;
+                let source = parts.get(2)?;
+                let mac = parts.get(4)?;
+
+                if *interface_type == "bridge" && *source == bridge_name {
+                    vm_mac = Some(mac.to_lowercase());
+                    break;
+                }
+            }
+        }
+
+        let mac = vm_mac?;
+        debug!("VM MAC address: {}", mac);
+
+        // Look up MAC in ARP table using `ip neigh`
+        let output = Command::new("ip")
+            .args(["neigh", "show", "dev", bridge_name])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+
+        // Parse ip neigh output
+        // Format: 192.168.1.x lladdr 52:54:00:xx:xx:xx REACHABLE
+        for line in output_str.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let ip = parts.first()?;
+                let lladdr_mac = parts.get(2)?;
+
+                if lladdr_mac.to_lowercase() == mac {
+                    debug!("Found VM IP via ARP: {}", ip);
+                    return Some(ip.to_string());
+                }
+            }
+        }
+
+        // Fallback: try arp-scan if available (more reliable but requires package)
+        let output = Command::new("sudo")
+            .args(["arp-scan", "--interface", bridge_name, "--localnet", "-q"])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for line in output_str.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let ip = parts.first()?;
+                        let scanned_mac = parts.get(1)?;
+
+                        if scanned_mac.to_lowercase() == mac {
+                            debug!("Found VM IP via arp-scan: {}", ip);
+                            return Some(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Build graphics arguments for virt-install
     fn build_graphics_args(&self, arch: &str) -> Vec<&'static str> {
         if self.config.headless {

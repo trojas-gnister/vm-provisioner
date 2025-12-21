@@ -17,26 +17,67 @@ impl KickstartGeneration for super::AppVMProvisioner {
     /// Generate a kickstart configuration file for automated Fedora installation
     fn generate_kickstart_config(&self) -> Result<String> {
         let kickstart_dir = format!("/tmp/{}-kickstart", self.config.name);
+
+        // Always remove existing kickstart dir to ensure fresh generation
+        if std::path::Path::new(&kickstart_dir).exists() {
+            debug!("Removing stale kickstart directory: {}", kickstart_dir);
+            fs::remove_dir_all(&kickstart_dir)?;
+        }
+
         fs::create_dir_all(&kickstart_dir)?;
 
         let kickstart_path = format!("{}/kickstart.cfg", kickstart_dir);
 
         info!("Generating kickstart configuration...");
 
-        // Xpra is the only supported display protocol
-        let display_bridge: Box<dyn DisplayBridge> = Box::new(
-            XpraManager::new(&self.config)
-                .map_err(|e| ProvisioningError::KickstartGeneration(e.to_string()))?,
-        );
+        // For headless VMs (like gaming VMs with full desktop), skip Xpra entirely
+        // and only use the user-provided system packages
+        let (packages, display_specific_config) = if self.config.headless {
+            debug!("Headless mode: skipping Xpra display bridge");
 
-        let mut base_packages = display_bridge.guest_packages();
-        base_packages.extend(self.config.system_packages.clone());
-        let packages = base_packages.join(" ");
+            // Get SSH public key for remote access (still useful for console SSH)
+            let ssh_public_key = XpraManager::get_ssh_public_key()
+                .map_err(|e| ProvisioningError::KickstartGeneration(e.to_string()))?;
 
-        // Get SSH public key
-        let ssh_public_key = XpraManager::get_ssh_public_key()
-            .map_err(|e| ProvisioningError::KickstartGeneration(e.to_string()))?;
-        let display_specific_config = display_bridge.kickstart_config(&ssh_public_key);
+            // Minimal SSH setup without Xpra-specific configuration
+            let ssh_config = format!(
+                r#"
+# SSH configuration for headless VM
+mkdir -p /home/user/.ssh
+chmod 700 /home/user/.ssh
+cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
+{ssh_key}
+SSH_KEY_EOF
+chmod 600 /home/user/.ssh/authorized_keys
+chown -R user:user /home/user/.ssh
+
+# Enable SSH server
+systemctl enable sshd
+
+# Allow SSH through firewall
+firewall-offline-cmd --add-service=ssh || true
+"#,
+                ssh_key = ssh_public_key
+            );
+
+            (self.config.system_packages.join(" "), ssh_config)
+        } else {
+            // GUI mode: use Xpra display bridge
+            let display_bridge: Box<dyn DisplayBridge> = Box::new(
+                XpraManager::new(&self.config)
+                    .map_err(|e| ProvisioningError::KickstartGeneration(e.to_string()))?,
+            );
+
+            let mut base_packages = display_bridge.guest_packages();
+            base_packages.extend(self.config.system_packages.clone());
+
+            // Get SSH public key
+            let ssh_public_key = XpraManager::get_ssh_public_key()
+                .map_err(|e| ProvisioningError::KickstartGeneration(e.to_string()))?;
+            let config = display_bridge.kickstart_config(&ssh_public_key);
+
+            (base_packages.join(" "), config)
+        };
 
         // Build Flatpak configuration
         let flatpak_config = self.build_flatpak_config();
@@ -56,6 +97,15 @@ impl KickstartGeneration for super::AppVMProvisioner {
         // Build custom kickstart section if provided
         let custom_kickstart = self.build_custom_kickstart();
 
+        // Determine bootloader config based on UEFI setting
+        // For UEFI: omit --location (anaconda handles ESP automatically)
+        // For BIOS: use --location=mbr
+        let bootloader_line = if self.config.use_uefi {
+            "bootloader --append=\"console=tty0 console=ttyS0,115200n8\"".to_string()
+        } else {
+            "bootloader --location=mbr --append=\"console=tty0 console=ttyS0,115200n8\"".to_string()
+        };
+
         // Generate the complete kickstart file
         let kickstart_content = format!(
             r#"# Kickstart file for Application VM
@@ -73,7 +123,7 @@ user --name=user --groups=wheel,video,audio,render,input --password={user_passwo
 # Disk configuration
 autopart --type=plain
 clearpart --all --initlabel
-bootloader --location=mbr
+{bootloader_line}
 
 # Security
 selinux --permissive
@@ -114,6 +164,9 @@ echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/user
 systemctl disable bluetooth
 systemctl disable cups
 
+# Enable serial console for virsh console access
+systemctl enable serial-getty@ttyS0.service
+
 # Set hostname
 echo "{vm_name}" > /etc/hostname
 
@@ -135,6 +188,7 @@ dnf clean all
 reboot"#,
             vm_name = self.config.name,
             user_password = self.config.user_password,
+            bootloader_line = bootloader_line,
             packages = packages,
             flatpak_config = flatpak_config,
             audio_config = audio_config,

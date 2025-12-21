@@ -167,9 +167,6 @@ pub enum CpuError {
     #[error("Invalid CPU core: {requested} exceeds available cores ({available})")]
     InvalidCpuCore { requested: u32, available: u32 },
 
-    #[error("Invalid vCPU index: {requested} (VM configured with {configured} vCPUs)")]
-    InvalidVcpu { requested: u32, configured: u32 },
-
     #[error("CPU topology mismatch: topology total ({topology_total}) != vcpus ({vcpus})")]
     TopologyMismatch { topology_total: u32, vcpus: u32 },
 

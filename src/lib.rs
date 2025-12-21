@@ -28,7 +28,7 @@ pub mod xpra_manager;
 // Re-export commonly used types
 pub use config::{
     AppVMConfig, AppVMConfigBuilder, CpuMode, CpuPinning, CpuTopology, DisplayProtocol,
-    GraphicsBackend, NetworkMode, PciDevice, SharedFolder, UsbDevice, VcpuPin,
+    GraphicsBackend, NetworkMode, PciDevice, SharedFolder, UsbDevice,
 };
 pub use display_bridge::DisplayBridge;
 pub use error::{Result, VmProvisionerError};

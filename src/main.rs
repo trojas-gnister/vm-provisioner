@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use config::{AppVMConfig, CpuMode, CpuPinning, CpuTopology, SharedFolder, VcpuPin};
+use config::{AppVMConfig, CpuMode, CpuPinning, CpuTopology, SharedFolder};
 use display_bridge::DisplayBridge;
 use error::{ConfigError, NetworkError, Result};
 use provisioner::{detect_usb_device, AppVMProvisioner, Installation, Lifecycle};
@@ -112,10 +112,10 @@ enum Commands {
         /// Disable networking entirely (uses vsock for display forwarding)
         #[arg(long)]
         no_network: bool,
-        /// Pin vCPU to host CPU (format: "vcpu:cpuset" e.g., "0:8" or "0:8,9" or "0:8-11")
-        #[arg(long = "cpu-pin", action = clap::ArgAction::Append)]
-        cpu_pin: Vec<String>,
-        /// Pin QEMU emulator to host CPUs (format: "cpu,cpu,..." or "start-end")
+        /// Host CPUs that all vCPUs can run on (format: "0-15" or "0,2,4,6")
+        #[arg(long = "cpu-affinity")]
+        cpu_affinity: Option<String>,
+        /// Pin QEMU emulator/VFIO threads to host CPUs (format: "0,1" or "0-3")
         #[arg(long = "emulator-pin")]
         emulator_pin: Option<String>,
         /// Set CPU topology for guest (format: "sockets:cores:threads" e.g., "1:4:2")
@@ -190,7 +190,7 @@ struct CreateOptions {
     network_bridge: Option<String>,
     grant_device_access: bool,
     no_network: bool,
-    cpu_pins: Vec<String>,
+    cpu_affinity: Option<String>,
     emulator_pin: Option<String>,
     cpu_topology: Option<String>,
 }
@@ -302,17 +302,17 @@ fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
     };
 
     // Parse CPU pinning configuration
-    let cpu_pinning = if !opts.cpu_pins.is_empty()
+    let cpu_pinning = if opts.cpu_affinity.is_some()
         || opts.emulator_pin.is_some()
         || opts.cpu_topology.is_some()
     {
         info!("Configuring CPU pinning...");
 
-        let vcpu_pins: Vec<VcpuPin> = opts
-            .cpu_pins
-            .iter()
-            .map(|spec| parse_cpu_pin(spec))
-            .collect::<Result<Vec<_>>>()?;
+        let cpu_affinity = if let Some(ref spec) = opts.cpu_affinity {
+            Some(parse_cpuset(spec)?)
+        } else {
+            None
+        };
 
         let emulator_pin = if let Some(ref spec) = opts.emulator_pin {
             Some(parse_cpuset(spec)?)
@@ -327,8 +327,7 @@ fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
         };
 
         CpuPinning {
-            enabled: true,
-            vcpu_pins,
+            cpu_affinity,
             emulator_pin,
             topology,
             cpu_mode: CpuMode::HostPassthrough,
@@ -357,7 +356,10 @@ fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
     );
 
     // Apply CPU pinning if configured
-    if cpu_pinning.enabled {
+    let has_cpu_config = cpu_pinning.cpu_affinity.is_some()
+        || cpu_pinning.emulator_pin.is_some()
+        || cpu_pinning.topology.is_some();
+    if has_cpu_config {
         config.cpu_pinning = cpu_pinning;
     }
 
@@ -427,13 +429,14 @@ fn display_config_summary(config: &AppVMConfig) {
         config::NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
         config::NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
     }
-    if config.cpu_pinning.enabled {
+    let has_cpu_config = config.cpu_pinning.cpu_affinity.is_some()
+        || config.cpu_pinning.emulator_pin.is_some()
+        || config.cpu_pinning.topology.is_some();
+    if has_cpu_config {
         println!("   CPU Pinning: Enabled (host-passthrough)");
-        if !config.cpu_pinning.vcpu_pins.is_empty() {
-            for pin in &config.cpu_pinning.vcpu_pins {
-                let cpuset: Vec<String> = pin.cpuset.iter().map(|c| c.to_string()).collect();
-                println!("     - vCPU {} → host CPU(s) {}", pin.vcpu, cpuset.join(","));
-            }
+        if let Some(ref affinity) = config.cpu_pinning.cpu_affinity {
+            let cpuset: Vec<String> = affinity.iter().map(|c| c.to_string()).collect();
+            println!("     - vCPU affinity: host CPU(s) {}", cpuset.join(","));
         }
         if let Some(ref emulator) = config.cpu_pinning.emulator_pin {
             let cpuset: Vec<String> = emulator.iter().map(|c| c.to_string()).collect();
@@ -538,7 +541,7 @@ fn main() -> Result<()> {
             network_bridge,
             grant_device_access,
             no_network,
-            cpu_pin,
+            cpu_affinity,
             emulator_pin,
             cpu_topology,
         } => {
@@ -562,7 +565,7 @@ fn main() -> Result<()> {
                 network_bridge,
                 grant_device_access,
                 no_network,
-                cpu_pin,
+                cpu_affinity,
                 emulator_pin,
                 cpu_topology,
             )?;
@@ -602,7 +605,7 @@ fn create_vm(
     network_bridge: Option<String>,
     grant_device_access: bool,
     no_network: bool,
-    cpu_pins: Vec<String>,
+    cpu_affinity: Option<String>,
     emulator_pin: Option<String>,
     cpu_topology: Option<String>,
 ) -> Result<()> {
@@ -629,7 +632,7 @@ fn create_vm(
         network_bridge,
         grant_device_access,
         no_network,
-        cpu_pins,
+        cpu_affinity,
         emulator_pin,
         cpu_topology,
     };
@@ -859,26 +862,6 @@ fn parse_share_path(path: &str, readonly: bool) -> Result<SharedFolder> {
         tag,
         readonly,
     })
-}
-
-/// Parse a CPU pin specification (e.g., "0:8" or "0:8,9" or "0:8-11")
-fn parse_cpu_pin(spec: &str) -> Result<VcpuPin> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() != 2 {
-        return Err(ConfigError::Invalid(format!(
-            "Invalid CPU pin format '{}'. Expected 'vcpu:cpuset' (e.g., '0:8' or '0:8-9')",
-            spec
-        ))
-        .into());
-    }
-
-    let vcpu: u32 = parts[0].parse().map_err(|_| {
-        ConfigError::Invalid(format!("Invalid vCPU number: {}", parts[0]))
-    })?;
-
-    let cpuset = parse_cpuset(parts[1])?;
-
-    Ok(VcpuPin { vcpu, cpuset })
 }
 
 /// Parse a cpuset specification (e.g., "8" or "8,9" or "8-11" or "8,10-12")
