@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2025-12-28
+
+### Fixed
+- **Fixed post-install validation race condition**: VM validation now handles the automatic reboot after installation
+  - Added 10s initial wait for VM to stabilize after installation
+  - Retry loop (up to 6 attempts with 5s delays) checks VM state
+  - Properly handles transitional states during reboot
+  - Prevents false "VM won't boot" errors when VM is actually booting
+
+- **Fixed VM shortcuts with dynamic IP resolution**: Launch scripts now resolve VM IP at runtime
+  - Shortcuts work even when created before VM is fully booted
+  - Script auto-starts VM if not running when shortcut is clicked
+  - Uses `notify-send` to display user-friendly errors
+  - Removes hardcoded IP addresses from generated scripts
+
+### Internal Improvements (Major Refactoring)
+
+- **New CLI module structure** (`src/cli/`): Extracted all CLI handling from main.rs
+  - `mod.rs` - CLI struct, Commands enum, main dispatch logic
+  - `create.rs` - VM creation command with CreateOptions, validation, config building
+  - `vm_ops.rs` - start, stop, destroy, list, passwords, console commands
+  - `shortcuts.rs` - Desktop shortcut generation and app launching
+  - `usb.rs` - USB attach/detach command handlers
+  - **main.rs reduced from ~847 lines to ~21 lines**
+
+- **New `src/virsh.rs` module**: Centralized all virsh/libvirt interactions
+  - Command builders: `virsh_command()`, `virsh_sudo_command()`
+  - Checked execution: `run_checked()`, `run_sudo_checked()` with proper error handling
+  - Unchecked variants: `run_sudo_unchecked()`, `destroy_unchecked()`, `shutdown_unchecked()`
+  - High-level operations: `attach_device()`, `detach_device()`, `dumpxml()`, `domain_exists()`
+  - VM state helpers: `get_vm_ip()`, `get_vm_state()`, `is_vm_running()`, `get_display()`
+  - Eliminated ~60+ duplicated virsh command patterns across codebase
+
+- **New `src/libvirt_xml.rs` module**: XML generation for libvirt devices
+  - `hostdev_pci()` / `hostdev_pci_from_address()` - PCI passthrough XML
+  - `hostdev_usb()` / `hostdev_usb_from_ids()` - USB passthrough XML
+  - `interface_network()` / `interface_bridge()` - Network interface XML
+  - `PciAddress` struct with parsing from "0000:01:00.0" format
+  - Unit tests for all XML generation functions
+
+- **New `src/constants.rs` module**: Centralized static configuration values
+  - Path constants: `DEFAULT_VM_DIR`, `CONFIG_DIR_NAME`, `PASSWORD_FILE_NAME`
+  - Timing constants: `SSH_RETRY_COUNT`, `SSH_RETRY_DELAY_SECS`, `VM_BOOT_*` values
+  - Installation: `MIN_INSTALL_MEMORY_MB`, `POST_INSTALL_WAIT_SECS`
+  - Device delays: `DEVICE_UNBIND_DELAY_MS`, `DEVICE_DETACH_DELAY_MS`
+
+- **New `src/passwords.rs` module**: Extracted VMPasswords from main.rs
+  - `VMPasswords` struct with HashMap storage
+  - CRUD operations: `add_vm()`, `get()`, `remove()`, `contains()`
+  - File persistence: `load_or_create()`, `save()`
+  - Iterator support: `iter()`, `is_empty()`
+
+- **Provisioner modules updated to use centralized helpers**:
+  - `installation.rs` - Uses virsh helpers and constants for retries/timeouts
+  - `lifecycle.rs` - Uses `virsh::start()`, `virsh::shutdown()`, `virsh::get_vm_ip()`
+  - `pci.rs` - Uses `libvirt_xml::hostdev_pci()`, `virsh::attach_device()`
+  - `usb.rs` - Uses `libvirt_xml::hostdev_usb()`, `virsh::attach_device()`
+  - `network.rs` - Uses `virsh::dumpxml()`, `libvirt_xml::interface_network()`
+  - `device_detection.rs` - Uses virsh helpers for vsock CID retrieval
+
+- **Path construction improvements**: Replaced `format!()` string concatenation with `Path::join()`
+  - `config.rs`: `config_path()`, `config_dir()`
+  - `installation.rs`: ISO path, disk path construction
+  - `passwords.rs`: `get_config_dir()`
+
+- **New test file**: `tests/template_placeholder_tests.rs`
+  - Tests for template placeholder substitution
+  - Verifies all placeholders are replaced correctly
+
+- **DRY improvements**: Extracted `SSH_BASE_OPTIONS` constant for SSH connection parameters
+  - Removes duplicate SSH option strings across shortcut generation
+
+---
+
 ## [1.3.0] - 2025-11-29
 
 ### Added

@@ -27,7 +27,7 @@ cat > /home/user/.config/openbox/menu.xml << 'OPENBOX_MENU_EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <openbox_menu xmlns="http://openbox.org/3.4/rc">
   <menu id="root-menu" label="Applications">
-{{MENU_ITEMS}}
+{menu_items}
     <separator />
     <item label="Terminal">
       <action name="Execute">
@@ -55,7 +55,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=SELKIES_ENCODER=x264enc
 Environment=SELKIES_BASIC_AUTH_USER=user
-Environment=SELKIES_BASIC_AUTH_PASSWORD={{PASSWORD}}
+Environment=SELKIES_BASIC_AUTH_PASSWORD={password}
 ExecStart=/home/user/selkies-wrapper.sh
 Restart=on-failure
 RestartSec=5
@@ -71,6 +71,6 @@ loginctl enable-linger user || true
 systemctl daemon-reload
 systemctl enable selkies-web.service
 
-echo "Selkies WebRTC streaming configured on port {{PORT}}"
-echo "Access via browser: http://<vm-ip>:{{PORT}}/"
-echo "Login: user / {{PASSWORD}}"
+echo "Selkies WebRTC streaming configured on port {port}"
+echo "Access via browser: http://<vm-ip>:{port}/"
+echo "Login: user / {password}"

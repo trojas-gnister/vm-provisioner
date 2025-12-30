@@ -6,9 +6,11 @@
 //! - Destroying VMs (cleanup)
 
 use crate::config::GraphicsBackend;
+use crate::constants::{DEFAULT_SPICE_PORT, VM_BOOT_WAIT_SECS};
 use crate::error::Result;
 use crate::provisioner::pci::PciPassthrough;
 use crate::provisioner::usb::UsbPassthrough;
+use crate::virsh;
 use log::{debug, error, info, warn};
 use std::fs;
 use std::path::Path;
@@ -28,12 +30,10 @@ impl Lifecycle for super::AppVMProvisioner {
     fn start_vm(&self) -> Result<()> {
         info!("Starting VM: {}", self.config.name);
 
-        Command::new("virsh")
-            .args(["-c", "qemu:///system", "start", &self.config.name])
-            .status()?;
+        virsh::start(&self.config.name)?;
 
         // Wait for VM to boot
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
 
         // Hot-attach PCI devices if in hot-plug mode
         if self.config.pci_hotplug && !self.config.pci_devices.is_empty() {
@@ -58,25 +58,17 @@ impl Lifecycle for super::AppVMProvisioner {
                 info!("Launching SPICE viewer...");
                 let vm_name = self.config.name.clone();
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_secs(5));
+                    thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
 
                     // Get the actual SPICE port from virsh
-                    if let Ok(output) = Command::new("virsh")
-                        .args(["-c", "qemu:///system", "domdisplay", &vm_name])
-                        .output()
-                    {
-                        if let Ok(display) = String::from_utf8(output.stdout) {
-                            let display = display.trim();
-                            if !display.is_empty() {
-                                let _ = Command::new("remote-viewer").arg(display).spawn();
-                                return;
-                            }
-                        }
+                    if let Some(display) = virsh::get_display(&vm_name) {
+                        let _ = Command::new("remote-viewer").arg(&display).spawn();
+                        return;
                     }
 
                     // Fallback to default port
                     let _ = Command::new("remote-viewer")
-                        .arg("spice://127.0.0.1:5900")
+                        .arg(format!("spice://127.0.0.1:{}", DEFAULT_SPICE_PORT))
                         .spawn();
                 });
                 debug!("SPICE viewer will launch automatically");
@@ -86,7 +78,7 @@ impl Lifecycle for super::AppVMProvisioner {
                 );
             }
             GraphicsBackend::VncOnly => {
-                info!("Connect with: vncviewer localhost:5900");
+                info!("Connect with: vncviewer localhost:{}", DEFAULT_SPICE_PORT);
             }
         }
 
@@ -110,9 +102,7 @@ impl Lifecycle for super::AppVMProvisioner {
             self.detach_usb_devices_hotplug()?;
         }
 
-        Command::new("virsh")
-            .args(["-c", "qemu:///system", "shutdown", &self.config.name])
-            .status()?;
+        virsh::shutdown(&self.config.name)?;
 
         Ok(())
     }
@@ -122,114 +112,46 @@ impl Lifecycle for super::AppVMProvisioner {
         info!("Destroying VM: {}", self.config.name);
 
         // Get VM IP before destroying (for SSH known_hosts cleanup)
-        let vm_ip = {
-            let output = Command::new("sudo")
-                .args([
-                    "virsh",
-                    "-c",
-                    "qemu:///system",
-                    "domifaddr",
-                    &self.config.name,
-                ])
-                .output();
-            match output {
-                Ok(out) if out.status.success() => {
-                    let output_str = String::from_utf8_lossy(&out.stdout);
-                    output_str
-                        .lines()
-                        .find(|line| line.contains("ipv4"))
-                        .and_then(|line| line.split_whitespace().nth(3))
-                        .and_then(|ip_part| ip_part.split('/').next())
-                        .map(|s| s.to_string())
-                }
-                _ => None,
-            }
-        };
+        let vm_ip = virsh::get_vm_ip(&self.config.name);
 
         // Check if VM exists first
-        let list_output = Command::new("virsh")
-            .args(["-c", "qemu:///system", "list", "--all"])
-            .output()?;
-
-        if !String::from_utf8_lossy(&list_output.stdout).contains(&self.config.name) {
+        if !virsh::domain_exists(&self.config.name) {
             debug!("VM {} not found", self.config.name);
         } else {
             // Force stop if running
             debug!("Force stopping VM...");
-            let destroy_output = Command::new("virsh")
-                .args(["-c", "qemu:///system", "destroy", &self.config.name])
-                .output();
-
-            match destroy_output {
-                Ok(output) => {
-                    if output.status.success() {
-                        debug!("VM stopped successfully");
-                    } else {
-                        debug!(
-                            "VM stop failed or already stopped: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                }
-                Err(e) => debug!("Error stopping VM: {}", e),
+            if virsh::destroy_unchecked(&self.config.name) {
+                debug!("VM stopped successfully");
+            } else {
+                debug!("VM stop failed or already stopped");
             }
 
             thread::sleep(Duration::from_secs(3));
 
             // Undefine VM (remove from libvirt)
             debug!("Removing VM definition...");
-            let undefine_output = Command::new("virsh")
-                .args([
-                    "-c",
-                    "qemu:///system",
-                    "undefine",
-                    &self.config.name,
-                    "--remove-all-storage",
-                    "--nvram",
-                ])
-                .output();
-
-            match undefine_output {
-                Ok(output) => {
-                    if output.status.success() {
-                        debug!("VM definition removed with storage");
-                    } else {
-                        debug!(
-                            "Undefine with storage failed: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        debug!("Trying without storage flags...");
-
-                        let simple_undefine = Command::new("virsh")
-                            .args(["-c", "qemu:///system", "undefine", &self.config.name])
-                            .output()?;
-
-                        if simple_undefine.status.success() {
-                            debug!("VM definition removed (without storage)");
-                        } else {
-                            error!(
-                                "Simple undefine also failed: {}",
-                                String::from_utf8_lossy(&simple_undefine.stderr)
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error running undefine: {}", e);
+            if virsh::undefine(&self.config.name, true).is_ok() {
+                debug!("VM definition removed with storage");
+            } else {
+                debug!("Undefine with storage failed, trying without storage flags...");
+                if virsh::undefine(&self.config.name, false).is_ok() {
+                    debug!("VM definition removed (without storage)");
+                } else {
+                    error!("Failed to undefine VM");
                 }
             }
         }
 
         // Remove disk manually
-        let disk_path = format!("{}/{}.qcow2", self.config.vm_dir, self.config.name);
-        if Path::new(&disk_path).exists() {
-            debug!("Removing disk image: {}", disk_path);
+        let disk_path = Path::new(&self.config.vm_dir).join(format!("{}.qcow2", self.config.name));
+        if disk_path.exists() {
+            debug!("Removing disk image: {}", disk_path.display());
             match fs::remove_file(&disk_path) {
                 Ok(_) => info!("Disk removed successfully"),
                 Err(e) => {
                     debug!("Permission denied ({}), trying with sudo...", e);
                     let sudo_result = Command::new("sudo")
-                        .args(["rm", "-f", &disk_path])
+                        .args(["rm", "-f", disk_path.to_str().unwrap_or_default()])
                         .output();
 
                     match sudo_result {
@@ -248,15 +170,11 @@ impl Lifecycle for super::AppVMProvisioner {
                 }
             }
         } else {
-            debug!("Disk image not found at: {}", disk_path);
+            debug!("Disk image not found at: {}", disk_path.display());
         }
 
         // Final verification
-        let final_check = Command::new("virsh")
-            .args(["-c", "qemu:///system", "list", "--all"])
-            .output()?;
-
-        if String::from_utf8_lossy(&final_check.stdout).contains(&self.config.name) {
+        if virsh::domain_exists(&self.config.name) {
             warn!("VM still appears in virsh list");
             warn!(
                 "You may need to manually run: virsh undefine {}",

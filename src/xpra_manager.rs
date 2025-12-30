@@ -7,6 +7,7 @@ use crate::config::{AppVMConfig, NetworkMode};
 use crate::display_bridge::DisplayBridge;
 use crate::error::{DisplayError, Result};
 use crate::templates;
+use crate::virsh;
 use log::{debug, info, warn};
 use std::fs;
 use std::io;
@@ -105,37 +106,12 @@ impl XpraManager {
     }
 
     fn get_vm_ip_static(vm_name: &str) -> Result<String> {
-        let output = Command::new("sudo")
-            .args(["virsh", "-c", "qemu:///system", "domifaddr", vm_name])
-            .output()?;
-
-        if output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines() {
-                if line.contains("ipv4") {
-                    if let Some(ip_part) = line.split_whitespace().nth(3) {
-                        if let Some(ip) = ip_part.split('/').next() {
-                            // Validate IP address format before returning
-                            if Self::validate_ip_address(ip) {
-                                return Ok(ip.to_string());
-                            } else {
-                                warn!("Invalid IP address format from virsh: {}", ip);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(DisplayError::ConnectionFailed(
-            "Could not determine VM IP address. VM may not be running.".to_string(),
-        )
-        .into())
-    }
-
-    /// Validate an IP address string
-    fn validate_ip_address(ip: &str) -> bool {
-        ip.parse::<std::net::Ipv4Addr>().is_ok()
+        virsh::get_vm_ip(vm_name).ok_or_else(|| {
+            DisplayError::ConnectionFailed(
+                "Could not determine VM IP address. VM may not be running.".to_string(),
+            )
+            .into()
+        })
     }
 
     fn resolve_vm_ip(&self) -> Result<String> {
@@ -182,11 +158,16 @@ impl XpraManager {
         None
     }
 
+    /// Core SSH options used for all VM connections
+    const SSH_BASE_OPTIONS: &'static str = "-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o TCPKeepAlive=yes -o StrictHostKeyChecking=no";
+
+    /// Build SSH invocation with optional source IP binding (for runtime use)
     fn build_ssh_invocation(&self, vm_ip: &str) -> String {
         let mut ssh_cmd = format!(
-            "ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o TCPKeepAlive=yes -o StrictHostKeyChecking=no -R {remote}:{host}",
-            remote = self.remote_pulse_socket,
-            host = self.host_pulse_socket
+            "ssh {} -R {}:{}",
+            Self::SSH_BASE_OPTIONS,
+            self.remote_pulse_socket,
+            self.host_pulse_socket
         );
 
         if let Some(src_ip) = Self::detect_source_ip(vm_ip) {
@@ -194,6 +175,26 @@ impl XpraManager {
         }
 
         ssh_cmd
+    }
+
+    /// Build SSH invocation for shell script templates (uses $VM_IP variable at runtime)
+    fn build_ssh_invocation_template(&self) -> String {
+        format!(
+            "ssh {} -o UserKnownHostsFile=/dev/null -R {}:{}",
+            Self::SSH_BASE_OPTIONS,
+            self.remote_pulse_socket,
+            self.host_pulse_socket
+        )
+    }
+
+    /// Generate xpra exec command template for shell scripts (uses $VM_IP variable)
+    fn generate_exec_command_template(&self, app_command: &str) -> String {
+        let ssh_cmd = self.build_ssh_invocation_template();
+        format!(
+            "env GDK_BACKEND=x11 xpra start ssh://user@$VM_IP/ --ssh=\"{ssh}\" --speaker=disabled --microphone=disabled --min-quality=80 --modal-windows=yes --start-child=\"{cmd}\" --exit-with-children",
+            ssh = ssh_cmd,
+            cmd = app_command
+        )
     }
 
     /// Get path to the vsock SSH wrapper script
@@ -306,19 +307,46 @@ exec ssh -o ExitOnForwardFailure=yes \
             package.to_string()
         };
 
-        let xpra_command = self.generate_exec_command(&exec_command);
-        let vm_ip = self.resolve_vm_ip().unwrap_or_else(|_| "UNKNOWN".to_string());
+        // Use template version that uses $VM_IP shell variable
+        let xpra_command = self.generate_exec_command_template(&exec_command);
+        let vm_name = &self.config.name;
 
-        // Create a wrapper script instead of embedding complex command in .desktop file
+        // Create a wrapper script that resolves IP dynamically at runtime
+        // This ensures the script works even if created before VM was fully booted
         let wrapper_script_path = format!(
             "{}/vm-provisioner-{}-{}-launch.sh",
             desktop_dir,
-            self.config.name,
+            vm_name,
             app_name.to_lowercase()
         );
         let wrapper_content = format!(
-            "#!/bin/bash\n# Auto-generated launch script for {} in {}\nssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@{} 'pkill -f \"xpra seamless\" 2>/dev/null || true'\n{}",
-            app_name, self.config.name, vm_ip, xpra_command
+            r#"#!/bin/bash
+# Auto-generated launch script for {app_name} in {vm_name}
+
+# Resolve VM IP dynamically
+VM_IP=$(virsh -c qemu:///system domifaddr {vm_name} 2>/dev/null | grep ipv4 | awk '{{print $4}}' | cut -d'/' -f1)
+
+if [ -z "$VM_IP" ]; then
+    # VM might not be running, try to start it
+    virsh -c qemu:///system start {vm_name} 2>/dev/null
+    sleep 5
+    VM_IP=$(virsh -c qemu:///system domifaddr {vm_name} 2>/dev/null | grep ipv4 | awk '{{print $4}}' | cut -d'/' -f1)
+fi
+
+if [ -z "$VM_IP" ]; then
+    notify-send "VM Error" "Cannot connect to VM '{vm_name}'. Check if it's running."
+    exit 1
+fi
+
+# Kill any existing xpra session for this VM
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@$VM_IP 'pkill -f "xpra seamless" 2>/dev/null || true'
+
+# Launch the application
+{xpra_command}
+"#,
+            app_name = app_name,
+            vm_name = vm_name,
+            xpra_command = xpra_command,
         );
         fs::write(&wrapper_script_path, wrapper_content)?;
 
@@ -679,19 +707,20 @@ SERVICE_EOF
             // Build selkies config from templates
             let port_str = port.to_string();
             let header = templates::SELKIES_HEADER
-                .replace("{{PORT}}", &port_str)
-                .replace("{{SYSTEMD_SERVICES}}", &systemd_services)
-                .replace("{{SYSTEMD_ENABLE_COMMANDS}}", &systemd_enable_commands);
+                .replace("{port}", &port_str)
+                .replace("{systemd_services}", &systemd_services)
+                .replace("{systemd_enable_commands}", &systemd_enable_commands);
 
+            let wrapper_script = templates::SELKIES_WRAPPER.replace("{port}", &port_str);
             let wrapper = format!(
                 "\n# Create wrapper script that starts Xvfb and Selkies together\ncat > /home/user/selkies-wrapper.sh << 'WRAPPER_EOF'\n{}\nWRAPPER_EOF\nchmod +x /home/user/selkies-wrapper.sh\nchown user:user /home/user/selkies-wrapper.sh\n",
-                templates::SELKIES_WRAPPER.replace("{{PORT}}", &port_str)
+                wrapper_script
             );
 
             let service = templates::SELKIES_SERVICE
-                .replace("{{PORT}}", &port_str)
-                .replace("{{PASSWORD}}", &self.config.user_password)
-                .replace("{{MENU_ITEMS}}", &menu_items);
+                .replace("{port}", &port_str)
+                .replace("{password}", &self.config.user_password)
+                .replace("{menu_items}", &menu_items);
 
             format!("{}{}{}", header, wrapper, service)
         } else {
@@ -708,10 +737,10 @@ SERVICE_EOF
         };
 
         templates::SSH_XPRA_BASE
-            .replace("{{SSH_KEY}}", ssh_public_key)
-            .replace("{{AUDIO_CONFIG}}", &audio_config)
-            .replace("{{WEB_STREAMING_CONFIG}}", &web_streaming_config)
-            .replace("{{VIRTIOFS_CONFIG}}", &virtiofs_config)
-            .replace("{{VSOCK_CONFIG}}", &vsock_config)
+            .replace("{ssh_key}", ssh_public_key)
+            .replace("{audio_config}", &audio_config)
+            .replace("{web_streaming_config}", &web_streaming_config)
+            .replace("{virtiofs_config}", &virtiofs_config)
+            .replace("{vsock_config}", &vsock_config)
     }
 }

@@ -4,9 +4,10 @@
 //! - Removing network interfaces for airgapped VMs
 
 use crate::error::{NetworkError, Result};
+use crate::libvirt_xml;
+use crate::virsh;
 use log::{debug, info, warn};
 use std::fs;
-use std::process::Command;
 
 /// Network operations for AppVMProvisioner
 pub trait NetworkManagement {
@@ -18,20 +19,9 @@ impl NetworkManagement for super::AppVMProvisioner {
     fn remove_network_interface(&self) -> Result<()> {
         debug!("Fetching VM XML to find network interface...");
 
-        let output = Command::new("virsh")
-            .args(["-c", "qemu:///system", "dumpxml", &self.config.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NetworkError::InterfaceRemovalFailed(format!(
-                "Failed to get VM XML: {}",
-                stderr
-            ))
-            .into());
-        }
-
-        let xml = String::from_utf8_lossy(&output.stdout);
+        let xml = virsh::dumpxml(&self.config.name).map_err(|e| {
+            NetworkError::InterfaceRemovalFailed(format!("Failed to get VM XML: {}", e))
+        })?;
 
         // Find the MAC address of the interface to detach
         let mut mac_address = None;
@@ -61,75 +51,40 @@ impl NetworkManagement for super::AppVMProvisioner {
         };
 
         // Create XML for the interface to detach
-        let detach_xml = format!(
-            r#"<interface type='network'>
-  <mac address='{}'/>
-  <source network='default'/>
-</interface>"#,
-            mac
-        );
-
+        let detach_xml = libvirt_xml::interface_network(&mac, "default");
         let xml_path = format!("/tmp/{}-detach-nic.xml", self.config.name);
         fs::write(&xml_path, &detach_xml)?;
 
         // Check if VM is running
-        let state_output = Command::new("virsh")
-            .args(["-c", "qemu:///system", "domstate", &self.config.name])
-            .output()?;
-        let vm_state = String::from_utf8_lossy(&state_output.stdout)
-            .trim()
-            .to_string();
-        debug!("VM state: {}", vm_state);
+        let is_running = virsh::is_vm_running(&self.config.name);
+        debug!("VM is running: {}", is_running);
 
-        let is_running = vm_state == "running";
-
-        // Build detach args based on VM state
-        let mut detach_args = vec![
-            "virsh",
-            "-c",
-            "qemu:///system",
-            "detach-device",
-            &self.config.name,
-            &xml_path,
-        ];
-
-        if is_running {
-            detach_args.push("--persistent");
-            detach_args.push("--live");
+        // Detach based on VM state
+        let result = if is_running {
+            // For running VMs, detach live and persist to config
+            virsh::detach_device(&self.config.name, &xml_path, true, true)
         } else {
-            detach_args.push("--config");
-        }
-
-        debug!("Running: sudo {}", detach_args.join(" "));
-
-        let result = Command::new("sudo")
-            .args(&detach_args[1..])
-            .output();
+            // For stopped VMs, just update config
+            virsh::detach_device(&self.config.name, &xml_path, false, true)
+        };
 
         let _ = fs::remove_file(&xml_path);
 
         match result {
-            Ok(output) if output.status.success() => {
+            Ok(_) => {
                 info!("Network interface removed (MAC: {})", mac);
                 info!("VM is now airgapped - vsock will be used for display forwarding");
 
                 // If VM was not running, start it now
                 if !is_running {
                     debug!("Starting VM...");
-                    let _ = Command::new("sudo")
-                        .args(["virsh", "-c", "qemu:///system", "start", &self.config.name])
-                        .output();
+                    virsh::start_if_stopped(&self.config.name);
                 }
                 Ok(())
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Failed to remove network interface: {}", stderr.trim());
-                Ok(()) // Non-fatal - VM might still work
-            }
             Err(e) => {
                 warn!("Failed to remove network interface: {}", e);
-                Ok(()) // Non-fatal
+                Ok(()) // Non-fatal - VM might still work
             }
         }
     }

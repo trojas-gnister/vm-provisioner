@@ -7,7 +7,10 @@
 //! - vfio-pci driver binding
 
 use crate::config::PciDevice;
+use crate::constants::DEVICE_UNBIND_DELAY_MS;
 use crate::error::{PciError, Result};
+use crate::libvirt_xml;
+use crate::virsh;
 use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
@@ -34,10 +37,7 @@ impl PciPassthrough for super::AppVMProvisioner {
         info!("Validating PCI passthrough setup...");
 
         // Check IOMMU enabled
-        let dmesg = Command::new("dmesg").output()?;
-        let dmesg_str = String::from_utf8_lossy(&dmesg.stdout);
-
-        if !dmesg_str.contains("IOMMU") && !dmesg_str.contains("DMAR") {
+        if !check_iommu_enabled() {
             return Err(PciError::IommuNotEnabled.into());
         }
         debug!("IOMMU enabled");
@@ -96,23 +96,7 @@ impl PciPassthrough for super::AppVMProvisioner {
 
     /// Generate libvirt XML for PCI device passthrough
     fn generate_pci_device_xml(&self, device: &PciDevice) -> Result<String> {
-        // Parse address: 0000:01:00.0 -> domain:0000, bus:01, slot:00, function:0
-        let parts: Vec<&str> = device.address.split(&[':', '.']).collect();
-
-        if parts.len() != 4 {
-            return Err(PciError::InvalidAddress(device.address.clone()).into());
-        }
-
-        let xml = format!(
-            r#"<hostdev mode='subsystem' type='pci' managed='yes'>
-  <source>
-    <address domain='0x{}' bus='0x{}' slot='0x{}' function='0x{}'/>
-  </source>
-</hostdev>"#,
-            parts[0], parts[1], parts[2], parts[3]
-        );
-
-        Ok(xml)
+        libvirt_xml::hostdev_pci(device)
     }
 
     /// Setup permanent PCI passthrough (devices attached to VM config)
@@ -128,36 +112,14 @@ impl PciPassthrough for super::AppVMProvisioner {
                 self.config.name,
                 device.address.replace(':', "-")
             );
-            fs::write(&xml_path, xml)?;
+            fs::write(&xml_path, &xml)?;
 
-            let result = Command::new("virsh")
-                .args([
-                    "-c",
-                    "qemu:///system",
-                    "attach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--config",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            match result {
-                Ok(status) if status.success() => {
-                    info!("{} attached to VM (permanent)", device.address);
-                }
-                Ok(status) => {
-                    warn!(
-                        "Failed to attach {} to VM XML (exit code: {:?})",
-                        device.address,
-                        status.code()
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to attach {} to VM XML: {}", device.address, e);
-                }
+            match virsh::attach_device(&self.config.name, &xml_path, false, true) {
+                Ok(_) => info!("{} attached to VM (permanent)", device.address),
+                Err(e) => warn!("Failed to attach {} to VM XML: {}", device.address, e),
             }
+
+            let _ = fs::remove_file(&xml_path);
         }
 
         Ok(())
@@ -173,12 +135,12 @@ impl PciPassthrough for super::AppVMProvisioner {
             // Unbind from current driver
             if device.original_driver.is_some() {
                 self.unbind_device(&device.address)?;
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(DEVICE_UNBIND_DELAY_MS));
             }
 
             // Bind to vfio-pci
             self.bind_to_vfio(device)?;
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(DEVICE_UNBIND_DELAY_MS));
 
             // Generate device XML
             let xml = self.generate_pci_device_xml(device)?;
@@ -190,34 +152,12 @@ impl PciPassthrough for super::AppVMProvisioner {
             fs::write(&xml_path, &xml)?;
 
             // Hot-attach to running VM
-            let result = Command::new("virsh")
-                .args([
-                    "-c",
-                    "qemu:///system",
-                    "attach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--live",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            match result {
-                Ok(status) if status.success() => {
-                    info!("{} attached successfully", device.address);
-                }
-                Ok(status) => {
-                    warn!(
-                        "Failed to attach {} (exit code: {:?})",
-                        device.address,
-                        status.code()
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to attach {}: {}", device.address, e);
-                }
+            match virsh::attach_device(&self.config.name, &xml_path, true, false) {
+                Ok(_) => info!("{} attached successfully", device.address),
+                Err(e) => warn!("Failed to attach {}: {}", device.address, e),
             }
+
+            let _ = fs::remove_file(&xml_path);
         }
 
         Ok(())
@@ -240,40 +180,18 @@ impl PciPassthrough for super::AppVMProvisioner {
             fs::write(&xml_path, &xml)?;
 
             // Detach from VM
-            let result = Command::new("virsh")
-                .args([
-                    "-c",
-                    "qemu:///system",
-                    "detach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--live",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            match result {
-                Ok(status) if status.success() => {
-                    info!("{} detached from VM", device.address);
-                }
-                Ok(status) => {
-                    debug!(
-                        "Detach {} returned exit code: {:?}",
-                        device.address,
-                        status.code()
-                    );
-                }
-                Err(e) => {
-                    debug!("Detach {} failed: {}", device.address, e);
-                }
+            match virsh::detach_device(&self.config.name, &xml_path, true, false) {
+                Ok(_) => info!("{} detached from VM", device.address),
+                Err(e) => debug!("Detach {} failed: {}", device.address, e),
             }
 
-            thread::sleep(Duration::from_millis(500));
+            let _ = fs::remove_file(&xml_path);
+
+            thread::sleep(Duration::from_millis(DEVICE_UNBIND_DELAY_MS));
 
             // Unbind from vfio-pci
             self.unbind_device(&device.address)?;
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(DEVICE_UNBIND_DELAY_MS));
 
             // Rebind to original driver
             if let Some(ref driver) = device.original_driver {
@@ -370,18 +288,21 @@ impl PciPassthrough for super::AppVMProvisioner {
 
 /// Check if IOMMU is enabled on the system.
 ///
-/// This checks kernel messages for IOMMU or DMAR (Intel VT-d) indicators.
-/// Note: This may require root privileges to read dmesg.
+/// Checks for the existence and population of IOMMU groups in sysfs.
+/// This is more reliable than checking dmesg which may be truncated.
 ///
 /// # Returns
-/// - `Ok(true)` if IOMMU appears to be enabled
-/// - `Ok(false)` if IOMMU does not appear to be enabled
-/// - `Err` if unable to check (e.g., dmesg not available)
-#[allow(dead_code)] // Library-only export
-pub fn check_iommu_enabled() -> Result<bool> {
-    let dmesg = Command::new("dmesg").output()?;
-    let dmesg_str = String::from_utf8_lossy(&dmesg.stdout);
-    Ok(dmesg_str.contains("IOMMU") || dmesg_str.contains("DMAR"))
+/// - `true` if IOMMU is enabled and groups exist
+/// - `false` if IOMMU is not enabled
+pub fn check_iommu_enabled() -> bool {
+    let iommu_groups = Path::new("/sys/kernel/iommu_groups");
+    if !iommu_groups.exists() {
+        return false;
+    }
+    match fs::read_dir(iommu_groups) {
+        Ok(entries) => entries.count() > 0,
+        Err(_) => false,
+    }
 }
 
 /// Get the IOMMU group number for a PCI device.
@@ -392,7 +313,6 @@ pub fn check_iommu_enabled() -> Result<bool> {
 /// # Returns
 /// - `Some(group)` if the device has an IOMMU group
 /// - `None` if IOMMU is not enabled or device not found
-#[allow(dead_code)] // Library-only export
 pub fn get_iommu_group(address: &str) -> Option<u32> {
     let path = format!("/sys/bus/pci/devices/{}/iommu_group", address);
     fs::read_link(&path)
@@ -407,7 +327,6 @@ pub fn get_iommu_group(address: &str) -> Option<u32> {
 ///
 /// # Returns
 /// Vector of PCI addresses (e.g., ["0000:00:14.0", "0000:00:14.2"])
-#[allow(dead_code)] // Library-only export
 pub fn list_iommu_group_devices(group: u32) -> Result<Vec<String>> {
     let group_path = format!("/sys/kernel/iommu_groups/{}/devices", group);
     let mut devices = Vec::new();
@@ -434,8 +353,69 @@ pub fn list_iommu_group_devices(group: u32) -> Result<Vec<String>> {
 /// # Returns
 /// - `Ok(true)` if the group contains exactly one device
 /// - `Ok(false)` if the group contains multiple devices
-#[allow(dead_code)] // Library-only export
 pub fn is_clean_iommu_group(group: u32) -> Result<bool> {
     let devices = list_iommu_group_devices(group)?;
     Ok(devices.len() == 1)
+}
+
+/// Get the current driver bound to a PCI device.
+///
+/// # Arguments
+/// * `address` - PCI address in format "0000:01:00.0"
+///
+/// # Returns
+/// - `Some(driver_name)` if device is bound to a driver
+/// - `None` if device has no driver or doesn't exist
+pub fn get_pci_driver(address: &str) -> Option<String> {
+    let driver_path = format!("/sys/bus/pci/devices/{}/driver", address);
+    fs::read_link(&driver_path)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+}
+
+/// Check if a PCI device is bound to the vfio-pci driver.
+///
+/// # Arguments
+/// * `address` - PCI address in format "0000:01:00.0"
+///
+/// # Returns
+/// - `true` if device is bound to vfio-pci
+/// - `false` otherwise
+pub fn is_device_bound_to_vfio(address: &str) -> bool {
+    matches!(get_pci_driver(address), Some(driver) if driver == "vfio-pci")
+}
+
+/// Check passthrough prerequisites, returning reason if not met.
+///
+/// This function checks whether PCI passthrough can proceed:
+/// 1. IOMMU must be enabled
+/// 2. Each device must be bound to vfio-pci driver
+///
+/// # Arguments
+/// * `pci_devices` - Slice of PCI devices to check
+///
+/// # Returns
+/// - `None` if all prerequisites are met
+/// - `Some(reason)` if prerequisites are not met, with explanation
+///
+/// This allows callers to defer provisioning rather than fail immediately.
+pub fn check_passthrough_prerequisites(pci_devices: &[PciDevice]) -> Option<String> {
+    if pci_devices.is_empty() {
+        return None;
+    }
+
+    if !check_iommu_enabled() {
+        return Some("IOMMU not enabled (reboot required after enabling in BIOS)".into());
+    }
+
+    for pci in pci_devices {
+        if !is_device_bound_to_vfio(&pci.address) {
+            let driver = get_pci_driver(&pci.address).unwrap_or_else(|| "none".to_string());
+            return Some(format!(
+                "Device {} not bound to vfio-pci (current: {})",
+                pci.address, driver
+            ));
+        }
+    }
+    None
 }

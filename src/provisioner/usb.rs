@@ -5,11 +5,11 @@
 //! - Hot-plug/unplug operations
 
 use crate::config::UsbDevice;
-use crate::error::{UsbError, Result};
-use crate::provisioner::device_detection::generate_usb_device_xml;
+use crate::error::{Result, UsbError};
+use crate::libvirt_xml;
+use crate::virsh;
 use log::{debug, info, warn};
 use std::fs;
-use std::process::Command;
 
 /// USB passthrough operations for AppVMProvisioner
 pub trait UsbPassthrough {
@@ -31,43 +31,22 @@ impl UsbPassthrough for super::AppVMProvisioner {
                 device.description, device.vendor_id, device.product_id
             );
 
-            let xml = generate_usb_device_xml(device);
+            let xml = libvirt_xml::hostdev_usb(device);
             let xml_path = format!(
                 "/tmp/{}-usb-{}-{}.xml",
                 self.config.name, device.vendor_id, device.product_id
             );
             fs::write(&xml_path, &xml)?;
 
-            let result = Command::new("virsh")
-                .args([
-                    "-c",
-                    "qemu:///system",
-                    "attach-device",
-                    &self.config.name,
-                    &xml_path,
-                    "--config",
-                ])
-                .status();
-
-            fs::remove_file(&xml_path)?;
-
-            match result {
-                Ok(status) if status.success() => {
-                    info!("USB device attached permanently");
-                }
-                Ok(status) => {
-                    warn!(
-                        "Failed to attach USB device {}:{} (exit code: {:?})",
-                        device.vendor_id, device.product_id, status.code()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to attach USB device {}:{}: {}",
-                        device.vendor_id, device.product_id, e
-                    );
-                }
+            match virsh::attach_device(&self.config.name, &xml_path, false, true) {
+                Ok(_) => info!("USB device attached permanently"),
+                Err(e) => warn!(
+                    "Failed to attach USB device {}:{}: {}",
+                    device.vendor_id, device.product_id, e
+                ),
             }
+
+            let _ = fs::remove_file(&xml_path);
         }
 
         Ok(())
@@ -99,37 +78,27 @@ impl UsbPassthrough for super::AppVMProvisioner {
             device.description, device.vendor_id, device.product_id
         );
 
-        let xml = generate_usb_device_xml(device);
+        let xml = libvirt_xml::hostdev_usb(device);
         let xml_path = format!(
             "/tmp/{}-usb-{}-{}.xml",
             self.config.name, device.vendor_id, device.product_id
         );
         fs::write(&xml_path, &xml)?;
 
-        let result = Command::new("virsh")
-            .args([
-                "-c",
-                "qemu:///system",
-                "attach-device",
-                &self.config.name,
-                &xml_path,
-                "--live",
-            ])
-            .output()?;
+        let result = virsh::attach_device(&self.config.name, &xml_path, true, false);
+        let _ = fs::remove_file(&xml_path);
 
-        fs::remove_file(&xml_path)?;
-
-        if result.status.success() {
-            info!("USB device attached successfully");
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            Err(UsbError::AttachFailed {
+        match result {
+            Ok(_) => {
+                info!("USB device attached successfully");
+                Ok(())
+            }
+            Err(e) => Err(UsbError::AttachFailed {
                 vendor_id: device.vendor_id.clone(),
                 product_id: device.product_id.clone(),
-                reason: stderr.to_string(),
+                reason: e.to_string(),
             }
-            .into())
+            .into()),
         }
     }
 
@@ -140,37 +109,27 @@ impl UsbPassthrough for super::AppVMProvisioner {
             device.description, device.vendor_id, device.product_id
         );
 
-        let xml = generate_usb_device_xml(device);
+        let xml = libvirt_xml::hostdev_usb(device);
         let xml_path = format!(
             "/tmp/{}-usb-{}-{}.xml",
             self.config.name, device.vendor_id, device.product_id
         );
         fs::write(&xml_path, &xml)?;
 
-        let result = Command::new("virsh")
-            .args([
-                "-c",
-                "qemu:///system",
-                "detach-device",
-                &self.config.name,
-                &xml_path,
-                "--live",
-            ])
-            .output()?;
+        let result = virsh::detach_device(&self.config.name, &xml_path, true, false);
+        let _ = fs::remove_file(&xml_path);
 
-        fs::remove_file(&xml_path)?;
-
-        if result.status.success() {
-            info!("USB device detached successfully");
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            Err(UsbError::DetachFailed {
+        match result {
+            Ok(_) => {
+                info!("USB device detached successfully");
+                Ok(())
+            }
+            Err(e) => Err(UsbError::DetachFailed {
                 vendor_id: device.vendor_id.clone(),
                 product_id: device.product_id.clone(),
-                reason: stderr.to_string(),
+                reason: e.to_string(),
             }
-            .into())
+            .into()),
         }
     }
 }

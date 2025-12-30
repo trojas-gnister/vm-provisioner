@@ -18,7 +18,7 @@ fi
 mkdir -p /home/user/.ssh
 chmod 700 /home/user/.ssh
 cat > /home/user/.ssh/authorized_keys << 'SSH_KEY_EOF'
-{{SSH_KEY}}
+{ssh_key}
 SSH_KEY_EOF
 chmod 600 /home/user/.ssh/authorized_keys
 chown -R user:user /home/user/.ssh
@@ -39,10 +39,10 @@ systemctl start sshd
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
 
-{{AUDIO_CONFIG}}
+{audio_config}
 
 # No auto-login needed - Xpra starts its own X server on demand
 systemctl set-default multi-user.target
-{{WEB_STREAMING_CONFIG}}
-{{VIRTIOFS_CONFIG}}
-{{VSOCK_CONFIG}}
+{web_streaming_config}
+{virtiofs_config}
+{vsock_config}

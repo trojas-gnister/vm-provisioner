@@ -8,11 +8,16 @@
 //! - SSH key acceptance
 
 use crate::config::{GraphicsBackend, NetworkMode};
+use crate::constants::{
+    MIN_INSTALL_MEMORY_MB, POST_INSTALL_WAIT_SECS, SHUTDOWN_WAIT_SECS, SSH_RETRY_COUNT,
+    SSH_RETRY_DELAY_SECS, VM_BOOT_RETRY_COUNT, VM_BOOT_RETRY_DELAY_SECS, VM_BOOT_WAIT_SECS,
+};
 use crate::error::{ProvisioningError, Result};
 use crate::provisioner::kickstart::KickstartGeneration;
 use crate::provisioner::network::NetworkManagement;
 use crate::provisioner::pci::PciPassthrough;
 use crate::provisioner::usb::UsbPassthrough;
+use crate::virsh;
 use log::{debug, error, info, warn};
 use std::fs;
 use std::io::Write;
@@ -20,10 +25,6 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-
-/// Constants for installation
-pub const FEDORA_VERSION: &str = "41";
-pub const MIN_INSTALL_MEMORY_MB: u64 = 4096;
 
 /// Installation operations for AppVMProvisioner
 pub trait Installation {
@@ -173,7 +174,10 @@ impl Installation for super::AppVMProvisioner {
     fn download_fedora_iso(&self) -> Result<String> {
         let arch = std::env::consts::ARCH;
         let iso_name = format!("Fedora-Server-dvd-{}.iso", arch);
-        let iso_path = format!("{}/{}", self.config.vm_dir, iso_name);
+        let iso_path = Path::new(&self.config.vm_dir)
+            .join(&iso_name)
+            .to_string_lossy()
+            .to_string();
 
         // Ensure the VM directory exists
         let mkdir_status = Command::new("sudo")
@@ -191,14 +195,15 @@ impl Installation for super::AppVMProvisioner {
         info!("Downloading Fedora Server ISO (~2GB)...");
         info!("This is a one-time download and will be reused for future VMs");
 
+        let fedora_version = &self.config.fedora_version;
         let download_url = match arch {
             "x86_64" => format!(
                 "https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/x86_64/iso/Fedora-Server-dvd-x86_64-{}-1.2.iso",
-                FEDORA_VERSION, FEDORA_VERSION
+                fedora_version, fedora_version
             ),
             "aarch64" => format!(
                 "https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/aarch64/iso/Fedora-Server-dvd-aarch64-{}-1.2.iso",
-                FEDORA_VERSION, FEDORA_VERSION
+                fedora_version, fedora_version
             ),
             _ => return Err(ProvisioningError::UnsupportedArch(arch.to_string()).into()),
         };
@@ -217,7 +222,10 @@ impl Installation for super::AppVMProvisioner {
 
     /// Create the VM disk image
     fn create_vm_disk(&self) -> Result<String> {
-        let disk_path = format!("{}/{}.qcow2", self.config.vm_dir, self.config.name);
+        let disk_path = Path::new(&self.config.vm_dir)
+            .join(format!("{}.qcow2", self.config.name))
+            .to_string_lossy()
+            .to_string();
 
         // Remove existing disk if it exists
         Command::new("sudo").args(["rm", "-f", &disk_path]).status()?;
@@ -259,14 +267,15 @@ impl Installation for super::AppVMProvisioner {
         };
 
         let arch = std::env::consts::ARCH;
+        let fedora_version = &self.config.fedora_version;
         let install_location = match arch {
             "x86_64" => format!(
                 "https://dl.fedoraproject.org/pub/fedora/linux/releases/{}/Server/x86_64/os/",
-                FEDORA_VERSION
+                fedora_version
             ),
             "aarch64" => format!(
                 "https://dl.fedoraproject.org/pub/fedora/linux/releases/{}/Everything/aarch64/os/",
-                FEDORA_VERSION
+                fedora_version
             ),
             _ => return Err(ProvisioningError::UnsupportedArch(arch.to_string()).into()),
         };
@@ -277,7 +286,7 @@ impl Installation for super::AppVMProvisioner {
             "path={},size={},format=qcow2,bus=virtio",
             disk_path, self.config.disk_size_gb
         );
-        let osinfo = format!("fedora{}", FEDORA_VERSION);
+        let osinfo = format!("fedora{}", fedora_version);
 
         // Configure graphics
         let graphics_args = self.build_graphics_args(arch);
@@ -385,9 +394,7 @@ impl Installation for super::AppVMProvisioner {
         self.accept_ssh_host_key()?;
 
         // Stop the VM
-        Command::new("sudo")
-            .args(["virsh", "-c", "qemu:///system", "destroy", &self.config.name])
-            .output()?;
+        virsh::destroy_unchecked(&self.config.name);
 
         info!("Installation completed and validated!");
 
@@ -401,37 +408,22 @@ impl Installation for super::AppVMProvisioner {
 
         // Retry getting VM IP address
         let mut vm_ip = None;
-        for attempt in 1..=30 {
-            let output = Command::new("sudo")
-                .args(["virsh", "-c", "qemu:///system", "domifaddr", &self.config.name])
-                .output()?;
-
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                for line in output_str.lines() {
-                    if line.contains("ipv4") {
-                        if let Some(ip_part) = line.split_whitespace().nth(3) {
-                            if let Some(ip) = ip_part.split('/').next() {
-                                vm_ip = Some(ip.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if vm_ip.is_some() {
-                    break;
-                }
+        for attempt in 1..=SSH_RETRY_COUNT {
+            if let Some(ip) = virsh::get_vm_ip(&self.config.name) {
+                vm_ip = Some(ip);
+                break;
             }
 
-            if attempt < 30 {
-                thread::sleep(Duration::from_secs(2));
+            if attempt < SSH_RETRY_COUNT {
+                thread::sleep(Duration::from_secs(SSH_RETRY_DELAY_SECS));
             }
         }
 
         let vm_ip = vm_ip.ok_or_else(|| {
-            ProvisioningError::SshKeyAcceptance(
-                "Could not determine VM IP address after 60 seconds".to_string(),
-            )
+            ProvisioningError::SshKeyAcceptance(format!(
+                "Could not determine VM IP address after {} seconds",
+                SSH_RETRY_COUNT * SSH_RETRY_DELAY_SECS as u32
+            ))
         })?;
         debug!("VM IP: {}", vm_ip);
 
@@ -458,7 +450,8 @@ impl Installation for super::AppVMProvisioner {
         // Use ssh-keyscan to get the host key
         debug!("Waiting for SSH server to be ready...");
         let mut scan_output = None;
-        for attempt in 1..=60 {
+        let ssh_scan_retries = SSH_RETRY_COUNT * 2; // Double retries for SSH scan
+        for attempt in 1..=ssh_scan_retries {
             let output = Command::new("ssh-keyscan").args(["-H", &vm_ip]).output()?;
 
             if output.status.success() && !output.stdout.is_empty() {
@@ -466,8 +459,8 @@ impl Installation for super::AppVMProvisioner {
                 break;
             }
 
-            if attempt < 60 {
-                thread::sleep(Duration::from_secs(2));
+            if attempt < ssh_scan_retries {
+                thread::sleep(Duration::from_secs(SSH_RETRY_DELAY_SECS));
             }
         }
 
@@ -572,6 +565,8 @@ impl super::AppVMProvisioner {
 
     /// Validate that installation succeeded
     fn validate_installation(&self, disk_path: &str) -> Result<()> {
+        use crate::constants::MIN_DISK_SIZE_MB;
+
         info!("Validating installation...");
 
         // Check disk size
@@ -579,10 +574,10 @@ impl super::AppVMProvisioner {
             let disk_size_mb = metadata.len() / (1024 * 1024);
             debug!("Disk size: {} MB", disk_size_mb);
 
-            if disk_size_mb < 500 {
+            if disk_size_mb < MIN_DISK_SIZE_MB {
                 error!(
-                    "Installation failed: Disk size is only {} MB (expected at least 500 MB)",
-                    disk_size_mb
+                    "Installation failed: Disk size is only {} MB (expected at least {} MB)",
+                    disk_size_mb, MIN_DISK_SIZE_MB
                 );
                 error!("This usually means the installer ran out of memory or disk space.");
                 error!("Try increasing RAM with --memory 3072 or --memory 4096");
@@ -592,35 +587,68 @@ impl super::AppVMProvisioner {
             warn!("Could not check disk size");
         }
 
-        // Check VM state
-        debug!("Checking VM status...");
-        let status_check = Command::new("virsh")
-            .args(["-c", "qemu:///system", "domstate", &self.config.name])
-            .output()?;
+        // Check VM state - retry a few times to handle post-install reboot
+        debug!("Checking VM status (waiting for post-install reboot to complete)...");
 
-        let vm_state = String::from_utf8_lossy(&status_check.stdout)
-            .trim()
-            .to_string();
+        // Give the VM time to stabilize after installation reboot
+        thread::sleep(Duration::from_secs(POST_INSTALL_WAIT_SECS));
 
-        if vm_state != "running" {
-            debug!("VM not running (state: {}), attempting to start...", vm_state);
-            let boot_test = Command::new("virsh")
-                .args(["-c", "qemu:///system", "start", &self.config.name])
-                .output()?;
+        let mut vm_running = false;
 
-            if !boot_test.status.success() {
-                let stderr = String::from_utf8_lossy(&boot_test.stderr);
-                if !stderr.contains("already active") {
-                    error!("Installation failed: VM will not start");
-                    error!("Error: {}", stderr);
-                    return Err(ProvisioningError::Validation("VM won't boot".to_string()).into());
-                }
+        for attempt in 1..=VM_BOOT_RETRY_COUNT {
+            let vm_state = virsh::get_vm_state(&self.config.name).unwrap_or_default();
+
+            debug!(
+                "Attempt {}/{}: VM state is '{}'",
+                attempt, VM_BOOT_RETRY_COUNT, vm_state
+            );
+
+            if vm_state == "running" {
+                debug!("VM is running");
+                vm_running = true;
+                break;
             }
 
-            thread::sleep(Duration::from_secs(5));
-        } else {
-            debug!("VM is already running");
+            // If shut off, try to start it
+            if vm_state == "shut off" {
+                debug!("VM is shut off, attempting to start...");
+                if virsh::start_if_stopped(&self.config.name) {
+                    debug!("VM started successfully");
+                    vm_running = true;
+                    break;
+                }
+                // Check if already running (race condition)
+                if virsh::is_vm_running(&self.config.name) {
+                    debug!("VM is already active");
+                    vm_running = true;
+                    break;
+                }
+                debug!("Start failed, will retry...");
+            }
+
+            // Wait before retry (VM might be mid-reboot)
+            if attempt < VM_BOOT_RETRY_COUNT {
+                debug!("Waiting {}s before retry...", VM_BOOT_RETRY_DELAY_SECS);
+                thread::sleep(Duration::from_secs(VM_BOOT_RETRY_DELAY_SECS));
+            }
         }
+
+        if !vm_running {
+            // One final check - maybe it came up while we were in the loop
+            let final_state = virsh::get_vm_state(&self.config.name).unwrap_or_default();
+
+            if final_state != "running" {
+                error!(
+                    "Installation failed: VM will not start after {} attempts",
+                    VM_BOOT_RETRY_COUNT
+                );
+                error!("Final state: {}", final_state);
+                return Err(ProvisioningError::Validation("VM won't boot".to_string()).into());
+            }
+        }
+
+        // Give the VM a moment to fully boot
+        thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
 
         Ok(())
     }
@@ -630,58 +658,29 @@ impl super::AppVMProvisioner {
         info!("Reducing VM memory to {}MB...", self.config.memory_mb);
 
         // Stop the VM
-        Command::new("sudo")
-            .args(["virsh", "-c", "qemu:///system", "shutdown", &self.config.name])
-            .output()?;
+        virsh::shutdown_unchecked(&self.config.name);
 
         // Wait for shutdown
-        for _ in 0..30 {
+        for _ in 0..SHUTDOWN_WAIT_SECS {
             thread::sleep(Duration::from_secs(1));
-            let state_check = Command::new("sudo")
-                .args(["virsh", "-c", "qemu:///system", "domstate", &self.config.name])
-                .output()?;
-            let state = String::from_utf8_lossy(&state_check.stdout)
-                .trim()
-                .to_string();
-            if state == "shut off" {
-                break;
+            if let Some(state) = virsh::get_vm_state(&self.config.name) {
+                if state == "shut off" {
+                    break;
+                }
             }
         }
 
         // Update memory configuration
-        Command::new("sudo")
-            .args([
-                "virsh",
-                "-c",
-                "qemu:///system",
-                "setmaxmem",
-                &self.config.name,
-                &format!("{}M", self.config.memory_mb),
-                "--config",
-            ])
-            .output()?;
-
-        Command::new("sudo")
-            .args([
-                "virsh",
-                "-c",
-                "qemu:///system",
-                "setmem",
-                &self.config.name,
-                &format!("{}M", self.config.memory_mb),
-                "--config",
-            ])
-            .output()?;
+        virsh::set_memory(&self.config.name, self.config.memory_mb, true)?; // setmaxmem
+        virsh::set_memory(&self.config.name, self.config.memory_mb, false)?; // setmem
 
         debug!("Memory reduced to {}MB", self.config.memory_mb);
 
         // Start the VM again
         debug!("Starting VM with new memory configuration...");
-        Command::new("sudo")
-            .args(["virsh", "-c", "qemu:///system", "start", &self.config.name])
-            .output()?;
+        virsh::start_if_stopped(&self.config.name);
 
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
 
         Ok(())
     }

@@ -15,7 +15,7 @@ sleep 1
 # Start Selkies (foreground) with resize support
 exec /opt/selkies-gstreamer/selkies-gstreamer-run \
     --addr=0.0.0.0 \
-    --port={{PORT}} \
+    --port={port} \
     --enable_resize=true \
     --enable_clipboard=true \
     --framerate=60 \

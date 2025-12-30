@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PciDevice {
@@ -115,9 +116,23 @@ pub struct AppVMConfig {
 
     // Custom kickstart additions (for library consumers)
     /// Custom kickstart script to inject before the final reboot command.
-    /// Used by library consumers to add custom setup steps.
+    ///
+    /// **Warning**: Content is injected verbatim without escaping. The script runs
+    /// as root during VM installation. Ensure content is properly shell-escaped
+    /// and comes from a trusted source.
     #[serde(default)]
     pub custom_kickstart: Option<String>,
+
+    /// Fedora version to install (default: "41").
+    ///
+    /// This controls which Fedora release is downloaded and installed.
+    /// The version string is used directly in download URLs.
+    #[serde(default = "default_fedora_version")]
+    pub fedora_version: String,
+}
+
+fn default_fedora_version() -> String {
+    "41".to_string()
 }
 
 // Remove AppType enum as we're now using dynamic packages
@@ -183,19 +198,21 @@ impl AppVMConfig {
 
     /// Get the path to a VM's configuration file
     pub fn config_path(vm_name: &str) -> crate::error::Result<String> {
-        Ok(format!(
-            "{}/.config/vm-provisioner/{}.toml",
-            std::env::var("HOME")?,
-            vm_name
-        ))
+        let home = std::env::var("HOME")?;
+        let path = PathBuf::from(home)
+            .join(".config")
+            .join("vm-provisioner")
+            .join(format!("{}.toml", vm_name));
+        Ok(path.to_string_lossy().to_string())
     }
 
     /// Get the directory containing all VM configurations
     pub fn config_dir() -> crate::error::Result<String> {
-        Ok(format!(
-            "{}/.config/vm-provisioner",
-            std::env::var("HOME")?
-        ))
+        let home = std::env::var("HOME")?;
+        let path = PathBuf::from(home)
+            .join(".config")
+            .join("vm-provisioner");
+        Ok(path.to_string_lossy().to_string())
     }
 
     pub fn new(
@@ -292,6 +309,9 @@ impl AppVMConfig {
 
             // No custom kickstart by default
             custom_kickstart: None,
+
+            // Use default Fedora version
+            fedora_version: default_fedora_version(),
         }
     }
 }
@@ -329,7 +349,6 @@ fn generate_password() -> String {
 ///     .build()?;
 /// ```
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
 pub struct AppVMConfigBuilder {
     name: String,
     memory_mb: u64,
@@ -347,9 +366,9 @@ pub struct AppVMConfigBuilder {
     web_port: Option<u16>,
     grant_device_access: bool,
     custom_kickstart: Option<String>,
+    fedora_version: String,
 }
 
-#[allow(dead_code)] // Library-only: used by external consumers, not the CLI binary
 impl AppVMConfigBuilder {
     /// Create a new builder with required name and sensible defaults.
     ///
@@ -359,6 +378,7 @@ impl AppVMConfigBuilder {
     /// - disk_size_gb: 20
     /// - headless: false
     /// - network_mode: Nat
+    /// - fedora_version: "41"
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -377,6 +397,7 @@ impl AppVMConfigBuilder {
             web_port: None,
             grant_device_access: false,
             custom_kickstart: None,
+            fedora_version: default_fedora_version(),
         }
     }
 
@@ -510,8 +531,18 @@ impl AppVMConfigBuilder {
     ///
     /// This script will be inserted into the kickstart file before
     /// the final cleanup and reboot commands.
+    ///
+    /// **Warning**: Content is injected verbatim without escaping.
     pub fn custom_kickstart(mut self, script: impl Into<String>) -> Self {
         self.custom_kickstart = Some(script.into());
+        self
+    }
+
+    /// Set the Fedora version to install (default: "41").
+    ///
+    /// This controls which Fedora release is downloaded and installed.
+    pub fn fedora_version(mut self, version: impl Into<String>) -> Self {
+        self.fedora_version = version.into();
         self
     }
 
@@ -552,6 +583,9 @@ impl AppVMConfigBuilder {
 
         // Apply custom kickstart if provided
         config.custom_kickstart = self.custom_kickstart;
+
+        // Apply Fedora version
+        config.fedora_version = self.fedora_version;
 
         Ok(config)
     }

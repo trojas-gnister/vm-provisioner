@@ -5,6 +5,8 @@
 
 use crate::config::{PciDevice, UsbDevice};
 use crate::error::{NetworkError, PciError, Result, UsbError};
+use crate::libvirt_xml;
+use crate::virsh;
 use log::{debug, info};
 use std::fs;
 use std::process::Command;
@@ -182,16 +184,10 @@ fn parse_usb_description(lsusb_line: &str) -> String {
 }
 
 /// Generate libvirt XML for USB hostdev passthrough
+///
+/// This is a convenience wrapper around libvirt_xml::hostdev_usb for backwards compatibility.
 pub fn generate_usb_device_xml(device: &UsbDevice) -> String {
-    format!(
-        r#"<hostdev mode='subsystem' type='usb' managed='yes'>
-  <source>
-    <vendor id='0x{}'/>
-    <product id='0x{}'/>
-  </source>
-</hostdev>"#,
-        device.vendor_id, device.product_id
-    )
+    libvirt_xml::hostdev_usb(device)
 }
 
 /// Retrieve auto-assigned vsock CID from libvirt domain XML
@@ -206,9 +202,7 @@ pub fn get_vsock_cid(vm_name: &str) -> Result<u32> {
     // CID not found - VM might be shut off. Start it briefly to get CID assigned.
     info!("Starting VM briefly to retrieve vsock CID...");
 
-    let _ = Command::new("virsh")
-        .args(["-c", "qemu:///system", "start", vm_name])
-        .output();
+    virsh::start_if_stopped(vm_name);
 
     // Wait a moment for CID assignment
     thread::sleep(Duration::from_secs(3));
@@ -217,28 +211,16 @@ pub fn get_vsock_cid(vm_name: &str) -> Result<u32> {
     let result = get_vsock_cid_from_xml(vm_name);
 
     // Shut down the VM
-    let _ = Command::new("virsh")
-        .args(["-c", "qemu:///system", "destroy", vm_name])
-        .output();
+    virsh::destroy_unchecked(vm_name);
 
     result
 }
 
 /// Parse vsock CID from VM XML
 fn get_vsock_cid_from_xml(vm_name: &str) -> Result<u32> {
-    let output = Command::new("virsh")
-        .args(["-c", "qemu:///system", "dumpxml", vm_name])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(NetworkError::VsockCidRetrievalFailed(format!(
-            "Failed to get VM XML for {}",
-            vm_name
-        ))
-        .into());
-    }
-
-    let xml = String::from_utf8_lossy(&output.stdout);
+    let xml = virsh::dumpxml(vm_name).map_err(|e| {
+        NetworkError::VsockCidRetrievalFailed(format!("Failed to get VM XML for {}: {}", vm_name, e))
+    })?;
 
     // Parse: <cid auto='yes' address='3'/>
     for line in xml.lines() {
