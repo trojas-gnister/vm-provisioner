@@ -4,24 +4,20 @@
 //! to the appropriate command handlers.
 
 pub mod create;
-pub mod shortcuts;
 pub mod usb;
 pub mod vm_ops;
 
 use clap::{Parser, Subcommand};
 
-use vm_provisioner::config::AppVMConfig;
-use vm_provisioner::display_bridge::DisplayBridge;
 use vm_provisioner::error::Result;
 use vm_provisioner::virsh;
-use vm_provisioner::xpra_manager::XpraManager;
 
 #[derive(Parser)]
 #[command(name = "vm-provisioner")]
-#[command(about = "Lightweight VM isolation system with seamless windowing", long_about = None)]
+#[command(about = "Lightweight VM isolation system for running applications in sandboxed VMs", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -45,13 +41,6 @@ pub enum Commands {
         disk: u64,
         #[arg(long)]
         headless: bool,
-        #[arg(long, action = clap::ArgAction::Append)]
-        pci: Vec<String>,
-        #[arg(long)]
-        pci_hotplug: bool,
-        /// Enable web-based streaming on this port (Selkies-GStreamer WebRTC)
-        #[arg(long)]
-        web_port: Option<u16>,
         /// USB device passthrough (format: "vendor:product" e.g. "046d:c52b")
         #[arg(long, action = clap::ArgAction::Append)]
         usb: Vec<String>,
@@ -70,7 +59,7 @@ pub enum Commands {
         /// Grant flatpak apps access to all devices (webcams, audio, etc.)
         #[arg(long)]
         grant_device_access: bool,
-        /// Disable networking entirely (uses vsock for display forwarding)
+        /// Disable networking entirely (headless CLI-only, access via virsh console)
         #[arg(long)]
         no_network: bool,
     },
@@ -88,16 +77,6 @@ pub enum Commands {
         yes: bool,
     },
     Console {
-        name: String,
-    },
-    GenerateShortcuts {
-        name: String,
-    },
-    Launch {
-        name: String,
-        app: String,
-    },
-    Apps {
         name: String,
     },
     /// Attach a USB device to a running VM
@@ -139,7 +118,8 @@ pub fn run() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Create {
+        None => return crate::tui::run(),
+        Some(Commands::Create {
             name,
             system,
             flatpak,
@@ -149,9 +129,6 @@ pub fn run() -> Result<()> {
             vcpus,
             disk,
             headless,
-            pci,
-            pci_hotplug,
-            web_port,
             usb,
             usb_hotplug,
             share,
@@ -159,7 +136,7 @@ pub fn run() -> Result<()> {
             network_bridge,
             grant_device_access,
             no_network,
-        } => {
+        }) => {
             create::create_vm(create::CreateOptions {
                 name,
                 system_packages: system,
@@ -170,9 +147,6 @@ pub fn run() -> Result<()> {
                 vcpus,
                 disk,
                 headless,
-                pci_addresses: pci,
-                pci_hotplug,
-                web_port,
                 usb_addresses: usb,
                 usb_hotplug,
                 share_paths: share,
@@ -182,25 +156,16 @@ pub fn run() -> Result<()> {
                 no_network,
             })?;
         }
-        Commands::Start { name } => vm_ops::start_vm(name)?,
-        Commands::Stop { name } => vm_ops::stop_vm(name)?,
-        Commands::List => vm_ops::list_vms()?,
-        Commands::Passwords => vm_ops::show_passwords()?,
-        Commands::Destroy { name, yes } => vm_ops::destroy_vm(name, yes)?,
-        Commands::Console { name } => vm_ops::connect_console(name)?,
-        Commands::GenerateShortcuts { name } => shortcuts::generate_shortcuts(name)?,
-        Commands::Launch { name, app } => shortcuts::launch_app(name, app)?,
-        Commands::Apps { name } => shortcuts::list_apps(name)?,
-        Commands::UsbAttach { name, device } => usb::usb_attach(name, device)?,
-        Commands::UsbDetach { name, device } => usb::usb_detach(name, device)?,
+        Some(Commands::Start { name }) => vm_ops::start_vm(name)?,
+        Some(Commands::Stop { name }) => vm_ops::stop_vm(name)?,
+        Some(Commands::List) => vm_ops::list_vms()?,
+        Some(Commands::Passwords) => vm_ops::show_passwords()?,
+        Some(Commands::Destroy { name, yes }) => vm_ops::destroy_vm(name, yes)?,
+        Some(Commands::Console { name }) => vm_ops::connect_console(name)?,
+        Some(Commands::UsbAttach { name, device }) => usb::usb_attach(name, device)?,
+        Some(Commands::UsbDetach { name, device }) => usb::usb_detach(name, device)?,
     }
     Ok(())
-}
-
-/// Get the display bridge for a given VM config
-pub fn get_display_bridge(config: &AppVMConfig) -> Result<Box<dyn DisplayBridge>> {
-    // Xpra is the only supported display protocol
-    Ok(Box::new(XpraManager::new(config)?))
 }
 
 /// Get the current VM status

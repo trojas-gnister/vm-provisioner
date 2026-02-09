@@ -12,7 +12,7 @@ use vm_provisioner::passwords::VMPasswords;
 use vm_provisioner::provisioner::{AppVMProvisioner, Lifecycle};
 use vm_provisioner::virsh;
 
-use super::{get_display_bridge, get_vm_status};
+use super::get_vm_status;
 
 /// Start a VM
 pub fn start_vm(name: String) -> Result<()> {
@@ -26,18 +26,6 @@ pub fn start_vm(name: String) -> Result<()> {
             "\n💡 Headless VM - connect via console: virsh console {}",
             name
         );
-    } else {
-        println!("\n🪟 Seamless window integration enabled via Xpra");
-        println!(
-            "   Use `vm-provisioner generate-shortcuts {}` to create .desktop files.",
-            name
-        );
-        if let Some(port) = config.web_port {
-            println!(
-                "   Or access via browser: http://<vm-ip>:{}/ (Selkies WebRTC)",
-                port
-            );
-        }
     }
     Ok(())
 }
@@ -93,9 +81,6 @@ pub fn destroy_vm(name: String, skip_confirm: bool) -> Result<()> {
 
     let config_file = AppVMConfig::config_path(&name)?;
     let config = AppVMConfig::load(&name)?;
-
-    let bridge = get_display_bridge(&config)?;
-    bridge.remove_desktop_files()?;
 
     // Clean up SSH known_hosts entry for this VM
     if let Some(ip) = virsh::get_vm_ip(&name) {

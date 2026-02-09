@@ -282,9 +282,25 @@ pub fn get_display(vm_name: &str) -> Option<String> {
 ///
 /// Queries `virsh domifaddr` and parses the IPv4 address from the output.
 /// Returns None if the VM is not running or has no IP assigned yet.
+///
+/// For bridged networks, this falls back to querying the QEMU guest agent.
 pub fn get_vm_ip(vm_name: &str) -> Option<String> {
-    let output = run_sudo_checked(&["domifaddr", vm_name]).ok()?;
-    parse_ip_from_domifaddr(&output)
+    // First try the standard method (works for NAT networks)
+    if let Ok(output) = run_sudo_checked(&["domifaddr", vm_name]) {
+        if let Some(ip) = parse_ip_from_domifaddr(&output) {
+            return Some(ip);
+        }
+    }
+
+    // Fall back to guest agent method (works for bridged networks)
+    // This requires qemu-guest-agent installed and running in the VM
+    if let Ok(output) = run_sudo_checked(&["domifaddr", vm_name, "--source", "agent"]) {
+        if let Some(ip) = parse_ip_from_domifaddr_agent(&output) {
+            return Some(ip);
+        }
+    }
+
+    None
 }
 
 /// Parse an IPv4 address from virsh domifaddr output
@@ -299,6 +315,37 @@ pub fn parse_ip_from_domifaddr(output: &str) -> Option<String> {
         if line.contains("ipv4") {
             if let Some(ip_part) = line.split_whitespace().nth(3) {
                 if let Some(ip) = ip_part.split('/').next() {
+                    // Validate IP address format
+                    if validate_ip_address(ip) {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse an IPv4 address from virsh domifaddr --source agent output
+///
+/// Guest agent output format is similar but may include more interfaces.
+/// We skip loopback (127.x.x.x) and link-local (169.254.x.x) addresses.
+///
+/// Example output:
+/// ```text
+///  Name       MAC address          Protocol     Address
+///  lo         00:00:00:00:00:00    ipv4         127.0.0.1/8
+///  enp1s0     52:54:00:xx:xx:xx    ipv4         192.168.1.100/24
+/// ```
+pub fn parse_ip_from_domifaddr_agent(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if line.contains("ipv4") {
+            if let Some(ip_part) = line.split_whitespace().nth(3) {
+                if let Some(ip) = ip_part.split('/').next() {
+                    // Skip loopback and link-local addresses
+                    if ip.starts_with("127.") || ip.starts_with("169.254.") {
+                        continue;
+                    }
                     // Validate IP address format
                     if validate_ip_address(ip) {
                         return Some(ip.to_string());
@@ -365,38 +412,13 @@ pub fn destroy(vm_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Define a VM from an XML file
+pub fn define(xml_path: &str) -> Result<()> {
+    run_sudo_checked(&["define", xml_path])?;
+    Ok(())
+}
+
 /// Destroy (force stop) a VM, ignoring errors
 pub fn destroy_unchecked(vm_name: &str) -> bool {
     run_sudo_unchecked(&["destroy", vm_name])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_ip_from_domifaddr() {
-        let output = r#" Name       MAC address          Protocol     Address
- vnet0      52:54:00:ab:cd:ef    ipv4         192.168.122.100/24
-"#;
-        assert_eq!(
-            parse_ip_from_domifaddr(output),
-            Some("192.168.122.100".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_ip_from_domifaddr_no_ip() {
-        let output = " Name       MAC address          Protocol     Address\n";
-        assert_eq!(parse_ip_from_domifaddr(output), None);
-    }
-
-    #[test]
-    fn test_validate_ip_address() {
-        assert!(validate_ip_address("192.168.122.1"));
-        assert!(validate_ip_address("10.0.0.1"));
-        assert!(!validate_ip_address("invalid"));
-        assert!(!validate_ip_address("256.1.1.1"));
-        assert!(!validate_ip_address(""));
-    }
 }

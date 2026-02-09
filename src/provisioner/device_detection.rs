@@ -1,100 +1,19 @@
-//! Device detection and validation for PCI and USB passthrough
+//! Device detection and validation for USB and GPU passthrough
 //!
 //! This module provides functions to detect and validate hardware devices
 //! for passthrough to virtual machines.
 
-use crate::config::{PciDevice, UsbDevice};
-use crate::error::{NetworkError, PciError, Result, UsbError};
+use crate::config::UsbDevice;
+use crate::constants::{GPU_VENDOR_AMD, GPU_VENDOR_INTEL, GPU_VENDOR_NVIDIA, VULKAN_ICD_DIR};
+use crate::error::{NetworkError, Result, UsbError};
 use crate::libvirt_xml;
 use crate::virsh;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-
-/// Detect and validate a PCI device for passthrough
-///
-/// # Arguments
-/// * `address` - PCI address in format "0000:01:00.0"
-///
-/// # Returns
-/// * `Result<PciDevice>` - Device information if found
-pub fn detect_pci_device(address: &str) -> Result<PciDevice> {
-    let lspci_output = Command::new("lspci")
-        .args(["-s", address, "-nn", "-k"])
-        .output()?;
-
-    if !lspci_output.status.success() || lspci_output.stdout.is_empty() {
-        return Err(PciError::DeviceNotFound(address.to_string()).into());
-    }
-
-    let output_str = String::from_utf8_lossy(&lspci_output.stdout);
-    let first_line = output_str.lines().next().unwrap_or("");
-
-    let (vendor_id, device_id) = parse_vendor_device_ids(&output_str)?;
-
-    let description = if let Some(desc_start) = first_line.find(": ") {
-        let desc = &first_line[desc_start + 2..];
-        if let Some(bracket_pos) = desc.find(" [") {
-            desc[..bracket_pos].to_string()
-        } else {
-            desc.to_string()
-        }
-    } else {
-        "Unknown device".to_string()
-    };
-
-    let original_driver = get_current_driver(address);
-    let iommu_group = get_iommu_group(address);
-
-    debug!(
-        "Detected PCI device: {} ({}) vendor={} device={} driver={:?} iommu_group={:?}",
-        address, description, vendor_id, device_id, original_driver, iommu_group
-    );
-
-    Ok(PciDevice {
-        address: address.to_string(),
-        vendor_id,
-        device_id,
-        description,
-        original_driver,
-        iommu_group,
-    })
-}
-
-/// Parse vendor and device IDs from lspci output
-fn parse_vendor_device_ids(lspci_output: &str) -> Result<(String, String)> {
-    // Look for pattern like [10de:1c03]
-    if let Some(start) = lspci_output.find('[') {
-        if let Some(end) = lspci_output[start..].find(']') {
-            let ids = &lspci_output[start + 1..start + end];
-            if let Some(colon_pos) = ids.find(':') {
-                let vendor = ids[..colon_pos].to_string();
-                let device = ids[colon_pos + 1..].to_string();
-                return Ok((vendor, device));
-            }
-        }
-    }
-    Err(PciError::ParseError.into())
-}
-
-/// Get the current driver bound to a PCI device
-fn get_current_driver(address: &str) -> Option<String> {
-    let driver_path = format!("/sys/bus/pci/devices/{}/driver", address);
-    fs::read_link(&driver_path)
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-}
-
-/// Get the IOMMU group for a PCI device
-fn get_iommu_group(address: &str) -> Option<u32> {
-    let iommu_path = format!("/sys/bus/pci/devices/{}/iommu_group", address);
-    fs::read_link(&iommu_path).ok().and_then(|p| {
-        p.file_name()
-            .and_then(|n| n.to_string_lossy().parse::<u32>().ok())
-    })
-}
 
 /// Detect and validate a USB device for passthrough
 ///
@@ -252,4 +171,146 @@ fn get_vsock_cid_from_xml(vm_name: &str) -> Result<u32> {
         vm_name
     ))
     .into())
+}
+
+// ============================================================================
+// GPU render node detection
+// ============================================================================
+
+/// GPU vendor classification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuVendor {
+    Amd,
+    Intel,
+    Nvidia,
+    Unknown,
+}
+
+/// A detected GPU render node on the host
+#[derive(Debug, Clone)]
+pub struct GpuRenderNode {
+    pub vendor: GpuVendor,
+    pub pci_slot: String,
+    pub render_node: String,
+    pub by_path: String,
+}
+
+/// Detect all GPU render nodes on the host
+///
+/// Scans `/sys/class/drm/renderD*` to find render nodes, resolves their
+/// PCI slots, reads vendor IDs, and constructs stable `/dev/dri/by-path` paths.
+pub fn detect_gpu_render_nodes() -> Vec<GpuRenderNode> {
+    let mut nodes = Vec::new();
+
+    let drm_class = Path::new("/sys/class/drm");
+    let entries = match fs::read_dir(drm_class) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Cannot read /sys/class/drm: {}", e);
+            return nodes;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("renderD") {
+            continue;
+        }
+
+        let render_node = format!("/dev/dri/{}", name_str);
+
+        // Resolve the PCI device via the 'device' symlink
+        let device_link = entry.path().join("device");
+        let pci_slot = match fs::read_link(&device_link) {
+            Ok(target) => {
+                // Target is something like ../../../0000:03:00.0
+                target
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                debug!("Cannot resolve device link for {}: {}", name_str, e);
+                continue;
+            }
+        };
+
+        if pci_slot.is_empty() {
+            continue;
+        }
+
+        // Read vendor ID from sysfs
+        let vendor_path = device_link.join("vendor");
+        let vendor_id = match fs::read_to_string(&vendor_path) {
+            Ok(v) => v.trim().to_lowercase(),
+            Err(e) => {
+                debug!("Cannot read vendor for {}: {}", pci_slot, e);
+                continue;
+            }
+        };
+
+        // Parse vendor: "0x1002" -> "1002"
+        let vendor_hex = vendor_id.trim_start_matches("0x");
+        let vendor = match vendor_hex {
+            v if v == GPU_VENDOR_AMD => GpuVendor::Amd,
+            v if v == GPU_VENDOR_INTEL => GpuVendor::Intel,
+            v if v == GPU_VENDOR_NVIDIA => GpuVendor::Nvidia,
+            _ => GpuVendor::Unknown,
+        };
+
+        let by_path = format!("/dev/dri/by-path/pci-{}-render", pci_slot);
+
+        debug!(
+            "Found GPU render node: {} ({:?}) at {}",
+            render_node, vendor, pci_slot
+        );
+
+        nodes.push(GpuRenderNode {
+            vendor,
+            pci_slot,
+            render_node,
+            by_path,
+        });
+    }
+
+    // Sort by PCI slot for deterministic ordering
+    nodes.sort_by(|a, b| a.pci_slot.cmp(&b.pci_slot));
+    nodes
+}
+
+/// Select the best GPU for Venus Vulkan
+///
+/// Preference: AMD > Intel > skip NVIDIA (no Venus support).
+/// Returns `None` if no suitable GPU is found.
+pub fn select_gpu_for_venus(nodes: &[GpuRenderNode]) -> Option<&GpuRenderNode> {
+    // Prefer AMD first
+    if let Some(node) = nodes.iter().find(|n| n.vendor == GpuVendor::Amd) {
+        return Some(node);
+    }
+    // Then Intel
+    if let Some(node) = nodes.iter().find(|n| n.vendor == GpuVendor::Intel) {
+        return Some(node);
+    }
+    // NVIDIA has no Venus support
+    None
+}
+
+/// Get the Vulkan ICD file path for a given GPU vendor
+///
+/// Returns `None` for NVIDIA or if the ICD file does not exist.
+pub fn get_vulkan_icd_path(vendor: &GpuVendor) -> Option<String> {
+    let filename = match vendor {
+        GpuVendor::Amd => "radeon_icd.x86_64.json",
+        GpuVendor::Intel => "intel_icd.x86_64.json",
+        _ => return None,
+    };
+
+    let path = format!("{}/{}", VULKAN_ICD_DIR, filename);
+    if Path::new(&path).exists() {
+        Some(path)
+    } else {
+        warn!("Vulkan ICD file not found: {}", path);
+        None
+    }
 }

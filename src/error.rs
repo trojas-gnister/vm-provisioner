@@ -2,7 +2,7 @@
 //!
 //! This module provides a hierarchical error system using `thiserror`:
 //! - `VmProvisionerError`: Top-level error enum for all operations
-//! - Module-specific errors: `ConfigError`, `ProvisioningError`, `PciError`, `UsbError`, `DisplayError`
+//! - Module-specific errors: `ConfigError`, `ProvisioningError`, `UsbError`, `DisplayError`
 
 use thiserror::Error;
 
@@ -16,13 +16,10 @@ pub enum VmProvisionerError {
     #[error("Provisioning error: {0}")]
     Provisioning(#[from] ProvisioningError),
 
-    #[error("PCI passthrough error: {0}")]
-    Pci(#[from] PciError),
-
     #[error("USB passthrough error: {0}")]
     Usb(#[from] UsbError),
 
-    #[error("Display bridge error: {0}")]
+    #[error("Display error: {0}")]
     Display(#[from] DisplayError),
 
     #[error("Network error: {0}")]
@@ -58,9 +55,6 @@ pub enum ProvisioningError {
     #[error("Missing prerequisite: {cmd}. Install with: {install_hint}")]
     MissingPrerequisite { cmd: String, install_hint: String },
 
-    #[error("ISO download failed: {0}")]
-    IsoDownload(String),
-
     #[error("Installation failed: {0}")]
     Installation(String),
 
@@ -70,30 +64,14 @@ pub enum ProvisioningError {
     #[error("SSH host key acceptance failed: {0}")]
     SshKeyAcceptance(String),
 
-    #[error("Kickstart generation failed: {0}")]
-    KickstartGeneration(String),
+    #[error("NixOS build failed: {0}")]
+    NixBuildFailed(String),
+
+    #[error("NixOS configuration invalid: {0}")]
+    NixConfigInvalid(String),
 
     #[error("Unsupported architecture: {0}")]
     UnsupportedArch(String),
-}
-
-/// PCI passthrough errors
-#[derive(Error, Debug)]
-pub enum PciError {
-    #[error("PCI device not found: {0}. Run 'lspci' to see available devices.")]
-    DeviceNotFound(String),
-
-    #[error("IOMMU not enabled. Enable VT-d (Intel) or AMD-Vi (AMD) in BIOS and add 'intel_iommu=on' or 'amd_iommu=on' to kernel cmdline.")]
-    IommuNotEnabled,
-
-    #[error("vfio-pci kernel module not available")]
-    VfioNotAvailable,
-
-    #[error("Invalid PCI address format: {0}. Expected format: '0000:01:00.0'")]
-    InvalidAddress(String),
-
-    #[error("Failed to parse vendor:device IDs from lspci output")]
-    ParseError,
 }
 
 /// USB passthrough errors
@@ -123,23 +101,14 @@ pub enum UsbError {
     },
 }
 
-/// Display bridge errors (Xpra-related)
+/// Display-related errors
 #[derive(Error, Debug)]
 pub enum DisplayError {
-    #[error("xpra binary not found on host. Install with: sudo dnf install xpra")]
-    XpraNotFound,
-
-    #[error("Failed to execute xpra: {0}")]
-    XpraExecution(String),
-
     #[error("Cannot connect to VM: {0}")]
     ConnectionFailed(String),
 
     #[error("Vsock CID not configured. VM may need reprovisioning with --no-network")]
     VsockNotConfigured,
-
-    #[error("Application launch failed: {0}")]
-    LaunchFailed(String),
 }
 
 /// Network-related errors

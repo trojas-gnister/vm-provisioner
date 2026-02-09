@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-02-08
+
+### Added
+- **Automated Venus Vulkan setup**: GUI VMs now automatically get hardware-accelerated Vulkan via virtio-gpu Venus
+  - Host GPU render node detection via sysfs (`/sys/class/drm/renderD*`)
+  - Automatic GPU selection for Venus (AMD > Intel; NVIDIA skipped — no Venus support)
+  - Stable `/dev/dri/by-path/` render node paths for SPICE configuration
+  - `VK_ICD_FILENAMES` environment variable set on QEMU process for correct host Vulkan ICD selection
+  - QEMU `qemu:commandline` post-processing: `venus=true`, `blob=true`, memory-backend-memfd
+  - `libvirt-qemu` user group membership check for `render` and `video` groups
+- **NixOS guest Venus configuration**: Generated `configuration.nix` now includes:
+  - `boot.kernelPackages = pkgs.linuxPackages_latest` (kernel >= 6.13 required for Venus)
+  - `hardware.graphics` block with Mesa, vulkan-loader, and 32-bit support
+  - `environment.variables` with `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` and `VK_DRIVER_FILES` pointing to Venus ICD
+- **New library exports**: `detect_gpu_render_nodes()`, `select_gpu_for_venus()`, `GpuVendor`, `GpuRenderNode`
+- **GPU vendor constants**: `GPU_VENDOR_AMD`, `GPU_VENDOR_INTEL`, `GPU_VENDOR_NVIDIA`, `VULKAN_ICD_DIR` in `constants.rs`
+
+### Fixed
+- **Memory-backend-memfd sizing**: Now uses KiB (`memory_mb * 1024`) to match libvirt's `<memory>` unit (was incorrectly using MB)
+
+### Known Limitations
+- **D3D12 Feature Level 12_2**: Not yet supported by Venus. Games requiring FL 12_2 (e.g. FF7 Rebirth) will fail. Waiting on Mesa 26.0 (expected late Feb 2026) which adds mesh shader support to Venus.
+- **NVIDIA GPUs**: Venus requires open-source Vulkan drivers (RADV or ANV). NVIDIA is not supported.
+
 ## [1.3.1] - 2025-12-28
 
 ### Fixed

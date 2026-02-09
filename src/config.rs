@@ -2,16 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PciDevice {
-    pub address: String,                 // "0000:01:00.0"
-    pub vendor_id: String,               // "10de"
-    pub device_id: String,               // "1c03"
-    pub description: String,             // "NVIDIA GeForce GTX 1050"
-    pub original_driver: Option<String>, // "nvidia" - for restoration
-    pub iommu_group: Option<u32>,        // IOMMU group number
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsbDevice {
     pub vendor_id: String,    // "1234" (hex)
     pub product_id: String,   // "5678" (hex)
@@ -26,39 +16,6 @@ pub struct SharedFolder {
     pub guest_path: String,  // "/mnt/shared/documents"
     pub tag: String,         // virtiofs mount tag (auto-generated)
     pub readonly: bool,      // default: false (read-write)
-}
-
-// Xpra is the only supported display protocol
-// Waypipe and Selkies have been deprecated
-#[derive(Debug, Serialize, Clone, PartialEq, Default)]
-pub enum DisplayProtocol {
-    #[default]
-    Xpra,
-}
-
-// Custom deserializer to handle migration from old configs
-impl<'de> Deserialize<'de> for DisplayProtocol {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_lowercase().as_str() {
-            "xpra" => Ok(DisplayProtocol::Xpra),
-            "waypipe" => {
-                log::warn!("Waypipe protocol is deprecated. Migrating to Xpra.");
-                Ok(DisplayProtocol::Xpra)
-            }
-            "selkies" => {
-                log::warn!("Selkies protocol is deprecated. Migrating to Xpra.");
-                Ok(DisplayProtocol::Xpra)
-            }
-            _ => Err(serde::de::Error::custom(format!(
-                "unknown display protocol: {}. Only 'Xpra' is supported.",
-                s
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -78,9 +35,6 @@ pub struct AppVMConfig {
 
     // Graphics and windowing
     pub graphics_backend: GraphicsBackend,
-    pub display_protocol: DisplayProtocol,
-    #[serde(default)]
-    pub web_port: Option<u16>, // Port for Selkies-GStreamer WebRTC web access (None = disabled)
     pub enable_clipboard: bool,
     pub enable_audio: bool,
     pub enable_usb_passthrough: bool,
@@ -88,10 +42,6 @@ pub struct AppVMConfig {
     pub headless: bool, // CLI-only mode, no GUI
     #[serde(default)]
     pub grant_device_access: bool, // Grant flatpak apps access to all devices
-
-    // PCI passthrough
-    pub pci_devices: Vec<PciDevice>,
-    pub pci_hotplug: bool, // true = hot-attach/detach, false = permanent XML
 
     // USB passthrough
     pub usb_devices: Vec<UsbDevice>,
@@ -114,34 +64,38 @@ pub struct AppVMConfig {
     // Authentication
     pub user_password: String,
 
-    // Custom kickstart additions (for library consumers)
-    /// Custom kickstart script to inject before the final reboot command.
-    ///
-    /// **Warning**: Content is injected verbatim without escaping. The script runs
-    /// as root during VM installation. Ensure content is properly shell-escaped
-    /// and comes from a trusted source.
+    // Custom NixOS configuration additions (for library consumers)
+    /// Extra Nix configuration snippet to append to the generated configuration.nix.
     #[serde(default)]
-    pub custom_kickstart: Option<String>,
-
-    /// Fedora version to install (default: "41").
-    ///
-    /// This controls which Fedora release is downloaded and installed.
-    /// The version string is used directly in download URLs.
-    #[serde(default = "default_fedora_version")]
-    pub fedora_version: String,
+    pub custom_nix_config: Option<String>,
 }
 
-fn default_fedora_version() -> String {
-    "41".to_string()
-}
-
-// Remove AppType enum as we're now using dynamic packages
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub enum GraphicsBackend {
-    VirtioGpu, // Hardware accelerated
-    QxlSpice,  // SPICE protocol
+    VirtioGpu, // Venus virtio-gpu with 3D acceleration
     VncOnly,   // Fallback
+}
+
+// Custom deserializer to handle migration from old configs with QxlSpice
+impl<'de> Deserialize<'de> for GraphicsBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "VirtioGpu" => Ok(GraphicsBackend::VirtioGpu),
+            "VncOnly" => Ok(GraphicsBackend::VncOnly),
+            "QxlSpice" => {
+                log::warn!("QxlSpice is deprecated. Migrating to VirtioGpu (Venus).");
+                Ok(GraphicsBackend::VirtioGpu)
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown graphics backend: {}. Supported: 'VirtioGpu', 'VncOnly'.",
+                s
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -151,6 +105,7 @@ pub enum NetworkMode {
     Bridge(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 impl AppVMConfig {
     /// Validate a VM name
     ///
@@ -223,9 +178,6 @@ impl AppVMConfig {
         system_packages: Vec<String>,
         flatpak_packages: Vec<String>,
         headless: bool,
-        pci_devices: Vec<PciDevice>,
-        pci_hotplug: bool,
-        web_port: Option<u16>,
         usb_devices: Vec<UsbDevice>,
         usb_hotplug: bool,
         shared_folders: Vec<SharedFolder>,
@@ -238,11 +190,10 @@ impl AppVMConfig {
             // Headless mode: minimal packages, no GUI/X11
             vec!["git".to_string()]
         } else {
-            // Xpra packages for GUI mode
+            // GUI mode: base packages
             vec![
-                "xpra".to_string(),
-                "xorg-x11-server-Xvfb".to_string(),
-                "pulseaudio-libs".to_string(),
+                "openbox".to_string(),
+                "xterm".to_string(),
                 "git".to_string(),
                 "openssh-server".to_string(),
             ]
@@ -267,17 +218,12 @@ impl AppVMConfig {
             } else {
                 GraphicsBackend::VirtioGpu
             },
-            display_protocol: DisplayProtocol::Xpra,
-            web_port,
             enable_clipboard: !headless,
             enable_audio: !headless,
             enable_usb_passthrough: !usb_devices.is_empty(),
             enable_auto_login: !headless,
             headless,
             grant_device_access,
-
-            pci_devices,
-            pci_hotplug,
 
             usb_devices,
             usb_hotplug,
@@ -307,11 +253,8 @@ impl AppVMConfig {
 
             user_password: generate_password(),
 
-            // No custom kickstart by default
-            custom_kickstart: None,
-
-            // Use default Fedora version
-            fedora_version: default_fedora_version(),
+            // No custom NixOS config by default
+            custom_nix_config: None,
         }
     }
 }
@@ -357,16 +300,12 @@ pub struct AppVMConfigBuilder {
     system_packages: Vec<String>,
     flatpak_packages: Vec<String>,
     headless: bool,
-    pci_devices: Vec<PciDevice>,
-    pci_hotplug: bool,
     usb_devices: Vec<UsbDevice>,
     usb_hotplug: bool,
     shared_folders: Vec<SharedFolder>,
     network_mode: NetworkMode,
-    web_port: Option<u16>,
     grant_device_access: bool,
-    custom_kickstart: Option<String>,
-    fedora_version: String,
+    custom_nix_config: Option<String>,
 }
 
 impl AppVMConfigBuilder {
@@ -378,7 +317,7 @@ impl AppVMConfigBuilder {
     /// - disk_size_gb: 20
     /// - headless: false
     /// - network_mode: Nat
-    /// - fedora_version: "41"
+    /// - fedora_version: "42"
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -388,16 +327,12 @@ impl AppVMConfigBuilder {
             system_packages: Vec::new(),
             flatpak_packages: Vec::new(),
             headless: false,
-            pci_devices: Vec::new(),
-            pci_hotplug: false,
             usb_devices: Vec::new(),
             usb_hotplug: false,
             shared_folders: Vec::new(),
             network_mode: NetworkMode::Nat,
-            web_port: None,
             grant_device_access: false,
-            custom_kickstart: None,
-            fedora_version: default_fedora_version(),
+            custom_nix_config: None,
         }
     }
 
@@ -449,24 +384,6 @@ impl AppVMConfigBuilder {
         self
     }
 
-    /// Set the PCI devices to pass through.
-    pub fn pci_devices(mut self, devices: Vec<PciDevice>) -> Self {
-        self.pci_devices = devices;
-        self
-    }
-
-    /// Add a single PCI device to pass through.
-    pub fn add_pci_device(mut self, device: PciDevice) -> Self {
-        self.pci_devices.push(device);
-        self
-    }
-
-    /// Set whether to use PCI hotplug (attach/detach while VM running).
-    pub fn pci_hotplug(mut self, hotplug: bool) -> Self {
-        self.pci_hotplug = hotplug;
-        self
-    }
-
     /// Set the USB devices to pass through.
     pub fn usb_devices(mut self, devices: Vec<UsbDevice>) -> Self {
         self.usb_devices = devices;
@@ -515,34 +432,15 @@ impl AppVMConfigBuilder {
         self
     }
 
-    /// Set the web streaming port (for Selkies-GStreamer).
-    pub fn web_port(mut self, port: u16) -> Self {
-        self.web_port = Some(port);
-        self
-    }
-
     /// Grant Flatpak apps access to all devices.
     pub fn grant_device_access(mut self, grant: bool) -> Self {
         self.grant_device_access = grant;
         self
     }
 
-    /// Set custom kickstart script additions.
-    ///
-    /// This script will be inserted into the kickstart file before
-    /// the final cleanup and reboot commands.
-    ///
-    /// **Warning**: Content is injected verbatim without escaping.
-    pub fn custom_kickstart(mut self, script: impl Into<String>) -> Self {
-        self.custom_kickstart = Some(script.into());
-        self
-    }
-
-    /// Set the Fedora version to install (default: "41").
-    ///
-    /// This controls which Fedora release is downloaded and installed.
-    pub fn fedora_version(mut self, version: impl Into<String>) -> Self {
-        self.fedora_version = version.into();
+    /// Set custom NixOS configuration snippet to append.
+    pub fn custom_nix_config(mut self, config: impl Into<String>) -> Self {
+        self.custom_nix_config = Some(config.into());
         self
     }
 
@@ -570,9 +468,6 @@ impl AppVMConfigBuilder {
             self.system_packages,
             self.flatpak_packages,
             self.headless,
-            self.pci_devices,
-            self.pci_hotplug,
-            self.web_port,
             self.usb_devices,
             self.usb_hotplug,
             self.shared_folders,
@@ -581,11 +476,8 @@ impl AppVMConfigBuilder {
             no_network,
         );
 
-        // Apply custom kickstart if provided
-        config.custom_kickstart = self.custom_kickstart;
-
-        // Apply Fedora version
-        config.fedora_version = self.fedora_version;
+        // Apply custom NixOS config if provided
+        config.custom_nix_config = self.custom_nix_config;
 
         Ok(config)
     }

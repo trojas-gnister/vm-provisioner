@@ -104,11 +104,21 @@ pub const DEFAULT_USER_UID: u32 = 1000;
 pub const DEFAULT_PULSE_SOCKET: &str = "/run/user/1000/pulse/native";
 
 // ============================================================================
-// Hot-plug Timing
+// NixOS
 // ============================================================================
 
-/// Delay after unbinding device before rebinding (milliseconds)
-pub const DEVICE_UNBIND_DELAY_MS: u64 = 500;
+/// NixOS channel used for image builds
+pub const NIXOS_CHANNEL: &str = "nixos-24.11";
 
-/// Delay after device detach before driver rebind (milliseconds)
-pub const DEVICE_DETACH_DELAY_MS: u64 = 500;
+// ============================================================================
+// GPU
+// ============================================================================
+
+/// GPU Vendor PCI IDs (for render node detection)
+pub const GPU_VENDOR_AMD: &str = "1002";
+pub const GPU_VENDOR_INTEL: &str = "8086";
+pub const GPU_VENDOR_NVIDIA: &str = "10de";
+
+/// Vulkan ICD directory
+pub const VULKAN_ICD_DIR: &str = "/usr/share/vulkan/icd.d";
+

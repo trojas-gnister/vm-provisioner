@@ -1,27 +1,22 @@
 //! VM installation and provisioning orchestration
 //!
-//! This module handles the full VM provisioning workflow:
+//! This module handles the full VM provisioning workflow using NixOS:
 //! - Prerequisites checking
-//! - ISO download
-//! - Disk creation
-//! - Kickstart-based installation
-//! - SSH key acceptance
+//! - NixOS configuration generation
+//! - qcow2 image building via nixos-generators
+//! - VM import via virt-install --import
 
 use crate::config::{GraphicsBackend, NetworkMode};
-use crate::constants::{
-    MIN_INSTALL_MEMORY_MB, POST_INSTALL_WAIT_SECS, SHUTDOWN_WAIT_SECS, SSH_RETRY_COUNT,
-    SSH_RETRY_DELAY_SECS, VM_BOOT_RETRY_COUNT, VM_BOOT_RETRY_DELAY_SECS, VM_BOOT_WAIT_SECS,
-};
 use crate::error::{ProvisioningError, Result};
-use crate::provisioner::kickstart::KickstartGeneration;
+use crate::nixos::{config_gen, image_builder};
+use crate::provisioner::device_detection::{
+    detect_gpu_render_nodes, get_vulkan_icd_path, select_gpu_for_venus,
+};
 use crate::provisioner::network::NetworkManagement;
-use crate::provisioner::pci::PciPassthrough;
 use crate::provisioner::usb::UsbPassthrough;
 use crate::virsh;
-use log::{debug, error, info, warn};
-use std::fs;
+use log::{debug, info, warn};
 use std::io::Write;
-use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -30,11 +25,6 @@ use std::time::Duration;
 pub trait Installation {
     fn provision_vm(&self) -> Result<()>;
     fn check_prerequisites(&self) -> Result<()>;
-    fn download_fedora_iso(&self) -> Result<String>;
-    fn create_vm_disk(&self) -> Result<String>;
-    fn start_installation(&self, iso_path: &str, disk_path: &str, kickstart_path: &str) -> Result<()>;
-    fn accept_ssh_host_key(&self) -> Result<()>;
-    fn setup_window_management(&self) -> Result<()>;
 }
 
 impl Installation for super::AppVMProvisioner {
@@ -47,30 +37,20 @@ impl Installation for super::AppVMProvisioner {
         // Check prerequisites
         self.check_prerequisites()?;
 
-        // Validate PCI passthrough if devices specified
-        if !self.config.pci_devices.is_empty() {
-            self.validate_pci_passthrough()?;
-        }
+        // Generate NixOS configuration
+        info!("Generating NixOS configuration...");
+        let nix_config = config_gen::generate_configuration_nix(&self.config)?;
 
-        // Download Fedora ISO (reused across VMs)
-        let iso_path = self.download_fedora_iso()?;
+        // Build qcow2 image
+        let qcow2_path = image_builder::build_image(
+            &nix_config,
+            &self.config.name,
+            &self.config.vm_dir,
+            self.config.disk_size_gb,
+        )?;
 
-        // Create VM disk
-        let disk_path = self.create_vm_disk()?;
-
-        // Generate kickstart configuration
-        let kickstart_path = self.generate_kickstart_config()?;
-
-        // Start automated installation
-        self.start_installation(&iso_path, &disk_path, &kickstart_path)?;
-
-        // Configure window management integration
-        self.setup_window_management()?;
-
-        // Setup PCI passthrough if devices specified (permanent mode)
-        if !self.config.pci_devices.is_empty() && !self.config.pci_hotplug {
-            self.setup_pci_passthrough_permanent()?;
-        }
+        // Import VM via virt-install
+        self.import_vm(&qcow2_path.to_string_lossy())?;
 
         // Setup USB passthrough if devices specified (permanent mode)
         if !self.config.usb_devices.is_empty() && !self.config.usb_hotplug {
@@ -90,14 +70,6 @@ impl Installation for super::AppVMProvisioner {
         debug!("System packages: {:?}", self.config.system_packages);
         debug!("Flatpak packages: {:?}", self.config.flatpak_packages);
         debug!("Graphics: {:?}", self.config.graphics_backend);
-        debug!(
-            "Clipboard: {}",
-            if self.config.enable_clipboard {
-                "Enabled"
-            } else {
-                "Disabled"
-            }
-        );
 
         Ok(())
     }
@@ -107,18 +79,18 @@ impl Installation for super::AppVMProvisioner {
         info!("Checking prerequisites...");
 
         let required_commands = [
-            ("virsh", "libvirt"),
-            ("virt-install", "virt-install"),
-            ("qemu-img", "qemu-img"),
+            ("virsh", "Install libvirt for your distribution"),
+            ("virt-install", "Install virt-install for your distribution"),
+            ("nixos-generate", "nix-env -iA nixpkgs.nixos-generators (or use nix flakes)"),
         ];
 
-        for (cmd, package) in &required_commands {
+        for (cmd, install_hint) in &required_commands {
             if Command::new("which").arg(cmd).output()?.status.success() {
                 debug!("{} found", cmd);
             } else {
                 return Err(ProvisioningError::MissingPrerequisite {
                     cmd: cmd.to_string(),
-                    install_hint: format!("sudo dnf install {}", package),
+                    install_hint: install_hint.to_string(),
                 }
                 .into());
             }
@@ -161,135 +133,67 @@ impl Installation for super::AppVMProvisioner {
             } else {
                 return Err(ProvisioningError::MissingPrerequisite {
                     cmd: "socat".to_string(),
-                    install_hint: "sudo dnf install socat".to_string(),
+                    install_hint: "Install socat for your distribution".to_string(),
                 }
                 .into());
             }
         }
 
+        // Check libvirt-qemu user groups for GPU access (VirtioGpu only)
+        if matches!(self.config.graphics_backend, GraphicsBackend::VirtioGpu) && !self.config.headless {
+            let qemu_user = Command::new("id").arg("libvirt-qemu").output();
+            let id_output = match qemu_user {
+                Ok(ref o) if o.status.success() => {
+                    Some(String::from_utf8_lossy(&o.stdout).to_string())
+                }
+                _ => {
+                    // Try 'qemu' as fallback (some distros use this)
+                    let fallback = Command::new("id").arg("qemu").output();
+                    match fallback {
+                        Ok(ref o) if o.status.success() => {
+                            Some(String::from_utf8_lossy(&o.stdout).to_string())
+                        }
+                        _ => None,
+                    }
+                }
+            };
+
+            if let Some(groups) = id_output {
+                let has_render = groups.contains("render");
+                let has_video = groups.contains("video");
+                if !has_render || !has_video {
+                    let mut missing = Vec::new();
+                    if !has_render {
+                        missing.push("render");
+                    }
+                    if !has_video {
+                        missing.push("video");
+                    }
+                    warn!(
+                        "libvirt-qemu user should be in '{}' group(s) for GPU access. \
+                         Add with: sudo usermod -aG {} libvirt-qemu",
+                        missing.join("' and '"),
+                        missing.join(",")
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
+}
 
-    /// Download Fedora ISO if not already cached
-    fn download_fedora_iso(&self) -> Result<String> {
-        let arch = std::env::consts::ARCH;
-        let iso_name = format!("Fedora-Server-dvd-{}.iso", arch);
-        let iso_path = Path::new(&self.config.vm_dir)
-            .join(&iso_name)
-            .to_string_lossy()
-            .to_string();
+impl super::AppVMProvisioner {
+    /// Import the built qcow2 image into libvirt via virt-install --import
+    fn import_vm(&self, qcow2_path: &str) -> Result<()> {
+        info!("Importing NixOS image into libvirt...");
 
-        // Ensure the VM directory exists
-        let mkdir_status = Command::new("sudo")
-            .args(["mkdir", "-p", &self.config.vm_dir])
-            .status()?;
-        if !mkdir_status.success() {
-            return Err(ProvisioningError::IsoDownload("Failed to create VM directory".to_string()).into());
-        }
-
-        if Path::new(&iso_path).exists() {
-            info!("Using existing Fedora ISO");
-            return Ok(iso_path);
-        }
-
-        info!("Downloading Fedora Server ISO (~2GB)...");
-        info!("This is a one-time download and will be reused for future VMs");
-
-        let fedora_version = &self.config.fedora_version;
-        let download_url = match arch {
-            "x86_64" => format!(
-                "https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/x86_64/iso/Fedora-Server-dvd-x86_64-{}-1.2.iso",
-                fedora_version, fedora_version
-            ),
-            "aarch64" => format!(
-                "https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Server/aarch64/iso/Fedora-Server-dvd-aarch64-{}-1.2.iso",
-                fedora_version, fedora_version
-            ),
-            _ => return Err(ProvisioningError::UnsupportedArch(arch.to_string()).into()),
-        };
-
-        let status = Command::new("sudo")
-            .args(["curl", "-L", "-o", &iso_path, "--progress-bar", &download_url])
-            .status()?;
-
-        if !status.success() {
-            return Err(ProvisioningError::IsoDownload("curl failed".to_string()).into());
-        }
-
-        info!("Download complete");
-        Ok(iso_path)
-    }
-
-    /// Create the VM disk image
-    fn create_vm_disk(&self) -> Result<String> {
-        let disk_path = Path::new(&self.config.vm_dir)
-            .join(format!("{}.qcow2", self.config.name))
-            .to_string_lossy()
-            .to_string();
-
-        // Remove existing disk if it exists
-        Command::new("sudo").args(["rm", "-f", &disk_path]).status()?;
-
-        info!("Creating VM disk ({} GB)...", self.config.disk_size_gb);
-
-        Command::new("sudo")
-            .args([
-                "qemu-img",
-                "create",
-                "-f",
-                "qcow2",
-                &disk_path,
-                &format!("{}G", self.config.disk_size_gb),
-            ])
-            .status()?;
-
-        Ok(disk_path)
-    }
-
-    /// Start the automated installation process
-    fn start_installation(
-        &self,
-        _iso_path: &str,
-        disk_path: &str,
-        kickstart_path: &str,
-    ) -> Result<()> {
-        info!("Starting VM installation...");
-
-        // Use more RAM during installation if needed
-        let install_memory = if self.config.memory_mb < MIN_INSTALL_MEMORY_MB {
-            warn!(
-                "Using {}MB RAM for installation (VM will use {}MB after first boot)",
-                MIN_INSTALL_MEMORY_MB, self.config.memory_mb
-            );
-            MIN_INSTALL_MEMORY_MB
-        } else {
-            self.config.memory_mb
-        };
-
-        let arch = std::env::consts::ARCH;
-        let fedora_version = &self.config.fedora_version;
-        let install_location = match arch {
-            "x86_64" => format!(
-                "https://dl.fedoraproject.org/pub/fedora/linux/releases/{}/Server/x86_64/os/",
-                fedora_version
-            ),
-            "aarch64" => format!(
-                "https://dl.fedoraproject.org/pub/fedora/linux/releases/{}/Everything/aarch64/os/",
-                fedora_version
-            ),
-            _ => return Err(ProvisioningError::UnsupportedArch(arch.to_string()).into()),
-        };
-
-        let memory_str = install_memory.to_string();
+        let memory_str = self.config.memory_mb.to_string();
         let vcpus_str = self.config.vcpus.to_string();
-        let disk_arg = format!(
-            "path={},size={},format=qcow2,bus=virtio",
-            disk_path, self.config.disk_size_gb
-        );
-        let osinfo = format!("fedora{}", fedora_version);
+        let disk_arg = format!("path={},format=qcow2,bus=virtio", qcow2_path);
 
-        // Configure graphics
-        let graphics_args = self.build_graphics_args(arch);
+        // Build graphics arguments
+        let graphics_args = self.build_graphics_args();
 
         let mut virt_install_args = vec![
             "--name",
@@ -300,17 +204,10 @@ impl Installation for super::AppVMProvisioner {
             &vcpus_str,
             "--disk",
             &disk_arg,
-            "--location",
-            &install_location,
-            "--initrd-inject",
-            kickstart_path,
-            "--extra-args",
-            "inst.ks=file:/kickstart.cfg console=tty0 console=ttyS0,115200n8",
-            "--osinfo",
-            &osinfo,
+            "--import",
+            "--os-variant",
+            "nixos-unstable",
             "--noautoconsole",
-            "--wait",
-            "-1",
         ];
 
         // Add graphics arguments
@@ -322,7 +219,7 @@ impl Installation for super::AppVMProvisioner {
         let network_arg = match &self.config.network_mode {
             NetworkMode::Bridge(bridge_name) => format!("bridge={},model=virtio", bridge_name),
             NetworkMode::Nat => "network=default,model=virtio".to_string(),
-            NetworkMode::None => "network=default,model=virtio".to_string(), // Temporary for install
+            NetworkMode::None => "none".to_string(),
         };
         virt_install_args.extend_from_slice(&["--network", &network_arg]);
 
@@ -333,6 +230,7 @@ impl Installation for super::AppVMProvisioner {
 
         // Add sound if enabled
         if self.config.enable_audio {
+            let arch = std::env::consts::ARCH;
             if arch == "aarch64" {
                 virt_install_args.extend_from_slice(&["--sound", "model=virtio"]);
             } else {
@@ -367,8 +265,6 @@ impl Installation for super::AppVMProvisioner {
                 .extend_from_slice(&["--memorybacking", "source.type=memfd,access.mode=shared"]);
         }
 
-        info!("Running automated installation (15-20 minutes)...");
-
         let status = Command::new("sudo")
             .arg("virt-install")
             .args(&virt_install_args)
@@ -376,312 +272,174 @@ impl Installation for super::AppVMProvisioner {
 
         if !status.success() {
             return Err(ProvisioningError::Installation(format!(
-                "virt-install failed with exit code: {:?}",
+                "virt-install --import failed with exit code: {:?}",
                 status.code()
             ))
             .into());
         }
 
-        // Validate installation
-        self.validate_installation(disk_path)?;
-
-        // Reduce memory if we increased it
-        if install_memory > self.config.memory_mb {
-            self.reduce_memory_after_install()?;
-        }
-
-        // Accept SSH host key
-        self.accept_ssh_host_key()?;
-
-        // Stop the VM
+        // Stop the VM after import (user starts it explicitly)
+        thread::sleep(Duration::from_secs(5));
         virsh::destroy_unchecked(&self.config.name);
 
-        info!("Installation completed and validated!");
+        // Enable Venus Vulkan for VirtioGpu (non-headless) VMs
+        if matches!(self.config.graphics_backend, GraphicsBackend::VirtioGpu) && !self.config.headless
+        {
+            self.enable_venus_vulkan()?;
+        }
 
+        info!("VM imported and ready.");
         Ok(())
     }
 
-    /// Accept the VM's SSH host key for seamless Xpra connections
-    fn accept_ssh_host_key(&self) -> Result<()> {
-        info!("Adding VM SSH host key...");
-        debug!("Waiting for VM networking to be ready...");
+    /// Enable Venus Vulkan by post-processing the libvirt XML
+    ///
+    /// virt-install doesn't support the `blob=on` and `venus=on` flags needed for
+    /// Venus Vulkan on virtio-gpu. This method modifies the VM's XML definition
+    /// after creation to add them. Also sets VK_ICD_FILENAMES to select the
+    /// correct Vulkan ICD on multi-GPU hosts.
+    fn enable_venus_vulkan(&self) -> Result<()> {
+        info!("Enabling Venus Vulkan for VM '{}'...", self.config.name);
 
-        // Retry getting VM IP address
-        let mut vm_ip = None;
-        for attempt in 1..=SSH_RETRY_COUNT {
-            if let Some(ip) = virsh::get_vm_ip(&self.config.name) {
-                vm_ip = Some(ip);
-                break;
-            }
+        let xml = virsh::dumpxml(&self.config.name)?;
 
-            if attempt < SSH_RETRY_COUNT {
-                thread::sleep(Duration::from_secs(SSH_RETRY_DELAY_SECS));
-            }
-        }
+        // Add qemu namespace to domain element
+        let xml = xml.replace(
+            "<domain type='kvm'>",
+            "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>",
+        );
 
-        let vm_ip = vm_ip.ok_or_else(|| {
-            ProvisioningError::SshKeyAcceptance(format!(
-                "Could not determine VM IP address after {} seconds",
-                SSH_RETRY_COUNT * SSH_RETRY_DELAY_SECS as u32
-            ))
+        // Replace the libvirt-managed <video> block with type='none' to prevent
+        // libvirt from adding a default VGA device that conflicts with our QEMU CLI device
+        let xml = replace_xml_block(
+            &xml,
+            "<video>",
+            "</video>",
+            "    <video>\n      <model type='none'/>\n    </video>",
+        );
+
+        // Use KiB for memory-backend-memfd size to match libvirt's <memory> unit
+        let mem_kb = self.config.memory_mb * 1024;
+        let mem_size = format!("{}K", mem_kb);
+        let device_arg = format!(
+            "virtio-vga-gl,hostmem={},blob=true,venus=true",
+            mem_size
+        );
+        let memfd_arg = format!(
+            "memory-backend-memfd,id=mem1,size={}",
+            mem_size
+        );
+
+        // Detect GPU and get ICD path for VK_ICD_FILENAMES env var
+        let gpu_nodes = detect_gpu_render_nodes();
+        let selected_gpu = select_gpu_for_venus(&gpu_nodes);
+        let icd_env = selected_gpu
+            .and_then(|gpu| get_vulkan_icd_path(&gpu.vendor))
+            .map(|icd_path| {
+                info!("Setting VK_ICD_FILENAMES={}", icd_path);
+                format!(
+                    "\n    <qemu:env name='VK_ICD_FILENAMES' value='{}'/>",
+                    icd_path
+                )
+            })
+            .unwrap_or_default();
+
+        let qemu_block = format!(
+            "  <qemu:commandline>\n    \
+               <qemu:arg value='-device'/>\n    \
+               <qemu:arg value='{device_arg}'/>\n    \
+               <qemu:arg value='-object'/>\n    \
+               <qemu:arg value='{memfd_arg}'/>\n    \
+               <qemu:arg value='-machine'/>\n    \
+               <qemu:arg value='memory-backend=mem1'/>\n    \
+               <qemu:arg value='-vga'/>\n    \
+               <qemu:arg value='none'/>{icd_env}\n  \
+             </qemu:commandline>\n</domain>"
+        );
+        let xml = xml.replace("</domain>", &qemu_block);
+
+        // Write modified XML to a temp file
+        let mut tmp = tempfile::NamedTempFile::new().map_err(|e| {
+            ProvisioningError::Installation(format!("Failed to create temp file: {}", e))
         })?;
-        debug!("VM IP: {}", vm_ip);
-
-        // Get user's home directory
-        let home = std::env::var("HOME").unwrap_or_else(|_| {
-            std::env::var("SUDO_USER")
-                .ok()
-                .and_then(|user| {
-                    Command::new("getent")
-                        .args(["passwd", &user])
-                        .output()
-                        .ok()
-                        .and_then(|o| {
-                            String::from_utf8(o.stdout)
-                                .ok()
-                                .and_then(|s| s.split(':').nth(5).map(|s| s.to_string()))
-                        })
-                })
-                .unwrap_or_else(|| "/root".to_string())
-        });
-
-        let known_hosts = format!("{}/.ssh/known_hosts", home);
-
-        // Use ssh-keyscan to get the host key
-        debug!("Waiting for SSH server to be ready...");
-        let mut scan_output = None;
-        let ssh_scan_retries = SSH_RETRY_COUNT * 2; // Double retries for SSH scan
-        for attempt in 1..=ssh_scan_retries {
-            let output = Command::new("ssh-keyscan").args(["-H", &vm_ip]).output()?;
-
-            if output.status.success() && !output.stdout.is_empty() {
-                scan_output = Some(output);
-                break;
-            }
-
-            if attempt < ssh_scan_retries {
-                thread::sleep(Duration::from_secs(SSH_RETRY_DELAY_SECS));
-            }
-        }
-
-        let output = scan_output.ok_or_else(|| {
-            ProvisioningError::SshKeyAcceptance("Failed to scan SSH host key after 2 minutes".to_string())
+        tmp.write_all(xml.as_bytes()).map_err(|e| {
+            ProvisioningError::Installation(format!("Failed to write XML: {}", e))
         })?;
+        let tmp_path = tmp.path().to_string_lossy().to_string();
 
-        // Append to known_hosts
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&known_hosts)?;
+        // Redefine the VM with the modified XML
+        virsh::undefine(&self.config.name, false)?;
+        virsh::define(&tmp_path)?;
 
-        file.write_all(&output.stdout)?;
-
-        info!("SSH host key added to {}", known_hosts);
-
+        info!("Venus Vulkan enabled (blob=on, venus=on).");
         Ok(())
     }
 
-    /// Setup window management integration
-    fn setup_window_management(&self) -> Result<()> {
-        info!("Setting up window management integration...");
+    /// Build graphics arguments for virt-install
+    fn build_graphics_args(&self) -> Vec<String> {
+        if self.config.headless {
+            return vec!["--graphics".to_string(), "none".to_string()];
+        }
 
         match self.config.graphics_backend {
             GraphicsBackend::VirtioGpu => {
-                debug!("Configured for VirtIO-GPU acceleration");
-            }
-            GraphicsBackend::QxlSpice => {
-                debug!("Configured for SPICE protocol");
-                debug!("Connect with: remote-viewer spice://localhost:5900");
+                // Detect GPU render nodes and select the best one for Venus
+                let gpu_nodes = detect_gpu_render_nodes();
+                let selected_gpu = select_gpu_for_venus(&gpu_nodes);
+
+                let spice_arg = if let Some(gpu) = selected_gpu {
+                    info!(
+                        "Using GPU render node {} ({:?}) for SPICE",
+                        gpu.by_path, gpu.vendor
+                    );
+                    format!(
+                        "spice,gl.enable=yes,listen=none,rendernode={}",
+                        gpu.by_path
+                    )
+                } else {
+                    warn!("No suitable GPU render node found, using default SPICE GL");
+                    "spice,gl.enable=yes,listen=none".to_string()
+                };
+
+                vec![
+                    "--graphics".to_string(),
+                    spice_arg,
+                    "--video".to_string(),
+                    "virtio,model.heads=1,model.acceleration.accel3d=yes".to_string(),
+                ]
             }
             GraphicsBackend::VncOnly => {
-                debug!("VNC fallback mode");
-                debug!("Connect with: vncviewer localhost:5900");
+                vec![
+                    "--graphics".to_string(),
+                    "vnc,listen=127.0.0.1,port=5900".to_string(),
+                ]
             }
         }
-
-        if self.config.enable_clipboard {
-            debug!("Clipboard sharing enabled (requires host agent)");
-        }
-
-        Ok(())
     }
 }
 
-impl super::AppVMProvisioner {
-    /// Build graphics arguments for virt-install
-    fn build_graphics_args(&self, arch: &str) -> Vec<&'static str> {
-        if self.config.headless {
-            return vec!["--graphics", "none"];
+/// Replace an XML block (inclusive of start/end tags) with a replacement string
+fn replace_xml_block(xml: &str, start_tag: &str, end_tag: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(xml.len());
+    let mut skipping = false;
+    let mut replaced = false;
+    for line in xml.lines() {
+        if !skipping && line.trim_start().starts_with(start_tag) {
+            skipping = true;
         }
-
-        match self.config.graphics_backend {
-            GraphicsBackend::VirtioGpu => {
-                if arch == "aarch64" {
-                    vec![
-                        "--graphics",
-                        "spice",
-                        "--video",
-                        "virtio",
-                        "--channel",
-                        "spicevmc,target_type=virtio,name=com.redhat.spice.0",
-                    ]
-                } else {
-                    vec![
-                        "--graphics",
-                        "spice,listen=127.0.0.1",
-                        "--video",
-                        "qxl",
-                        "--channel",
-                        "spicevmc,target_type=virtio,name=com.redhat.spice.0",
-                    ]
+        if skipping {
+            if line.trim_start().starts_with(end_tag) {
+                skipping = false;
+                if !replaced {
+                    result.push_str(replacement);
+                    result.push('\n');
+                    replaced = true;
                 }
             }
-            GraphicsBackend::QxlSpice => {
-                if arch == "aarch64" {
-                    vec![
-                        "--graphics",
-                        "spice",
-                        "--video",
-                        "virtio",
-                        "--channel",
-                        "spicevmc,target_type=virtio,name=com.redhat.spice.0",
-                    ]
-                } else {
-                    vec![
-                        "--graphics",
-                        "spice,listen=127.0.0.1",
-                        "--video",
-                        "qxl",
-                        "--channel",
-                        "spicevmc,target_type=virtio,name=com.redhat.spice.0",
-                    ]
-                }
-            }
-            GraphicsBackend::VncOnly => {
-                vec!["--graphics", "vnc,listen=127.0.0.1,port=5900"]
-            }
+            continue;
         }
+        result.push_str(line);
+        result.push('\n');
     }
-
-    /// Validate that installation succeeded
-    fn validate_installation(&self, disk_path: &str) -> Result<()> {
-        use crate::constants::MIN_DISK_SIZE_MB;
-
-        info!("Validating installation...");
-
-        // Check disk size
-        if let Ok(metadata) = fs::metadata(disk_path) {
-            let disk_size_mb = metadata.len() / (1024 * 1024);
-            debug!("Disk size: {} MB", disk_size_mb);
-
-            if disk_size_mb < MIN_DISK_SIZE_MB {
-                error!(
-                    "Installation failed: Disk size is only {} MB (expected at least {} MB)",
-                    disk_size_mb, MIN_DISK_SIZE_MB
-                );
-                error!("This usually means the installer ran out of memory or disk space.");
-                error!("Try increasing RAM with --memory 3072 or --memory 4096");
-                return Err(ProvisioningError::Validation("disk too small".to_string()).into());
-            }
-        } else {
-            warn!("Could not check disk size");
-        }
-
-        // Check VM state - retry a few times to handle post-install reboot
-        debug!("Checking VM status (waiting for post-install reboot to complete)...");
-
-        // Give the VM time to stabilize after installation reboot
-        thread::sleep(Duration::from_secs(POST_INSTALL_WAIT_SECS));
-
-        let mut vm_running = false;
-
-        for attempt in 1..=VM_BOOT_RETRY_COUNT {
-            let vm_state = virsh::get_vm_state(&self.config.name).unwrap_or_default();
-
-            debug!(
-                "Attempt {}/{}: VM state is '{}'",
-                attempt, VM_BOOT_RETRY_COUNT, vm_state
-            );
-
-            if vm_state == "running" {
-                debug!("VM is running");
-                vm_running = true;
-                break;
-            }
-
-            // If shut off, try to start it
-            if vm_state == "shut off" {
-                debug!("VM is shut off, attempting to start...");
-                if virsh::start_if_stopped(&self.config.name) {
-                    debug!("VM started successfully");
-                    vm_running = true;
-                    break;
-                }
-                // Check if already running (race condition)
-                if virsh::is_vm_running(&self.config.name) {
-                    debug!("VM is already active");
-                    vm_running = true;
-                    break;
-                }
-                debug!("Start failed, will retry...");
-            }
-
-            // Wait before retry (VM might be mid-reboot)
-            if attempt < VM_BOOT_RETRY_COUNT {
-                debug!("Waiting {}s before retry...", VM_BOOT_RETRY_DELAY_SECS);
-                thread::sleep(Duration::from_secs(VM_BOOT_RETRY_DELAY_SECS));
-            }
-        }
-
-        if !vm_running {
-            // One final check - maybe it came up while we were in the loop
-            let final_state = virsh::get_vm_state(&self.config.name).unwrap_or_default();
-
-            if final_state != "running" {
-                error!(
-                    "Installation failed: VM will not start after {} attempts",
-                    VM_BOOT_RETRY_COUNT
-                );
-                error!("Final state: {}", final_state);
-                return Err(ProvisioningError::Validation("VM won't boot".to_string()).into());
-            }
-        }
-
-        // Give the VM a moment to fully boot
-        thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
-
-        Ok(())
-    }
-
-    /// Reduce memory after installation if it was temporarily increased
-    fn reduce_memory_after_install(&self) -> Result<()> {
-        info!("Reducing VM memory to {}MB...", self.config.memory_mb);
-
-        // Stop the VM
-        virsh::shutdown_unchecked(&self.config.name);
-
-        // Wait for shutdown
-        for _ in 0..SHUTDOWN_WAIT_SECS {
-            thread::sleep(Duration::from_secs(1));
-            if let Some(state) = virsh::get_vm_state(&self.config.name) {
-                if state == "shut off" {
-                    break;
-                }
-            }
-        }
-
-        // Update memory configuration
-        virsh::set_memory(&self.config.name, self.config.memory_mb, true)?; // setmaxmem
-        virsh::set_memory(&self.config.name, self.config.memory_mb, false)?; // setmem
-
-        debug!("Memory reduced to {}MB", self.config.memory_mb);
-
-        // Start the VM again
-        debug!("Starting VM with new memory configuration...");
-        virsh::start_if_stopped(&self.config.name);
-
-        thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
-
-        Ok(())
-    }
+    result
 }

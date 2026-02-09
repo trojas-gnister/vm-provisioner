@@ -26,10 +26,15 @@ env_logger = "0.11"
 # Cryptographic randomness
 rand = "0.8"
 
-[dev-dependencies]
-tempfile = "3.12"
-mockall = "0.12"
-regex = "1"
+# Temporary files
+tempfile = "3"
+
+# Nix expression validation
+rnix = "0.11"
+
+# TUI
+ratatui = "0.30"
+
 
 [profile.release]
 opt-level = 3

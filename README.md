@@ -134,6 +134,42 @@ vm-provisioner create \
   --name dev-workstation
 ```
 
+## GPU Virtualization (Venus Vulkan)
+
+GUI VMs automatically use **Venus**, a virtio-GPU Vulkan driver that forwards Vulkan calls from the guest to the host GPU — no GPU passthrough required.
+
+### How It Works
+
+1. **Host-side**: vm-provisioner detects GPU render nodes via sysfs, selects the best GPU (AMD > Intel; NVIDIA not supported by Venus), and configures QEMU with `venus=true`, `blob=true`, and the correct Vulkan ICD
+2. **Guest-side**: The generated NixOS configuration installs Mesa, sets `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`, and points `VK_DRIVER_FILES` to the Venus ICD
+
+### Requirements
+
+| Component | Minimum Version |
+|-----------|----------------|
+| QEMU | >= 9.2 |
+| Host kernel | >= 6.6 |
+| Guest kernel | >= 6.13 (auto-configured via `linuxPackages_latest`) |
+| Mesa (guest) | >= 25.x (Venus stable since Mesa 25.x) |
+| Host GPU | AMD (RADV) or Intel (ANV) — NVIDIA lacks Venus support |
+
+### Current Limitations
+
+- **D3D12 Feature Level 12_2 not yet supported**: Games requiring FL 12_2 (e.g. FF7 Rebirth) will fail to create a D3D12 device. Mesa 26.0 (expected late February 2026) adds mesh shader support to Venus, which is required for FL 12_2 via vkd3d-proton.
+- **Performance overhead**: Venus adds a serialization layer between guest and host Vulkan. Lightweight workloads (emulators, older games) run well; demanding AAA titles may experience lower framerates compared to bare metal or VFIO passthrough.
+- **NVIDIA GPUs**: Venus requires an open-source Vulkan driver (RADV or ANV). NVIDIA's proprietary driver is not supported.
+
+### Verified Working
+
+- Steam (native Linux client)
+- Games requiring D3D12 Feature Level <= 12_1 via Proton/vkd3d-proton
+- Vulkan-native applications (e.g. `vulkaninfo`, `vkcube`)
+- Console emulators that require Vulkan 1.2+
+
+### Waiting On
+
+- **Mesa 26.0** (RC3 released Feb 5 2026, stable expected late Feb 2026): Adds Venus mesh shader support, enabling D3D12 FL 12_2. This will unlock more modern Proton games. Track the [Mesa release calendar](https://docs.mesa3d.org/release-calendar.html).
+
 ## Hardware Passthrough
 
 ### USB Devices
@@ -233,23 +269,6 @@ vm-provisioner create --flatpak ... --no-network --name airgapped
 
 Display forwarding uses virtio-vsock (host-guest communication channel) instead of SSH over TCP. Requires `socat` on both host and guest.
 
-## Web-Based Remote Access
-
-Access VMs from any browser using Selkies-GStreamer (WebRTC streaming):
-
-```bash
-vm-provisioner create \
-  --flatpak io.gitlab.librewolf-community \
-  --web-port 8080 \
-  --name remote-browser
-```
-
-After booting, access at `http://<vm-ip>:8080/`. Login with:
-- Username: `user`
-- Password: from `vm-provisioner passwords`
-
-Useful for accessing VMs from mobile devices or machines without Xpra installed.
-
 ## Configuration Files
 
 Configs are stored in `~/.config/vm-provisioner/`:
@@ -283,6 +302,36 @@ sudo virsh net-autostart default
 Your VPN may block local network traffic. Either:
 - Allow 192.168.122.0/24 in VPN split-tunnel settings, or
 - Use `--network-bridge` for LAN networking
+
+**Venus Vulkan: "failed to initialize venus renderer"**
+
+Venus requires a working Vulkan driver on the **host**. Install the appropriate driver:
+
+```bash
+# AMD (RADV)
+sudo pacman -S vulkan-radeon    # Arch
+sudo dnf install vulkan-loader mesa-vulkan-drivers  # Fedora
+
+# Intel
+sudo pacman -S vulkan-intel     # Arch
+
+# Verify with:
+vulkaninfo --summary  # Requires vulkan-tools
+```
+
+After installing, restart the VM. Verify inside the guest with `vulkaninfo --summary` — you should see a Venus device instead of llvmpipe.
+
+Venus also requires QEMU's seccomp sandbox to allow process spawning (virglrenderer runs Venus in an isolated process). If Venus still fails after installing Vulkan drivers, disable the sandbox in `/etc/libvirt/qemu.conf`:
+
+```bash
+# Edit /etc/libvirt/qemu.conf
+seccomp_sandbox = 0
+
+# Then restart libvirtd
+sudo systemctl restart libvirtd
+```
+
+> **Note:** Venus requires QEMU >= 9.2, Linux kernel >= 6.13 on the guest, virglrenderer with Venus support, and a working host Vulkan driver.
 
 **No audio in VM**
 
@@ -318,13 +367,24 @@ cargo fmt             # Format code
 
 ### Architecture
 
-- `src/main.rs` — CLI interface and command routing
-- `src/config.rs` — VM configuration structures
-- `src/provisioner/` — VM lifecycle (create, start, stop, destroy)
-- `src/xpra_manager.rs` — Xpra display bridge implementation
-- `src/templates/` — Kickstart shell script templates
-
-To add a new display protocol, implement the `DisplayBridge` trait in `src/display_bridge.rs`.
+- `src/main.rs` — CLI entrypoint
+- `src/cli/` — CLI command handlers (create, start, stop, destroy, etc.)
+- `src/config.rs` — VM configuration structures and builder
+- `src/provisioner/` — VM lifecycle and hardware management
+  - `installation.rs` — VM provisioning orchestration, Venus/SPICE setup
+  - `lifecycle.rs` — Start/stop/destroy operations
+  - `device_detection.rs` — GPU render node and USB device detection
+  - `pci.rs` / `usb.rs` — PCI and USB passthrough
+  - `network.rs` — Network interface management
+  - `kickstart.rs` — Fedora kickstart generation
+- `src/nixos/` — NixOS guest configuration
+  - `config_gen.rs` — Generates `configuration.nix` with Venus, Mesa, Flatpak, etc.
+  - `packages.rs` — Package name mapping (generic -> nixpkgs)
+- `src/virsh.rs` — Centralized libvirt/virsh command helpers
+- `src/libvirt_xml.rs` — XML generation for libvirt devices
+- `src/constants.rs` — Static configuration values, GPU vendor IDs, paths
+- `src/passwords.rs` — VM credential management
+- `src/templates/` — Shell script templates for guest provisioning
 
 ## Library Usage
 
@@ -401,6 +461,9 @@ if check_iommu_enabled()? {
 | `is_clean_iommu_group()` | Check if group has single device |
 | `detect_pci_device()` | Detect PCI device by address |
 | `detect_usb_device()` | Detect USB device by vendor:product |
+| `detect_gpu_render_nodes()` | Detect GPU render nodes via sysfs |
+| `select_gpu_for_venus()` | Select best GPU for Venus Vulkan |
+| `GpuVendor`, `GpuRenderNode` | GPU detection types |
 
 ## License
 

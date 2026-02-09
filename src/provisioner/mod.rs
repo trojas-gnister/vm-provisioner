@@ -4,24 +4,23 @@
 //! - Device detection and validation
 //! - Kickstart configuration generation
 //! - VM installation and provisioning
-//! - PCI/USB passthrough management
+//! - USB passthrough management
 //! - Network interface management
 //! - VM lifecycle (start/stop/destroy)
 
 pub mod device_detection;
 pub mod installation;
-pub mod kickstart;
 pub mod lifecycle;
 pub mod network;
-pub mod pci;
 pub mod usb;
 
 use crate::config::AppVMConfig;
 
 // Re-export public functions for external use
-pub use device_detection::{detect_pci_device, detect_usb_device, get_vsock_cid};
-#[allow(unused_imports)] // Library-only exports: used by external consumers, not the CLI binary
-pub use pci::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group, list_iommu_group_devices};
+pub use device_detection::{
+    detect_gpu_render_nodes, detect_usb_device, get_vsock_cid, select_gpu_for_venus, GpuRenderNode,
+    GpuVendor,
+};
 
 // Re-export traits for method access
 pub use installation::Installation;

@@ -9,7 +9,8 @@ use std::path::Path;
 use vm_provisioner::config::{AppVMConfig, NetworkMode, SharedFolder};
 use vm_provisioner::error::{ConfigError, NetworkError, Result};
 use vm_provisioner::passwords::VMPasswords;
-use vm_provisioner::provisioner::{self, AppVMProvisioner, Installation};
+use vm_provisioner::provisioner::{self, AppVMProvisioner};
+use vm_provisioner::provisioner::installation::Installation;
 
 /// Options for VM creation
 pub struct CreateOptions {
@@ -22,9 +23,6 @@ pub struct CreateOptions {
     pub vcpus: u32,
     pub disk: u64,
     pub headless: bool,
-    pub pci_addresses: Vec<String>,
-    pub pci_hotplug: bool,
-    pub web_port: Option<u16>,
     pub usb_addresses: Vec<String>,
     pub usb_hotplug: bool,
     pub share_paths: Vec<String>,
@@ -36,15 +34,6 @@ pub struct CreateOptions {
 
 /// Validate create options for mutual exclusivity and prerequisites
 pub fn validate_create_options(opts: &CreateOptions) -> Result<()> {
-    // Validate --no-network and --web-port are mutually exclusive
-    if opts.no_network && opts.web_port.is_some() {
-        return Err(NetworkError::ConflictingOptions(
-            "Cannot use --no-network with --web-port. Selkies web streaming requires networking."
-                .to_string(),
-        )
-        .into());
-    }
-
     // Validate --no-network and --network-bridge are mutually exclusive
     if opts.no_network && opts.network_bridge.is_some() {
         return Err(NetworkError::ConflictingOptions(
@@ -55,7 +44,7 @@ pub fn validate_create_options(opts: &CreateOptions) -> Result<()> {
     }
 
     if opts.no_network {
-        info!("Network-disabled mode: VM will use vsock for display forwarding");
+        info!("Network-disabled mode: VM will be headless CLI-only (access via virsh console)");
     }
 
     // Validate bridge interface exists if specified
@@ -110,16 +99,6 @@ pub fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
     // Validate VM name
     AppVMConfig::validate_vm_name(&vm_name)?;
 
-    let pci_devices = if !opts.pci_addresses.is_empty() {
-        info!("Detecting PCI devices...");
-        opts.pci_addresses
-            .iter()
-            .map(|addr| provisioner::detect_pci_device(addr))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-
     let usb_devices = if !opts.usb_addresses.is_empty() {
         info!("Detecting USB devices...");
         opts.usb_addresses
@@ -148,9 +127,6 @@ pub fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
         opts.system_packages,
         opts.flatpak_packages,
         opts.headless,
-        pci_devices,
-        opts.pci_hotplug,
-        opts.web_port,
         usb_devices,
         opts.usb_hotplug,
         shared_folders,
@@ -164,19 +140,10 @@ pub fn build_config(opts: CreateOptions) -> Result<AppVMConfig> {
 pub fn display_config_summary(config: &AppVMConfig) {
     println!("\n📋 VM Configuration:");
     println!("   Name: {}", config.name);
-    println!(
-        "   Mode: {}",
-        if config.headless {
-            "Headless (CLI only)"
-        } else {
-            "GUI (Xpra)"
-        }
-    );
-    if let Some(port) = config.web_port {
-        println!(
-            "   Web Streaming: http://<vm-ip>:{}/ (Selkies WebRTC)",
-            port
-        );
+    if config.headless {
+        println!("   Mode: Headless (CLI only)");
+    } else {
+        println!("   Mode: GUI");
     }
     println!("   System Packages: {:?}", config.system_packages);
     println!("   Flatpak Packages: {:?}", config.flatpak_packages);
@@ -219,7 +186,7 @@ pub fn display_config_summary(config: &AppVMConfig) {
         }
     }
     match &config.network_mode {
-        NetworkMode::None => println!("   Network: Disabled (vsock for display)"),
+        NetworkMode::None => println!("   Network: Disabled (headless CLI-only)"),
         NetworkMode::Nat => println!("   Network: NAT (192.168.122.x)"),
         NetworkMode::Bridge(br) => println!("   Network: Bridged ({})", br),
     }
@@ -253,7 +220,7 @@ pub fn handle_post_provisioning(config: &mut AppVMConfig, config_file: &str) -> 
             Err(e) => {
                 warn!("Could not retrieve vsock CID: {}", e);
                 warn!(
-                    "Display forwarding may not work. Check 'virsh dumpxml {}'",
+                    "Check 'virsh dumpxml {}'",
                     config.name
                 );
             }

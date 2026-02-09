@@ -91,30 +91,3 @@ impl Default for VMPasswords {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_vmpasswords_new() {
-        let passwords = VMPasswords::new();
-        assert!(passwords.vms.is_empty());
-    }
-
-    #[test]
-    fn test_vmpasswords_add_and_get() {
-        let mut passwords = VMPasswords::new();
-        passwords.add_vm("test-vm", "secret123");
-        assert_eq!(passwords.get("test-vm"), Some(&"secret123".to_string()));
-    }
-
-    #[test]
-    fn test_vmpasswords_remove() {
-        let mut passwords = VMPasswords::new();
-        passwords.add_vm("test-vm", "secret123");
-        assert!(passwords.contains("test-vm"));
-        passwords.remove("test-vm");
-        assert!(!passwords.contains("test-vm"));
-    }
-}

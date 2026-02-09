@@ -8,7 +8,6 @@
 use crate::config::GraphicsBackend;
 use crate::constants::{DEFAULT_SPICE_PORT, VM_BOOT_WAIT_SECS};
 use crate::error::Result;
-use crate::provisioner::pci::PciPassthrough;
 use crate::provisioner::usb::UsbPassthrough;
 use crate::virsh;
 use log::{debug, error, info, warn};
@@ -35,11 +34,6 @@ impl Lifecycle for super::AppVMProvisioner {
         // Wait for VM to boot
         thread::sleep(Duration::from_secs(VM_BOOT_WAIT_SECS));
 
-        // Hot-attach PCI devices if in hot-plug mode
-        if self.config.pci_hotplug && !self.config.pci_devices.is_empty() {
-            self.attach_pci_devices_hotplug()?;
-        }
-
         // Hot-attach USB devices if in hot-plug mode
         if self.config.usb_hotplug && !self.config.usb_devices.is_empty() {
             self.attach_usb_devices_hotplug()?;
@@ -54,7 +48,7 @@ impl Lifecycle for super::AppVMProvisioner {
 
         // Launch SPICE viewer for immediate functionality
         match self.config.graphics_backend {
-            GraphicsBackend::VirtioGpu | GraphicsBackend::QxlSpice => {
+            GraphicsBackend::VirtioGpu => {
                 info!("Launching SPICE viewer...");
                 let vm_name = self.config.name.clone();
                 thread::spawn(move || {
@@ -90,12 +84,6 @@ impl Lifecycle for super::AppVMProvisioner {
     /// Stop the VM gracefully
     fn stop_vm(&self) -> Result<()> {
         info!("Stopping VM: {}", self.config.name);
-
-        // Hot-detach PCI devices if in hot-plug mode (before shutdown)
-        if self.config.pci_hotplug && !self.config.pci_devices.is_empty() {
-            thread::sleep(Duration::from_secs(2));
-            self.detach_pci_devices_hotplug()?;
-        }
 
         // Hot-detach USB devices if in hot-plug mode (before shutdown)
         if self.config.usb_hotplug && !self.config.usb_devices.is_empty() {
