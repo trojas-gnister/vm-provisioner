@@ -13,7 +13,7 @@ use std::process::Command;
 
 /// Generate a complete `configuration.nix` as a String from the given VM config.
 ///
-/// The generated config includes base system, SSH, packages, optional Selkies/GUI
+/// The generated config includes base system, SSH, packages, optional GUI
 /// services, flatpak, shared folders, networking, vsock, firewall, and user setup.
 ///
 /// The output is validated with `rnix::Root::parse()` before returning.

@@ -1,14 +1,14 @@
 # VM Provisioner
 
-**Run desktop applications in isolated Fedora VMs with seamless window integration.** Each app gets its own virtual machine, but windows appear natively on your desktop—no visible VM boundary.
+**Run applications in isolated NixOS VMs with hardware-accelerated Vulkan.** Each app gets its own virtual machine built from a declarative NixOS configuration, with Venus virtio-gpu providing near-native GPU performance — no GPU passthrough required.
 
 ## Why Use This?
 
 | Traditional VMs | VM Provisioner |
 |-----------------|----------------|
-| Full desktop in a window | Individual app windows on your desktop |
-| Manual guest OS install | Automated Fedora provisioning |
-| Static configuration | Dynamic package installation |
+| Full desktop in a window | Lightweight, purpose-built NixOS VMs |
+| Manual guest OS install | Declarative NixOS provisioning via `nixos-generators` |
+| Static configuration | Dynamic package installation (system + Flatpak) |
 | Shared attack surface | One VM per app = isolation |
 
 **Use cases:**
@@ -21,25 +21,27 @@
 
 ### 1. Prerequisites
 
-**Fedora:**
-```bash
-sudo dnf install libvirt qemu-kvm virt-install xpra
-sudo systemctl enable --now libvirtd
-sudo usermod -aG libvirt $USER  # Log out and back in after this
-```
+**Host requirements:**
+- libvirt + QEMU/KVM
+- Nix package manager (for `nixos-generators`)
+- AMD or Intel GPU (for Venus Vulkan acceleration)
 
-**Debian/Ubuntu:**
 ```bash
-sudo apt install libvirt-daemon-system qemu-kvm virtinst xpra
-sudo systemctl enable --now libvirtd
-sudo usermod -aG libvirt $USER  # Log out and back in after this
-```
+# Install libvirt and QEMU
+# Fedora:
+sudo dnf install libvirt qemu-kvm virt-install
+# Debian/Ubuntu:
+sudo apt install libvirt-daemon-system qemu-kvm virtinst
+# Arch:
+sudo pacman -S libvirt qemu-full virt-install
 
-**Arch Linux:**
-```bash
-sudo pacman -S libvirt qemu-full virt-install xpra
+# Enable libvirtd
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt $USER  # Log out and back in after this
+
+# Install nixos-generators (requires Nix package manager)
+# If you don't have Nix: https://nixos.org/download
+nix-env -iA nixpkgs.nixos-generators
 ```
 
 ### 2. Install VM Provisioner
@@ -53,48 +55,54 @@ sudo install -m 755 target/release/vm-provisioner /usr/local/bin/
 
 ### 3. Create Your First VM
 
+**Using the TUI (recommended):**
 ```bash
-# Create a browser VM (first run downloads Fedora ISO, ~5-10 minutes)
+# Launch the interactive terminal UI
+vm-provisioner
+```
+
+The TUI lets you create, start, stop, and destroy VMs with a visual interface.
+
+**Using the CLI:**
+```bash
+# Create a browser VM (first run builds a NixOS image, ~5-10 minutes)
 vm-provisioner create --flatpak io.gitlab.librewolf-community --name browser
 
 # Start the VM
 vm-provisioner start browser
 
-# Wait ~30 seconds for VM to boot, then generate shortcuts
-vm-provisioner generate-shortcuts browser
+# Check VM status and IP
+vm-provisioner list
 
-# Launch the browser
-vm-provisioner launch browser "flatpak run io.gitlab.librewolf-community"
+# Connect via SSH or serial console
+vm-provisioner console browser
 ```
-
-The browser window appears on your desktop just like a native app.
 
 ## Command Reference
 
-### VM Lifecycle
+### TUI
+
+Running `vm-provisioner` with no subcommand launches the interactive terminal UI (built with ratatui). The TUI provides:
+
+- VM dashboard with status overview
+- VM creation form with all configuration options
+- Start/stop/destroy operations
+- Live provisioning log viewer
+- VM detail view with configuration summary
+
+### CLI Commands
 
 | Command | Description |
 |---------|-------------|
 | `create` | Provision a new VM with specified packages |
 | `start <vm>` | Boot a stopped VM |
-| `stop <vm>` | Graceful shutdown (saves state) |
+| `stop <vm>` | Graceful shutdown |
 | `destroy <vm> -y` | Permanently delete VM and disk image |
 | `list` | Show all VMs with status and IP addresses |
-
-### Application Management
-
-| Command | Description |
-|---------|-------------|
-| `launch <vm> "command"` | Run a command in the VM via Xpra |
-| `generate-shortcuts <vm>` | Create .desktop files in `~/.local/share/applications/` |
-| `apps <vm>` | List launchable applications |
-
-### Utilities
-
-| Command | Description |
-|---------|-------------|
 | `passwords` | Display VM user credentials |
 | `console <vm>` | Attach to VM serial console (Ctrl+] to exit) |
+| `usb-attach <vm> <device>` | Hot-attach a USB device to a running VM |
+| `usb-detach <vm> <device>` | Detach a USB device from a running VM |
 
 Run `vm-provisioner --help` or `vm-provisioner <command> --help` for all options.
 
@@ -208,29 +216,6 @@ vm-provisioner create ... --share /path:/mnt/path --share-readonly
 
 Inside the VM, shared folders mount automatically at the specified guest path (e.g., `/mnt/projects`).
 
-### PCI/GPU Passthrough
-
-Pass entire PCI devices (GPUs, network cards, etc.) to VMs.
-
-**Requirements:**
-1. Enable IOMMU in BIOS
-2. Add kernel parameter: `intel_iommu=on` (Intel) or `amd_iommu=on` (AMD)
-3. Reboot
-
-```bash
-# Find device address
-lspci -nn -D | grep -i vga
-# 0000:01:00.0 VGA compatible controller [0300]: NVIDIA...
-
-vm-provisioner create \
-  --flatpak org.mozilla.firefox \
-  --pci 0000:01:00.0 \
-  --pci-hotplug \
-  --name gpu-vm
-```
-
-> **Warning:** Passing your only GPU will make the host display unusable. Use `--pci-hotplug` to return the device when the VM stops.
-
 ## Networking Options
 
 ### Default (NAT)
@@ -261,13 +246,13 @@ vm-provisioner create --flatpak ... --network-bridge br0 --name lan-accessible
 
 ### Network-Disabled (Airgapped)
 
-Maximum isolation—VM has no network interface:
+Maximum isolation — VM has no network interface:
 
 ```bash
-vm-provisioner create --flatpak ... --no-network --name airgapped
+vm-provisioner create --system git --headless --no-network --name airgapped
 ```
 
-Display forwarding uses virtio-vsock (host-guest communication channel) instead of SSH over TCP. Requires `socat` on both host and guest.
+Access via `virsh console` only. Flatpak installation requires networking, so `--no-network` is best suited for headless VMs with system packages only.
 
 ## Configuration Files
 
@@ -296,12 +281,6 @@ sudo usermod -aG libvirt $USER
 sudo virsh net-start default
 sudo virsh net-autostart default
 ```
-
-**Xpra drops when VPN connects**
-
-Your VPN may block local network traffic. Either:
-- Allow 192.168.122.0/24 in VPN split-tunnel settings, or
-- Use `--network-bridge` for LAN networking
 
 **Venus Vulkan: "failed to initialize venus renderer"**
 
@@ -333,21 +312,24 @@ sudo systemctl restart libvirtd
 
 > **Note:** Venus requires QEMU >= 9.2, Linux kernel >= 6.13 on the guest, virglrenderer with Venus support, and a working host Vulkan driver.
 
-**No audio in VM**
+**NixOS image build fails**
 
-Check PulseAudio is running on the host:
+Ensure `nixos-generators` is installed and the Nix daemon is running:
+
 ```bash
-pactl info
+nixos-generate --help   # Should show usage
+systemctl status nix-daemon  # Should be active (if using multi-user Nix)
 ```
 
-For low-latency audio input (microphones), use USB passthrough instead of network audio:
+If the build fails with permission errors, ensure your user is in the `nix-users` group or is a trusted user in `/etc/nix/nix.conf`.
+
+**No audio in VM**
+
+Audio uses PipeWire inside the NixOS guest (auto-configured for GUI VMs). For audio input devices (microphones), use USB passthrough:
+
 ```bash
 vm-provisioner create --usb <audio-device-id> --usb-hotplug ...
 ```
-
-**generate-shortcuts says VM not found**
-
-The VM must be running. After `vm-provisioner start`, wait ~30 seconds for the network to come up.
 
 ### Getting Help
 
@@ -367,24 +349,35 @@ cargo fmt             # Format code
 
 ### Architecture
 
-- `src/main.rs` — CLI entrypoint
-- `src/cli/` — CLI command handlers (create, start, stop, destroy, etc.)
+- `src/main.rs` — Entrypoint, delegates to CLI or TUI
+- `src/cli/` — CLI command handlers
+  - `mod.rs` — Clap CLI definition and dispatch; launches TUI when no subcommand given
+  - `create.rs` — VM creation: validation, config building, post-provisioning
+  - `vm_ops.rs` — start, stop, destroy, list, passwords, console
+  - `usb.rs` — USB attach/detach command handlers
+- `src/tui/` — Interactive terminal UI (ratatui)
+  - `app.rs` — Application state, VM list management, provisioning orchestration
+  - `ui.rs` — Screen rendering (dashboard, detail, create form, provisioning log)
+  - `handler.rs` — Keyboard input handling
+  - `event.rs` — Event loop
+  - `logger.rs` — Log capture for TUI display
+- `src/nixos/` — NixOS guest configuration
+  - `config_gen.rs` — Generates `configuration.nix` with Venus, PipeWire, Flatpak, etc.
+  - `image_builder.rs` — Builds qcow2 images via `nixos-generators`
+  - `packages.rs` — Package name mapping (Fedora names -> nixpkgs equivalents)
 - `src/config.rs` — VM configuration structures and builder
 - `src/provisioner/` — VM lifecycle and hardware management
-  - `installation.rs` — VM provisioning orchestration, Venus/SPICE setup
+  - `installation.rs` — VM provisioning orchestration: NixOS build, virt-install import, Venus/SPICE setup
   - `lifecycle.rs` — Start/stop/destroy operations
   - `device_detection.rs` — GPU render node and USB device detection
-  - `pci.rs` / `usb.rs` — PCI and USB passthrough
+  - `usb.rs` — USB passthrough
   - `network.rs` — Network interface management
-  - `kickstart.rs` — Fedora kickstart generation
-- `src/nixos/` — NixOS guest configuration
-  - `config_gen.rs` — Generates `configuration.nix` with Venus, Mesa, Flatpak, etc.
-  - `packages.rs` — Package name mapping (generic -> nixpkgs)
 - `src/virsh.rs` — Centralized libvirt/virsh command helpers
-- `src/libvirt_xml.rs` — XML generation for libvirt devices
-- `src/constants.rs` — Static configuration values, GPU vendor IDs, paths
+- `src/libvirt_xml.rs` — XML generation for libvirt devices (USB, network)
+- `src/constants.rs` — Static configuration values, GPU vendor IDs, NixOS channel
 - `src/passwords.rs` — VM credential management
-- `src/templates/` — Shell script templates for guest provisioning
+- `src/error.rs` — Typed error hierarchy (`VmProvisionerError`, `ProvisioningError`, etc.)
+- `src/validation.rs` — USB and shared folder validation helpers
 
 ## Library Usage
 
@@ -417,34 +410,34 @@ fn main() -> vm_provisioner::Result<()> {
 }
 ```
 
-### Custom Kickstart Scripts
+### Custom NixOS Configuration
 
-Inject custom setup scripts into the VM provisioning process:
+Inject custom Nix configuration into the generated `configuration.nix`:
 
 ```rust
 let config = AppVMConfigBuilder::new("custom-vm")
-    .add_system_package("usbip")
-    .custom_kickstart(r#"
-        # Custom setup script
-        systemctl enable my-custom-service
-        echo "Custom setup complete"
+    .add_system_package("nginx")
+    .custom_nix_config(r#"
+        services.nginx.enable = true;
+        services.nginx.virtualHosts."localhost" = {
+            root = "/var/www";
+        };
     "#)
     .build()?;
 ```
 
-### IOMMU Helpers
+### GPU Detection
 
-Check IOMMU status for PCI passthrough:
+Query host GPU render nodes for Venus Vulkan support:
 
 ```rust
-use vm_provisioner::{check_iommu_enabled, get_iommu_group, is_clean_iommu_group};
+use vm_provisioner::{detect_gpu_render_nodes, select_gpu_for_venus, GpuVendor};
 
-if check_iommu_enabled()? {
-    if let Some(group) = get_iommu_group("0000:00:14.0") {
-        if is_clean_iommu_group(group)? {
-            println!("Device is safe for passthrough");
-        }
-    }
+let nodes = detect_gpu_render_nodes();
+if let Some(gpu) = select_gpu_for_venus(&nodes) {
+    println!("Best GPU for Venus: {:?} at {}", gpu.vendor, gpu.pci_slot);
+    println!("Render node: {}", gpu.render_node);
+    println!("Stable path: {}", gpu.by_path);
 }
 ```
 
@@ -455,15 +448,13 @@ if check_iommu_enabled()? {
 | `AppVMConfigBuilder` | Builder pattern for VM configuration |
 | `AppVMProvisioner` | Main provisioner struct |
 | `Installation`, `Lifecycle` | Traits for VM operations |
-| `PciPassthrough`, `UsbPassthrough` | Traits for device passthrough |
-| `check_iommu_enabled()` | Check if IOMMU is enabled |
-| `get_iommu_group()` | Get IOMMU group for a PCI device |
-| `is_clean_iommu_group()` | Check if group has single device |
-| `detect_pci_device()` | Detect PCI device by address |
+| `UsbPassthrough` | Trait for USB device passthrough |
 | `detect_usb_device()` | Detect USB device by vendor:product |
 | `detect_gpu_render_nodes()` | Detect GPU render nodes via sysfs |
 | `select_gpu_for_venus()` | Select best GPU for Venus Vulkan |
 | `GpuVendor`, `GpuRenderNode` | GPU detection types |
+| `validate_usb_device()` | Validate USB device config format |
+| `validate_shared_folder()` | Validate shared folder config format |
 
 ## License
 

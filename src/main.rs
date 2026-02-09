@@ -1,4 +1,4 @@
-//! VM Provisioner - Lightweight VM isolation with seamless windowing
+//! VM Provisioner - Lightweight VM isolation with NixOS
 //!
 //! This is the main entry point for the CLI application.
 //! The CLI uses the vm_provisioner library crate for all functionality.

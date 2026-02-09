@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 ## [1.4.0] - 2026-02-08
 
 ### Added
+- **NixOS-based provisioning**: Replaced Fedora kickstart pipeline with declarative NixOS configuration generation and `nixos-generators` qcow2 image building
+  - `src/nixos/config_gen.rs` generates a complete `configuration.nix` from `AppVMConfig`
+  - `src/nixos/image_builder.rs` builds qcow2 images via `nixos-generate` with auto-resizing
+  - `src/nixos/packages.rs` maps Fedora/RPM package names to nixpkgs equivalents
+  - Nix expression validation via `rnix` crate before building
+  - SHA-512 password hashing via `mkpasswd`/`openssl` for NixOS `hashedPassword`
+- **Interactive TUI**: Running `vm-provisioner` with no subcommand launches a ratatui-based terminal UI
+  - VM dashboard with status, IP, and configuration overview
+  - Create form with all configuration options (name, memory, vCPUs, disk, packages, graphics, network)
+  - Start/stop/destroy operations with confirmation dialogs
+  - Live provisioning log viewer
+  - VM detail view
+  - New dependencies: `ratatui` 0.30
 - **Automated Venus Vulkan setup**: GUI VMs now automatically get hardware-accelerated Vulkan via virtio-gpu Venus
   - Host GPU render node detection via sysfs (`/sys/class/drm/renderD*`)
   - Automatic GPU selection for Venus (AMD > Intel; NVIDIA skipped — no Venus support)
@@ -16,11 +29,40 @@ All notable changes to this project will be documented in this file.
   - `boot.kernelPackages = pkgs.linuxPackages_latest` (kernel >= 6.13 required for Venus)
   - `hardware.graphics` block with Mesa, vulkan-loader, and 32-bit support
   - `environment.variables` with `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` and `VK_DRIVER_FILES` pointing to Venus ICD
+- **NixOS guest PipeWire audio**: GUI VMs get PipeWire with ALSA and PulseAudio compatibility
+- **NixOS guest QEMU agent**: `services.qemuGuest.enable = true` for host-guest communication
 - **New library exports**: `detect_gpu_render_nodes()`, `select_gpu_for_venus()`, `GpuVendor`, `GpuRenderNode`
 - **GPU vendor constants**: `GPU_VENDOR_AMD`, `GPU_VENDOR_INTEL`, `GPU_VENDOR_NVIDIA`, `VULKAN_ICD_DIR` in `constants.rs`
+- **NixOS channel constant**: `NIXOS_CHANNEL` in `constants.rs`
+- **virsh improvements**:
+  - `get_vm_ip()` now falls back to QEMU guest agent for bridged networks (`--source agent`)
+  - `parse_ip_from_domifaddr_agent()` parses agent output, skipping loopback and link-local
+  - `define()` function for defining VMs from XML files
+- **New error variants**: `ProvisioningError::NixBuildFailed`, `ProvisioningError::NixConfigInvalid`
+
+### Changed
+- **CLI subcommand is now optional**: No subcommand launches the TUI; all existing commands still work as subcommands
+- **Prerequisites check**: Now checks for `nixos-generate` instead of `qemu-img`; install hints are distribution-agnostic
+- **GraphicsBackend**: Removed `QxlSpice` variant (migrated to `VirtioGpu` on config load); only `VirtioGpu` and `VncOnly` remain
+- **`custom_kickstart` field renamed to `custom_nix_config`**: Now accepts Nix configuration snippets instead of shell scripts
+- **`--no-network` mode**: No longer implies vsock display forwarding; now creates a headless CLI-only VM accessible via `virsh console`
+- **Dependencies**: Added `ratatui` 0.30, `rnix` 0.11, `tempfile` 3 (moved from dev-dependencies); removed `mockall`, `regex` dev-dependencies
 
 ### Fixed
 - **Memory-backend-memfd sizing**: Now uses KiB (`memory_mb * 1024`) to match libvirt's `<memory>` unit (was incorrectly using MB)
+
+### Removed
+- **Fedora/kickstart provisioning**: Removed `src/provisioner/kickstart.rs`, ISO download, `fedora_version` config field
+- **PCI passthrough**: Removed `src/provisioner/pci.rs`, `PciDevice` struct, `PciError`, `PciPassthrough` trait, IOMMU helpers, `--pci` and `--pci-hotplug` CLI flags
+- **Xpra display bridge**: Removed `src/display_bridge.rs`, `src/xpra_manager.rs`, `XpraManager`, `DisplayBridge` trait
+- **Display protocol system**: Removed `DisplayProtocol` enum (Xpra/Waypipe/Selkies migration logic)
+- **Shell templates**: Removed entire `src/templates/` directory (audio, vsock relay, virtiofs, Selkies scripts)
+- **CLI shortcuts**: Removed `src/cli/shortcuts.rs`, `generate-shortcuts`, `launch`, and `apps` commands
+- **`--web-port` flag**: Selkies-GStreamer web streaming removed
+- **Tests**: Removed `tests/display_bridge_tests.rs`, `tests/e2e_testing_guide.rs`, `tests/template_placeholder_tests.rs`, PCI/XML unit tests
+- **`test-xpra.sh`**: Removed Xpra testing script
+- **Timing constants**: Removed `DEVICE_UNBIND_DELAY_MS`, `DEVICE_DETACH_DELAY_MS` (PCI-related)
+- **Installation constants**: Removed `MIN_INSTALL_MEMORY_MB`, `POST_INSTALL_WAIT_SECS`, `SHUTDOWN_WAIT_SECS` and related retry constants (no longer needed with NixOS image-based provisioning)
 
 ### Known Limitations
 - **D3D12 Feature Level 12_2**: Not yet supported by Venus. Games requiring FL 12_2 (e.g. FF7 Rebirth) will fail. Waiting on Mesa 26.0 (expected late Feb 2026) which adds mesh shader support to Venus.
@@ -54,7 +96,7 @@ All notable changes to this project will be documented in this file.
 - **New `src/virsh.rs` module**: Centralized all virsh/libvirt interactions
   - Command builders: `virsh_command()`, `virsh_sudo_command()`
   - Checked execution: `run_checked()`, `run_sudo_checked()` with proper error handling
-  - Unchecked variants: `run_sudo_unchecked()`, `destroy_unchecked()`, `shutdown_unchecked()`
+  - Unchecked variants: `run_sudo_unchecked()`, `destroy_unchecked()`
   - High-level operations: `attach_device()`, `detach_device()`, `dumpxml()`, `domain_exists()`
   - VM state helpers: `get_vm_ip()`, `get_vm_state()`, `is_vm_running()`, `get_display()`
   - Eliminated ~60+ duplicated virsh command patterns across codebase
